@@ -2,6 +2,12 @@
 
 A macOS Finder-inspired file manager for Linux, built with Tauri.
 
+![Column View](SCREENSHOTS/screenshot_2026-03-17_10-48-57.png)
+![Gallery View](SCREENSHOTS/screenshot_2026-03-17_10-49-59.png)
+![Quick Look](SCREENSHOTS/screenshot_2026-03-17_10-50-17.png)
+![Icon View](SCREENSHOTS/screenshot_2026-03-17_10-50-32.png)
+![Tags](SCREENSHOTS/screenshot_2026-03-17_10-50-58.png)
+
 ## What We Want to Achieve
 
 FrostFinder aims to bring the elegant, intuitive file management experience from macOS to Linux desktop users. We believe file management should be:
