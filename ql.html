@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Quick Look</title>
+<style>
+  :root {
+    --bg-window:  #1a1a1d;
+    --bg-hover:   rgba(255,255,255,.08);
+    --text-primary:   #e2e8f0;
+    --text-secondary: #94a3b8;
+    --text-tertiary:  #636368;
+    --accent-blue:    #5b8dd9;
+    --border:     rgba(255,255,255,.13);
+    --font: -apple-system, 'Inter', 'Segoe UI', sans-serif;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: transparent;
+    font-family: var(--font);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+    color: var(--text-primary);
+  }
+
+  /* ── Window shell ─────────────────────────────────────────────────────── */
+  #ql-root {
+    width: 100%; height: 100%;
+    background: var(--bg-window);
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow:
+      0 2px 4px rgba(0,0,0,.25),
+      0 8px 24px rgba(0,0,0,.45),
+      0 32px 80px rgba(0,0,0,.65),
+      inset 0 1px 0 rgba(255,255,255,.06);
+  }
+
+  /* ── Title bar — data-tauri-drag-region makes it drag the native window ── */
+  #ql-titlebar {
+    data-tauri-drag-region: true; /* hint for CSS; JS attr set below */
+    flex-shrink: 0;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,.03);
+    cursor: default;
+  }
+  #ql-titlebar button { cursor: pointer; }
+
+  /* macOS-style close dot */
+  .ql-wm-close {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: #ff5f57;
+    border: none;
+    flex-shrink: 0;
+    position: relative;
+    transition: filter .1s;
+  }
+  .ql-wm-close:hover { filter: brightness(.82); }
+  .ql-wm-close::before,
+  .ql-wm-close::after {
+    content: '';
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 6px; height: 1px;
+    background: rgba(0,0,0,.6);
+    border-radius: 1px;
+    opacity: 0;
+    transition: opacity .1s;
+  }
+  .ql-wm-close::before { transform: translate(-50%,-50%) rotate(45deg); }
+  .ql-wm-close::after  { transform: translate(-50%,-50%) rotate(-45deg); }
+  #ql-titlebar:hover .ql-wm-close::before,
+  #ql-titlebar:hover .ql-wm-close::after { opacity: 1; }
+
+  .ql-nav-btn {
+    background: none; border: none;
+    color: var(--text-tertiary); font-size: 20px; line-height: 1;
+    padding: 0 4px; cursor: pointer; border-radius: 4px;
+    transition: color .1s, background .1s;
+    flex-shrink: 0;
+  }
+  .ql-nav-btn:hover { background: rgba(255,255,255,.1); color: var(--text-primary); }
+  .ql-nav-btn.disabled { opacity: .25; cursor: default; pointer-events: none; }
+
+  .ql-name {
+    flex: 1;
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: center;
+  }
+  .ql-meta {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .ql-open-btn {
+    background: none; border: none;
+    color: var(--text-tertiary);
+    cursor: pointer; border-radius: 5px;
+    padding: 3px 6px; font-size: 12px;
+    transition: color .1s, background .1s;
+    flex-shrink: 0;
+    display: flex; align-items: center; gap: 4px;
+  }
+  .ql-open-btn:hover { color: var(--accent-blue); background: rgba(91,141,217,.12); }
+  .ql-open-btn svg { width: 14px; height: 14px; }
+
+  /* ── Body ──────────────────────────────────────────────────────────────── */
+  #ql-body {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  #ql-body img {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  #ql-body video {
+    max-width: 100%; max-height: 100%;
+    background: #000;
+    display: block;
+  }
+  #ql-body iframe {
+    width: 100%; height: 100%;
+    border: none;
+    background: #fff;
+  }
+  #ql-body audio {
+    width: 320px;
+    outline: none;
+    accent-color: var(--accent-blue);
+  }
+  #ql-body pre {
+    width: 100%; height: 100%;
+    overflow: auto;
+    padding: 16px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--text-primary);
+    white-space: pre;
+    tab-size: 4;
+  }
+  .ql-audio-wrap {
+    display: flex; flex-direction: column;
+    align-items: center; gap: 12px;
+    padding: 24px;
+    text-align: center;
+  }
+  .ql-viz-canvas {
+    width: 100%;
+    height: 56px;
+    display: block;
+    border-radius: 6px;
+    background: transparent;
+    flex-shrink: 0;
+  }
+  .ql-unknown {
+    display: flex; flex-direction: column;
+    align-items: center; gap: 12px;
+    color: var(--text-secondary);
+    font-size: 13px;
+  }
+  .ql-loading {
+    color: var(--text-tertiary);
+    font-size: 13px;
+  }
+
+  /* fullscreen button overlay for video — top-right to avoid controls bar */
+  .ql-fs-btn {
+    position: absolute;
+    top: 10px; right: 10px;
+    background: rgba(0,0,0,.55);
+    border: none; border-radius: 6px;
+    color: #fff; cursor: pointer;
+    padding: 5px 8px; font-size: 11px;
+    opacity: 0.7; transition: opacity .15s;
+  }
+  #ql-body:hover .ql-fs-btn { opacity: 1; }
+
+  /* ── Font preview ────────────────────────────────────────────────────────── */
+  .ql-font-wrap {
+    display: flex; flex-direction: column; gap: 12px;
+    padding: 18px 16px 14px; width: 100%; box-sizing: border-box; min-height: 0;
+  }
+  .ql-font-specimen {
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 10px; padding: 16px 14px; overflow: auto; flex: 1; min-height: 0;
+  }
+  .qlf-display  { font-size: 52px; line-height: 1.1; color: #f1f5f9; margin-bottom: 12px; }
+  .qlf-alpha    { font-size: 13px; line-height: 1.9; color: #94a3b8; word-break: break-all; margin-bottom: 8px; }
+  .qlf-nums     { font-size: 12px; line-height: 1.8; color: #94a3b8; word-break: break-all; margin-bottom: 10px; }
+  .qlf-sentence { font-size: 16px; color: #e2e8f0; line-height: 1.6; margin-bottom: 4px; }
+  .qlf-sm       { font-size: 12px; color: #94a3b8; }
+  .ql-font-actions { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  .ql-font-btn {
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+    padding: 9px 0; background: #5b8dd9; border: none; border-radius: 8px;
+    color: #fff; font-size: 13px; font-weight: 600; cursor: pointer;
+    font-family: inherit; transition: background .15s; width: 100%;
+  }
+  .ql-font-btn:hover:not(:disabled) { background: #4a7fc8; }
+  .ql-font-btn:disabled { opacity: .6; cursor: default; }
+  .ql-font-btn.ql-font-installed { background: rgba(52,211,153,.15); color: #34d399; border: 1px solid rgba(52,211,153,.3); }
+  .ql-font-status  { font-size: 11px; color: #636368; text-align: center; min-height: 14px; }
+  .ql-font-progwrap { height: 4px; background: rgba(255,255,255,.08); border-radius: 2px; overflow: hidden; }
+  .ql-font-progbar  { height: 100%; width: 0%; background: #5b8dd9; border-radius: 2px; transition: width 1.2s ease; }
+  .ql-font-progbar.green { background: #34d399; }
+  .ql-font-progbar.red   { background: #f87171; }
+</style>
+</head>
+<body>
+<div id="ql-root">
+  <div id="ql-titlebar">
+    <button class="ql-wm-close" id="ql-close" title="Close (Esc)"></button>
+    <button class="ql-nav-btn disabled" id="ql-prev" title="Previous (←)">&#8249;</button>
+    <span class="ql-name" id="ql-name">Loading…</span>
+    <span class="ql-meta" id="ql-meta"></span>
+    <button class="ql-nav-btn disabled" id="ql-next" title="Next (→)">&#8250;</button>
+    <button class="ql-open-btn" id="ql-open" title="Open externally">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M7 3H3a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V9"/>
+        <path d="M10 2h4v4"/><path d="M14 2 8 8"/>
+      </svg>
+    </button>
+  </div>
+  <div id="ql-body">
+    <span class="ql-loading">Loading…</span>
+  </div>
+</div>
+<script type="module" src="/src/ql-window.js"></script>
+</body>
+</html>

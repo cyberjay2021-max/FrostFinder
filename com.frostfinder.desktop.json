@@ -1,0 +1,73 @@
+{
+  "id": "com.frostfinder.desktop",
+  "runtime": "org.freedesktop.Platform",
+  "runtime-version": "24.08",
+  "sdk": "org.freedesktop.Sdk",
+  "command": "frostfinder",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=fallback-x11",
+    "--socket=wayland",
+    "--socket=pulseaudio",
+    "--share=network",
+    "--device=dri",
+    "--filesystem=home",
+    "--filesystem=/media",
+    "--filesystem=/mnt",
+    "--filesystem=/run/media",
+    "--talk-name=org.freedesktop.Notifications",
+    "--talk-name=org.kde.StatusNotifierWatcher",
+    "--own-name=org.kde.*",
+    "--talk-name=org.gtk.vfs",
+    "--talk-name=org.gtk.vfs.*"
+  ],
+  "modules": [
+    {
+      "name": "libbz2",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 libbz2.so.1.0.8 /app/lib/libbz2.so.1.0",
+        "install -Dm755 libbz2.so.1.0.8 /app/lib/libbz2.so.1"
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "path": "/usr/lib/libbz2.so.1.0.8"
+        }
+      ]
+    },
+    {
+      "name": "frostfinder",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 frostfinder /app/bin/frostfinder",
+        "install -Dm644 frostfinder.desktop /app/share/applications/com.frostfinder.desktop.desktop",
+        "install -Dm644 128x128.png /app/share/icons/hicolor/128x128/apps/com.frostfinder.desktop.png",
+        "install -Dm644 256x256.png /app/share/icons/hicolor/256x256/apps/com.frostfinder.desktop.png",
+        "install -Dm644 512x512.png /app/share/icons/hicolor/512x512/apps/com.frostfinder.desktop.png"
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "path": "src-tauri/target/release/frostfinder"
+        },
+        {
+          "type": "file",
+          "path": "packaging/frostfinder.desktop"
+        },
+        {
+          "type": "file",
+          "path": "src-tauri/icons/128x128.png"
+        },
+        {
+          "type": "file",
+          "path": "src-tauri/icons/256x256.png"
+        },
+        {
+          "type": "file",
+          "path": "src-tauri/icons/512x512.png"
+        }
+      ]
+    }
+  ]
+}

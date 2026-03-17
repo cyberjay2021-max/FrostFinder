@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=FrostFinder
+GenericName=File Manager
+Comment=A fast, modern column-based file manager inspired by macOS Finder
+Exec=frostfinder %F
+Icon=frostfinder
+Terminal=false
+StartupNotify=true
+StartupWMClass=frostfinder
+Categories=Utility;FileManager;
+Keywords=file;manager;finder;column;browser;
+MimeType=inode/directory;
