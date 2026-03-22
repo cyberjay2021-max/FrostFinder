@@ -4,7 +4,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow as _getAppWindow } from '@tauri-apps/api/window';
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
-const appWindow = _getAppWindow();
+let appWindow; // set lazily by injectDeps() after Tauri context ready
 import { emit, once, listen } from '@tauri-apps/api/event';
 import {
   I, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, DOC_EXTS, OFFICE_EXTS, BOOK_EXTS, PDF_EXTS, ARCHIVE_EXTS, ISO_EXTS, HTML_EXTS, DMG_EXTS, FONT_EXTS,
@@ -13,8 +13,43 @@ import {
 
 // Injected by main.js
 let _deps = {};
-export function injectDeps(deps){ _deps = deps; }
+export function injectDeps(deps){ _deps = deps; appWindow = deps.appWindow || _getAppWindow(); }
 const d = () => _deps;
+
+// ── Keyboard shortcuts for new features ────────────────────────────────────────
+if (typeof document !== 'undefined') {
+  document.addEventListener('keydown', async (e) => {
+    if (!e.ctrlKey || !e.shiftKey) return;
+    const { sel, state, showToast, getVisibleEntries } = d();
+    
+    // Ctrl+Shift+R: Batch Rename
+    if (e.key === 'R') {
+      e.preventDefault();
+      const entries = getVisibleEntries();
+      const selectedEntries = sel.size > 0 
+        ? sel.arr.map(i => entries[i]).filter(Boolean)
+        : (state.selIdx >= 0 ? [entries[state.selIdx]].filter(Boolean) : []);
+      const paths = selectedEntries.map(en => en.path);
+      if (paths.length > 0) {
+        showBatchRenameDialog(paths);
+      } else {
+        showToast(t('toast.select_files_first'), 'info');
+      }
+    }
+    
+    // Ctrl+Shift+S: SMB Connect
+    if (e.key === 'S') {
+      e.preventDefault();
+      showSmbConnectDialog();
+    }
+    
+    // Ctrl+Shift+O: Cloud (O for OwnCloud/Online)
+    if (e.key === 'O') {
+      e.preventDefault();
+      showCloudMountDialog();
+    }
+  });
+}
 
 // ── Video player ─────────────────────────────────────────────────────────────
 // In-app preview: native <video> element served by the local HTTP media server.
@@ -175,7 +210,7 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
           } catch { clearInterval(poll); _fsActive=false; appWindow.unminimize(); }
         }, 500);
       })
-      .catch(err => { _fsActive=false; appWindow.unminimize(); d().showToast('mpv: '+err,'error'); });
+      .catch(err => { _fsActive=false; appWindow.unminimize(); d().showToast(t('error.mpv',{err}),'error'); });
   };
 
   // Only F-key fullscreen on document (global is fine — it's not disruptive)
@@ -549,7 +584,26 @@ export function renderView(){
 // but it WILL still be in _preloadedPaths — that's fine: the navigate() call that
 // follows will miss the Rust cache and do a fresh FS read anyway).
 const _preloadedPaths = new Set();
+// Fix 1: sequence counter — lets renderColumnView detect and skip stale calls
+// that arrive during rapid navigation (multiple renders queued in one RAF tick).
+let _colRenderSeq = 0;
+// Debounce: skip renders if a more recent one is already pending
+let _colRenderPending = null;
 export function renderColumnView(host){
+  const _mySeq = ++_colRenderSeq;
+  // Skip if a more recent render is already scheduled
+  if (_colRenderPending !== null && _mySeq < _colRenderPending) return;
+  // Schedule this render with 16ms debounce to coalesce rapid calls
+  clearTimeout(_colRenderPending);
+  _colRenderPending = _mySeq;
+  setTimeout(() => {
+    if (_mySeq !== _colRenderPending) return; // superseded
+    _colRenderPending = null;
+    _doRenderColumn(host, _mySeq);
+  }, 16);
+}
+
+function _doRenderColumn(host, _mySeq) {
   window.FF?.log('RENDER_COL',{cols:window._state?.columns?.length,paths:window._state?.columns?.map(c=>c.path?.split('/').pop())});
   const {state,sel,sortEntries,setupDragDrop,setupDropTarget,
          showContextMenu,buildFileCtxMenu,buildBgCtxMenu,
@@ -581,10 +635,14 @@ export function renderColumnView(host){
     el._rbCleanup?.();
   };
 
+  // Fix 2: track whether columns were removed so Fix 3 can clamp scrollLeft
+  let _colsRemoved = false;
+
   // Remove trailing columns that are no longer in state.columns
   while (container.children.length > state.columns.length) {
     _cleanupColEl(container.lastChild);
     container.lastChild.remove();
+    _colsRemoved = true;
   }
   // Remove any column whose path no longer matches its position
   for (let i = 0; i < container.children.length; i++) {
@@ -593,6 +651,7 @@ export function renderColumnView(host){
       while (container.children.length > i) {
         _cleanupColEl(container.lastChild);
         container.lastChild.remove();
+        _colsRemoved = true;
       }
       break;
     }
@@ -642,6 +701,9 @@ export function renderColumnView(host){
 
     const colList=document.createElement('div');
     colList.className='col-list';
+    colList.setAttribute('role','listbox');
+    colList.setAttribute('aria-multiselectable','true');
+    colList.setAttribute('aria-label',`${col.path.split('/').pop()||col.path} contents`);
 
     // ── Virtual scroll for column list ────────────────────────────────────────
     // ROW_H=28 enforced by CSS: .col-list .frow { height:28px; margin:0; box-sizing:border-box }
@@ -676,14 +738,26 @@ export function renderColumnView(host){
       const row = document.createElement('div');
       row.className = `frow${isSel ? ' sel' : ''}${isTrail ? ' trail' : ''}${e.is_hidden ? ' hid' : ''}${isCut ? ' cut-item' : ''}`;
       row.dataset.col = ci; row.dataset.idx = ei; row.dataset.path = e.path; row.dataset.dir = e.is_dir;
+      row.setAttribute('role','option'); row.setAttribute('aria-selected',isSel?'true':'false'); row.setAttribute('aria-label',e.name+(e.is_dir?', folder':''));
       row.style.cssText = `position:absolute;left:0;right:0;top:${ei * CROW_H}px;`;
       if (!isSel && !isTrail && _rowTag) row.style.background = `${tagColor(_rowTag)}33`;
-      row.innerHTML = `<span class="fico" style="color:${fileColor(e)}">${fileIcon(e)}</span><span class="fname">${escHtml(e.name)}${e.is_symlink ? '<span class="sym-arrow">\u2192</span>' : ''}</span>${e.is_dir ? `<span class="fchev">${I.chev}</span>` : `<span class="fsize">${e.size != null ? fmtSize(e.size) : ''}</span>`}${_rowTags.map(t => `<span class="frow-tag" style="background:${tagColor(t)}"></span>`).join('')}`;
+      row.innerHTML = `<span class="fico" style="color:${fileColor(e)}">${fileIcon(e)}</span><span class="fname">${escHtml(e.name)}${e.is_symlink ? '<span class="sym-arrow">\u2192</span>' : ''}</span>${e.is_dir ? `<span class="fchev">${I.chev}</span>` : `<span class="fsize">${e.size != null ? fmtSize(e.size) : ''}</span>`}${_rowTags.map(t => `<span class="frow-tag" style="background:${tagColor(t)}"></span>`).join('')}${d().gitBadgeHtml?.(e.path)??''}` ;
       return row;
     };
 
     let _cPainted = {start:-1, end:-1};
     const _paintColList = () => {
+      // Empty state
+      const _emptyEl = colList.querySelector('.col-empty-state');
+      if(entries.length === 0){
+        if(!_emptyEl){
+          const em = document.createElement('div');
+          em.className = 'col-empty-state';
+          em.innerHTML = '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" style="width:32px;height:32px;opacity:.25"><rect x="8" y="6" width="32" height="36" rx="3"/><line x1="14" y1="16" x2="34" y2="16"/><line x1="14" y1="22" x2="28" y2="22"/><line x1="14" y1="28" x2="24" y2="28"/></svg><span>Empty folder</span>';
+          colList.appendChild(em);
+        }
+        return;
+      } else if(_emptyEl){ _emptyEl.remove(); }
       const scrollTop = colList.scrollTop;
       const VH = colList.clientHeight || 400;
       const start = Math.max(0, Math.floor(scrollTop / CROW_H) - CROW_OVERSCAN);
@@ -761,6 +835,14 @@ export function renderColumnView(host){
         await loadPreview(entry); render(); rst();
       }
     });
+    colList.addEventListener('auxclick', ev => {
+      if(ev.button!==1) return; // middle mouse only
+      if (!colList.isConnected) return;
+      const row = ev.target.closest('.frow'); if (!row) return;
+      const ei=+row.dataset.idx; const e=entries[ei]; if(!e||!e.is_dir) return;
+      ev.preventDefault();
+      d().newTab?.(e.path);
+    });
     colList.addEventListener('dblclick', ev => {
       if (!colList.isConnected) return;
       const row = ev.target.closest('.frow'); if (!row) return;
@@ -795,38 +877,44 @@ export function renderColumnView(host){
 
     colList.addEventListener('scroll', _paintColList, {passive: true});
     const _colRO = new ResizeObserver(() => { _cPainted = {start:-1, end:-1}; _paintColList(); });
-    _colRO.observe(colList);
-    // Store on colEl so the reconciliation cleanup helper can disconnect it
-    // when this column is removed — prevents accumulating observers on detached elements.
-    colEl._colRO = _colRO;
-    // Defer initial paint to after the column is appended to the DOM so
-    // colList.clientHeight returns the correct layout height, not 0.
-    // The requestAnimationFrame fires after layout; the ResizeObserver also
-    // fires then, but the RAF guard (_cPainted != {-1,-1}) prevents a double paint.
-    // Initial paint: deferred to a RAF so colList.clientHeight is the real layout
-    // height (not 0). Also scrolls to the pre-selected row when navigating back.
-    // Using double-RAF ensures layout is fully complete before we measure heights —
-    // single RAF can still catch a frame where the horizontal scroll container hasn't
-    // settled its scrollbar layout yet, giving a stale clientHeight.
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      if (!colList.isConnected) return; // column was removed before first paint
-      // _patchEntries (called when done:true arrives from the streamer) resets
-      // _cPainted to {0, N} after a full repaint.  If it already ran by the time
-      // this double-RAF fires, there is nothing to do — bailing here prevents a
-      // second reset+repaint that flashes visible rows at the wrong scroll offset
-      // (the 3rd-column glitch when navigating quickly into deep subdirectories).
-      if (_cPainted.start !== -1) return;
-      if (col.selIdx >= 0) {
-        const targetTop = col.selIdx * CROW_H;
-        const VH = colList.clientHeight || 400;
-        if (targetTop < colList.scrollTop || targetTop + CROW_H > colList.scrollTop + VH) {
-          colList.scrollTop = Math.max(0, targetTop - Math.floor(VH / 2));
-        }
-      }
-      _paintColList();
-    }));
+    // NOTE: _colRO.observe() and the initial-paint double-RAF are registered AFTER
+    // container.appendChild(colEl) below, so colList is already in the live DOM
+    // when they fire. Observing a detached element causes WebKit2GTK to miss the
+    // first size-change notification; the double-RAF with clientHeight=0 paints rows
+    // that are clipped invisible by contain:paint on the zero-height parent column.
 
+    // ── Sort indicator header ─────────────────────────────────────────────────
+    // Only shown on the last (active) column so it doesn't clutter intermediate columns
     colEl.appendChild(colList);
+    // ── Sort indicator header — inserted AFTER colEl.appendChild(colList) ──────
+    // colEl.insertBefore(sortHdr, colList) requires colList to already be a child
+    // of colEl. Calling it before appendChild throws a DOMException, crashing
+    // renderColumnView and leaving the column blank with status "Loading...".
+    if(ci === state.columns.length - 1){
+      const {sortState} = d();
+      const sortLabel = sortState
+        ? `${sortState.col==='name'?'Name':sortState.col==='date'?'Date':sortState.col==='size'?'Size':'Kind'} ${sortState.dir>0?'↑':'↓'}`
+        : 'Name ↑';
+      const sortHdr = document.createElement('div');
+      sortHdr.className = 'col-sort-hdr';
+      sortHdr.textContent = sortLabel;
+      sortHdr.title = 'Click to cycle sort: Name → Date → Size → Kind';
+      sortHdr.addEventListener('click', () => {
+        const {sortState, saveSortState, render} = d();
+        if(!sortState) return;
+        const cols = ['name','date','size','kind'];
+        const ci2 = cols.indexOf(sortState.col);
+        if(ci2 >= 0 && ci2 < cols.length - 1){
+          sortState.col = cols[ci2 + 1]; sortState.dir = 1;
+        } else if(ci2 === cols.length - 1 && sortState.dir > 0){
+          sortState.dir = -1;
+        } else {
+          sortState.col = 'name'; sortState.dir = 1;
+        }
+        saveSortState?.(); render?.();
+      });
+      colEl.insertBefore(sortHdr, colList);
+    }
     // ── Stable identity for incremental reconciliation ────────────────────
     colEl.dataset.colPath = col.path;
     // _patchEntries: called on subsequent renders when this column's path is unchanged.
@@ -1007,6 +1095,32 @@ export function renderColumnView(host){
     colEl.appendChild(resizeHandle);
     container.appendChild(colEl);
     setupDropTarget(colList,col.path);
+
+    // ── ResizeObserver + initial paint — registered HERE, after colEl is in the DOM ──
+    // colList.clientHeight is 0 for any detached element. Registering before
+    // container.appendChild gives the double-RAF a stale zero height, causing
+    // _paintColList to use the 400px fallback and paint rows that are immediately
+    // clipped invisible by `contain:paint` on the zero-height parent .col.
+    // WebKit2GTK's ResizeObserver also silently misses the initial size notification
+    // when observe() is called on an element that isn't yet connected to the DOM.
+    // Registering both here — after the element has its real layout dimensions —
+    // ensures _paintColList sees the correct clientHeight on first call.
+    colEl._colRO = _colRO;
+    _colRO.observe(colList);
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (!colList.isConnected) return; // column removed before first paint
+      // _patchEntries (done:true streamer chunk) resets _cPainted and repaints.
+      // If it already ran, bail here to avoid a double-repaint at the wrong offset.
+      if (_cPainted.start !== -1) return;
+      if (col.selIdx >= 0) {
+        const targetTop = col.selIdx * CROW_H;
+        const VH = colList.clientHeight || 400;
+        if (targetTop < colList.scrollTop || targetTop + CROW_H > colList.scrollTop + VH) {
+          colList.scrollTop = Math.max(0, targetTop - Math.floor(VH / 2));
+        }
+      }
+      _paintColList();
+    }));
   }); // end state.columns.forEach
 
   // Attach container-level listeners only ONCE — they accumulate across renders otherwise.
@@ -1025,10 +1139,41 @@ export function renderColumnView(host){
     });
   }
   // Always scroll to show new column (this was causing jiggle, but removing it breaks visibility)
+  // Fix 3a: scroll right to show new column — guarded by sequence counter so a
+  // stale rAF callback from a superseded render never hijacks the scroll position.
+  // Use two rAFs: first ensures DOM is painted, second ensures layout is computed.
   if(_newColAppended){
     requestAnimationFrame(()=>{
+      if(_colRenderSeq !== _mySeq) return; // superseded — don't touch scroll
+      // Force layout flush by reading offsetWidth
       const w=host.querySelector('.cols-wrap');
-      if(w) w.scrollLeft = w.scrollWidth;
+      if(w) { void w.offsetWidth; }
+      requestAnimationFrame(()=>{
+        if(_colRenderSeq !== _mySeq) return;
+        const w=host.querySelector('.cols-wrap');
+        if(w) {
+          // Force layout flush
+          void w.offsetWidth;
+          // Scroll to end using max scroll position
+          w.scrollLeft = w.scrollWidth;
+        }
+      });
+    });
+  }
+  // Fix 3b: clamp scrollLeft when columns were removed (navigating back / up).
+  // Without this the viewport sits past the last column showing blank grey space.
+  if(_colsRemoved){
+    requestAnimationFrame(()=>{
+      const w=host.querySelector('.cols-wrap');
+      if(w) {
+        // Force layout flush
+        void w.offsetWidth;
+        // Clamp scroll position to valid range
+        const maxScroll = w.scrollWidth - w.clientWidth;
+        if(w.scrollLeft > maxScroll){
+          w.scrollLeft = Math.max(0, maxScroll);
+        }
+      }
     });
   }
 }
@@ -1315,6 +1460,12 @@ export function renderIconView(host) {
          buildFileCtxMenu,buildBgCtxMenu,handleEntryClick,navigate}=d();
   const entries = getVisibleEntries();
 
+  // Empty state for icon view
+  if(!entries.length){
+    host.innerHTML = '<div class="view-empty-state"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="8" y="6" width="32" height="36" rx="3"/><line x1="14" y1="16" x2="34" y2="16"/><line x1="14" y1="22" x2="28" y2="22"/><line x1="14" y1="28" x2="24" y2="28"/></svg><span>Empty folder</span></div>';
+    host.addEventListener('contextmenu', ev=>{ev.preventDefault();showContextMenu(ev.clientX,ev.clientY,buildBgCtxMenu());},{once:true});
+    return;
+  }
   const iconSz  = state.iconSize || 80;
   const ITEM_W  = iconSz * 2 + 16;
   const ITEM_H  = iconSz + 78;
@@ -1413,14 +1564,16 @@ export function renderIconView(host) {
     const isSel = sel.hasp(e.path);
     const isCut = state.clipboard.op === 'cut' && state.clipboard.entries?.some(x => x.path === e.path);
     const ext   = (e.extension || '').toLowerCase();
-    const isImg = IMAGE_EXTS.includes(ext);
-    const thumbUrl = isImg ? _thumbCache.get(e.path) : null;
+    const isImg   = IMAGE_EXTS.includes(ext);
+    const isVideo  = VIDEO_EXTS.includes(ext);
+    const thumbUrl = (isImg || isVideo) ? _thumbCache.get(e.path) : null;
     const color = fileColor(e);
 
     const div = document.createElement('div');
     div.className = `icon-item${isSel ? ' sel' : ''}${e.is_hidden ? ' hid' : ''}${isCut ? ' cut-item' : ''}`;
     div.dataset.idx = idx;
     div.dataset.path = e.path;
+    div.setAttribute('role','option'); div.setAttribute('aria-selected', isSel ? 'true' : 'false'); div.setAttribute('aria-label', e.name + (e.is_dir ? ', folder' : ''));
     const _iconTag = !isSel ? (state._fileTags?.[e.path]||[])[0] : null;
     div.style.cssText = `
       position:absolute;
@@ -1450,6 +1603,13 @@ export function renderIconView(host) {
       img.dataset.path = e.path;
       img.style.cssText = `width:100%;height:100%;object-fit:cover;border-radius:7px;display:block;`;
       box.appendChild(img);
+      // Play indicator overlay for video thumbnails
+      if (isVideo) {
+        const play = document.createElement('div');
+        play.style.cssText = `position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;`;
+        play.innerHTML = `<div style="width:28px;height:28px;background:rgba(0,0,0,0.55);border-radius:50%;display:flex;align-items:center;justify-content:center;"><svg width="12" height="14" viewBox="0 0 12 14" fill="white"><polygon points="1,1 11,7 1,13"/></svg></div>`;
+        box.appendChild(play);
+      }
     } else {
       // SVG icon — direct innerHTML, guaranteed to render in WebKitGTK
       const iconWrap = document.createElement('div');
@@ -1460,12 +1620,23 @@ export function renderIconView(host) {
       const svg = iconWrap.querySelector('svg');
       if (svg) { svg.style.width = spSz+'px'; svg.style.height = spSz+'px'; svg.style.display = 'block'; }
       box.appendChild(iconWrap);
-      if (isImg) {
-        // Hidden placeholder img; will be shown when thumb loads
+      if (isImg || isVideo) {
+        // Hidden placeholder img/video-thumb; will be shown when thumb loads
         const img = document.createElement('img');
         img.dataset.path = e.path;
         img.style.cssText = `position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:7px;display:none;`;
-        img.onload = () => { img.style.display = 'block'; iconWrap.style.display = 'none'; };
+        img.onload = () => {
+          img.style.display = 'block';
+          iconWrap.style.display = 'none';
+          // Add play overlay once thumbnail is visible
+          if (isVideo && !box.querySelector('.play-overlay')) {
+            const play = document.createElement('div');
+            play.className = 'play-overlay';
+            play.style.cssText = `position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;`;
+            play.innerHTML = `<div style="width:28px;height:28px;background:rgba(0,0,0,0.55);border-radius:50%;display:flex;align-items:center;justify-content:center;"><svg width="12" height="14" viewBox="0 0 12 14" fill="white"><polygon points="1,1 11,7 1,13"/></svg></div>`;
+            box.appendChild(play);
+          }
+        };
         box.appendChild(img);
       }
     }
@@ -1546,8 +1717,21 @@ export function renderIconView(host) {
         item.addEventListener('click', async ev => {
           // Snapshot scroll NOW — handleEntryClick→render() will destroy iv-wrap
           state._iconScroll = {path: state.currentPath, top: wrap.scrollTop};
+          // Slow double-click on label (already selected item) → inline rename
+          const lbl = ev.target.closest('.ico-lbl');
+          if(lbl && sel.has(idx) && !ev.shiftKey && !ev.ctrlKey && !ev.metaKey){
+            // Already selected — start rename timer (macOS Finder behaviour)
+            clearTimeout(item._renameTimer);
+            item._renameTimer = setTimeout(() => {
+              const {startRename} = d();
+              if(startRename) startRename(e);
+            }, 600);
+            return;
+          }
+          clearTimeout(item._renameTimer);
           await handleEntryClick(e, idx, ev); paint();
         });
+        item.addEventListener('mousedown', () => { clearTimeout(item._renameTimer); });
         item.addEventListener('dblclick', () => {
           if (e.is_dir) navigate(e.path, 0);
           else invoke('open_file', {path: e.path}).catch(() => {});
@@ -1562,7 +1746,7 @@ export function renderIconView(host) {
         rowsEl.appendChild(item);
 
         const ext = (e.extension || '').toLowerCase();
-        if (IMAGE_EXTS.includes(ext) && !_thumbCache.has(e.path)) needThumb.push(e.path);
+        if ((IMAGE_EXTS.includes(ext) || VIDEO_EXTS.includes(ext)) && !_thumbCache.has(e.path)) needThumb.push(e.path);
       }
     }
 
@@ -1679,6 +1863,12 @@ export function renderListView(host){
   let LV_ROW_H = 29; // initial estimate; overwritten after first paint
   const LV_OVERSCAN = 6;
 
+  // Empty state
+  if(!entries.length){
+    host.innerHTML = '<div class="view-empty-state"><svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="8" y="6" width="32" height="36" rx="3"/><line x1="14" y1="16" x2="34" y2="16"/><line x1="14" y1="22" x2="28" y2="22"/><line x1="14" y1="28" x2="24" y2="28"/></svg><span>Empty folder</span></div>';
+    host.addEventListener('contextmenu', ev=>{ev.preventDefault();showContextMenu(ev.clientX,ev.clientY,buildBgCtxMenu());},{once:true});
+    return;
+  }
   host.innerHTML=`<div class="list-wrap" id="lv-wrap">
     <table class="list-table">
       <colgroup>
@@ -1734,11 +1924,12 @@ export function renderListView(host){
     const tr = document.createElement('tr');
     tr.className = `list-row${isSel?' sel':''}${e.is_hidden?' hid':''}${isCut?' cut-item':''}`;
     tr.dataset.idx = i; tr.dataset.path = e.path; tr.dataset.dir = e.is_dir;
+    tr.setAttribute('role','row'); tr.setAttribute('aria-selected',isSel?'true':'false'); tr.setAttribute('aria-label',e.name+(e.is_dir?', folder':''));
     tr.innerHTML = `
       <td class="cell-name"${tdBg}>
         <span class="fico" style="color:${fileColor(e)};width:16px;height:16px;display:inline-flex;align-items:center;flex-shrink:0">${fileIcon(e)}</span>
         <span class="cell-name-text">${escHtml(e.name)}${e.is_symlink?'<span class="sym-arrow">\u2192</span>':''}</span>
-        ${(state._fileTags?.[e.path]||[]).map(t=>`<span class="row-tag" style="background:${tagColor(t)}22;color:${tagColor(t)};border:1px solid ${tagColor(t)}44">${t}</span>`).join('')}
+        ${(state._fileTags?.[e.path]||[]).map(t=>`<span class="row-tag" style="background:${tagColor(t)}22;color:${tagColor(t)};border:1px solid ${tagColor(t)}44">${t}</span>`).join('')}${d().gitBadgeHtml?.(e.path)??''}
       </td>
       <td class="cell-meta"${tdBg}>${fmtDate(e.modified)}</td>
       <td class="cell-meta"${tdBg}>${e.is_dir?'--':fmtSize(e.size)}</td>
@@ -1801,6 +1992,12 @@ export function renderListView(host){
     // the stable #view-host element, untouched by the rebuild) to find the new
     // #lv-wrap and restore its scroll position.
     requestAnimationFrame(() => { const lw = host.querySelector('#lv-wrap'); if (lw) lw.scrollTop = sv; });
+  });
+  lvWrap?.addEventListener('auxclick', ev => {
+    if(ev.button!==1) return;
+    const row = ev.target.closest('.list-row'); if(!row) return;
+    const entry = entries[+row.dataset.idx]; if(!entry||!entry.is_dir) return;
+    ev.preventDefault(); d().newTab?.(entry.path);
   });
   lvWrap?.addEventListener('dblclick', ev => {
     const row = ev.target.closest('.list-row'); if (!row) return;
@@ -1876,15 +2073,89 @@ export function renderListView(host){
   }
 }
 
+
+// Highlight matching substring in search results
+function _hlMatch(name, query) {
+  if(!query) return escHtml(name);
+  // Strip regex: prefix and use raw query for highlight
+  const q = query.startsWith('regex: ') ? '' : query;
+  if(!q) return escHtml(name);
+  try {
+    const re = new RegExp('('+q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')', 'gi');
+    return escHtml(name).replace(re, '<mark class="search-hl">$1</mark>');
+  } catch(_) { return escHtml(name); }
+}
+
+function _wireFilterBar(host, render) {
+  const {state} = d();
+  if (!host.querySelector('#sr-ftype')) return;
+  const apply = () => render();
+  host.querySelector('#sr-ftype')?.addEventListener('change', e => { state._srFilter.type=e.target.value; apply(); });
+  host.querySelector('#sr-fdate')?.addEventListener('change', e => { state._srFilter.date=e.target.value; apply(); });
+  let _sft=null;
+  host.querySelector('#sr-fmin')?.addEventListener('input', e => { clearTimeout(_sft); _sft=setTimeout(()=>{state._srFilter.minSize=e.target.value;apply();},400); });
+  host.querySelector('#sr-fmax')?.addEventListener('input', e => { clearTimeout(_sft); _sft=setTimeout(()=>{state._srFilter.maxSize=e.target.value;apply();},400); });
+  host.querySelector('#sr-fclr')?.addEventListener('click', () => { state._srFilter={type:'',minSize:'',maxSize:'',date:''}; apply(); });
+}
+
 export function renderFlatList(host,entries){
   const {state,sel,handleEntryClick,navigate,render,showContextMenu,
          buildFileCtxMenu,buildBgCtxMenu,setupDragDrop,setupDropTarget}=d();
   if(state.loading){host.innerHTML='<div class="search-loading"><div class="spinner"></div><span>Searching all drives...</span></div>';return;}
 
-  // Apply hidden-file filter here — callers pass raw state.searchResults which may include hidden files
+  // Apply hidden-file filter
   if(!state.showHidden) entries=entries.filter(x=>!x.is_hidden);
 
-  if(!entries.length){host.innerHTML='<div class="search-empty">No results for "' + (escHtml(state.searchQuery)) + '"</div>';return;}
+  // ── Search filters ─────────────────────────────────────────────────────────
+  // Persistent per-session filter state on state (not tab-persisted — intentional)
+  if(!state._srFilter) state._srFilter={type:'',minSize:'',maxSize:'',date:''};
+  const sf=state._srFilter;
+  // Apply filters client-side
+  let filtered=entries;
+  if(sf.type==='folder') filtered=filtered.filter(e=>e.is_dir);
+  else if(sf.type) filtered=filtered.filter(e=>!e.is_dir&&(e.extension||'').toLowerCase()===sf.type);
+  if(sf.minSize){const mb=parseFloat(sf.minSize)*1024*1024;filtered=filtered.filter(e=>!e.is_dir&&(e.size||0)>=mb);}
+  if(sf.maxSize){const mb=parseFloat(sf.maxSize)*1024*1024;filtered=filtered.filter(e=>!e.is_dir&&(e.size||0)<=mb);}
+  if(sf.date){
+    const cutoff=Date.now()-({'1d':86400,'7d':7*86400,'30d':30*86400}[sf.date]||0)*1000;
+    filtered=filtered.filter(e=>(e.modified||0)*1000>=cutoff);
+  }
+
+  // Collect distinct file types for the type dropdown
+  const typeSet=new Set(entries.filter(e=>!e.is_dir&&e.extension).map(e=>(e.extension||'').toLowerCase()));
+  const hasFolder=entries.some(e=>e.is_dir);
+  const typeOpts=['<option value="">All types</option>',
+    hasFolder?'<option value="folder">Folders</option>':'',
+    ...[...typeSet].sort().map(t=>`<option value="${escHtml(t)}" ${sf.type===t?'selected':''}>${t.toUpperCase()}</option>`)
+  ].join('');
+
+  const activeFilters=sf.type||sf.minSize||sf.maxSize||sf.date;
+  const filterBarHtml=`<div class="sr-filter-bar">
+    <select class="sr-filter-select" id="sr-ftype">
+      ${typeOpts}
+    </select>
+    <select class="sr-filter-select" id="sr-fdate">
+      <option value="" ${!sf.date?'selected':''}>Any date</option>
+      <option value="1d" ${sf.date==='1d'?'selected':''}>Today</option>
+      <option value="7d" ${sf.date==='7d'?'selected':''}>Last 7 days</option>
+      <option value="30d" ${sf.date==='30d'?'selected':''}>Last 30 days</option>
+    </select>
+    <div class="sr-filter-size">
+      <input class="sr-filter-input" id="sr-fmin" type="number" placeholder="Min MB" min="0" value="${escHtml(sf.minSize)}" title="Min size in MB">
+      <span style="color:#636368;font-size:10px;">–</span>
+      <input class="sr-filter-input" id="sr-fmax" type="number" placeholder="Max MB" min="0" value="${escHtml(sf.maxSize)}" title="Max size in MB">
+      <span style="color:#636368;font-size:10px;">MB</span>
+    </div>
+    ${activeFilters?'<button class="sr-filter-clear" id="sr-fclr">Clear filters</button>':''}
+    <span class="sr-filter-count">${filtered.length} / ${entries.length}</span>
+  </div>`;
+
+  if(!filtered.length){
+    host.innerHTML=filterBarHtml+'<div class="search-empty">'+(activeFilters?'No results match the active filters — try clearing them.':'No results for "'+escHtml(state.searchQuery)+'"')+'</div>';
+    _wireFilterBar(host,render);
+    return;
+  }
+  entries=filtered;
 
   // Per-column widths stored in state.colWidths under 'sr-*' keys
   const W={name:state.colWidths['sr-name']||260,loc:state.colWidths['sr-loc']||220,
@@ -1902,7 +2173,7 @@ export function renderFlatList(host,entries){
   });
   const arrow=c=>sc===c?`<span class="sort-arrow">${sd>0?'↑':'↓'}</span>`:'';
 
-  host.innerHTML=`<div class="list-wrap"><table class="list-table">
+  host.innerHTML=filterBarHtml+`<div class="list-wrap"><table class="list-table">
     <colgroup>
       <col id="sr-col-name" style="width:${W.name}px">
       <col id="sr-col-loc"  style="width:${W.loc}px">
@@ -1927,7 +2198,7 @@ export function renderFlatList(host,entries){
                     data-idx="${i}" data-path="${e.path.replace(/"/g,'&quot;')}" data-dir="${e.is_dir}">
           <td class="cell-name"${tdBg2}>
             <span class="fico" style="color:${fileColor(e)};width:16px;height:16px;display:inline-flex;align-items:center;flex-shrink:0">${fileIcon(e)}</span>
-            <span class="cell-name-text">${escHtml(e.name)}${e.is_symlink?'<span class="sym-arrow">→</span>':''}</span>
+            <span class="cell-name-text">${_hlMatch(e.name,state.searchQuery)}${e.is_symlink?'<span class="sym-arrow">→</span>':''}</span>
           </td>
           <td class="cell-meta"${tdBg2}>${escHtml(loc)}</td>
           <td class="cell-meta"${tdBg2}>${fmtDate(e.modified)}</td>
@@ -2041,7 +2312,7 @@ function _wireFontInstall(fontPath, panel) {
       if (s) { s.textContent = '✓ Installed'; s.style.color = '#34d399'; }
       if (b) { b.textContent = '✓ Installed'; b.classList.add('pv-font-installed'); }
       setTimeout(() => { if (pw) pw.style.display = 'none'; }, 1200);
-      d().showToast(`Font installed: ${filename}`, 'success');
+      d().showToast(t('toast.font_installed',{name:filename}),'success');
     } catch(err) {
       if (pb) { pb.style.width = '100%'; pb.classList.add('red'); }
       if (s) { s.textContent = String(err); s.style.color = '#f87171'; }
@@ -2167,14 +2438,27 @@ export async function renderGalleryView(host){
   };
 
   // ── Build toolbar-bar HTML ───────────────────────────────────────────────────
-  const _buildBarHtml=()=>`
-    ${sel_e&&!sel_e.is_dir?`<button class="gallery-open-btn" id="gallery-open">${I.openExt} Open</button>`:'<span></span>'}
+  // Fit-to-window toggle: when on, image fills the container; zoom controls disabled
+  if(state._galleryFit===undefined) state._galleryFit=false;
+  const isFit=!!state._galleryFit;
+  if(state._galSlideshow===undefined) state._galSlideshow=false;
+  const _isSS=!!state._galSlideshow;
+  let _buildBarHtml=()=>`
+    <div class="gallery-ss-bar-wrap" style="display:${_isSS?'block':'none'}"><div id="gallery-ss-bar" class="gallery-ss-bar"></div></div>
+    <div style="display:flex;align-items:center;gap:6px;">
+      ${sel_e&&!sel_e.is_dir?`<button class="gallery-open-btn" id="gallery-open">${I.openExt} Open</button>`:'<span></span>'}
+      <button class="gallery-open-btn${_isSS?' gallery-ss-active':''}" id="gallery-slideshow" title="Slideshow (S)" style="font-size:11px;padding:0 10px;${_isSS?'background:var(--accent-blue);color:#fff;border-color:var(--accent-blue);':''}">
+        ${_isSS?'⏹ Stop':'▶ Slideshow'}
+      </button>
+    </div>
     ${canZoom&&!VIDEO_EXTS.includes(sel_e?.extension||'')?`<div class="gallery-zoom-bar">
-      <button class="gallery-zoom-btn" id="gz-out" title="Zoom Out (-)">&#x2212;</button>
-      <span class="gallery-zoom-pct" id="gz-pct">${zoomPct}%</span>
-      <button class="gallery-zoom-btn" id="gz-in" title="Zoom In (+)">+</button>
+      <button class="gallery-zoom-btn${isFit?' active':''}" id="gz-fit" title="Fit to window (F)" style="font-size:10px;padding:0 8px;${isFit?'background:var(--accent-blue);color:#fff;':''}">Fit</button>
+      <button class="gallery-zoom-btn" id="gz-out" title="Zoom Out (-)" ${isFit?'disabled style="opacity:.35;pointer-events:none"':''}>&#x2212;</button>
+      <span class="gallery-zoom-pct" id="gz-pct">${isFit?'fit':zoomPct+'%'}</span>
+      <button class="gallery-zoom-btn" id="gz-in" title="Zoom In (+)" ${isFit?'disabled style="opacity:.35;pointer-events:none"':''}>+</button>
       <button class="gallery-zoom-btn" id="gz-reset" title="Reset Zoom (0)" style="font-size:10px;padding:0 6px">&#x27F3;</button>
-    </div>`:''}`;
+    </div>`:''}
+`;
 
   // ── Load media content into already-inserted DOM slots ───────────────────────
   const _loadContent=()=>{
@@ -2230,10 +2514,56 @@ export async function renderGalleryView(host){
     const pctEl=document.getElementById('gz-pct');
     if(pctEl)pctEl.textContent=Math.round(z*100)+'%';
   };
+  const _applyFit=()=>{
+    const imgEl=document.querySelector('#gallery-img-slot img.gallery-main-img');
+    if(!imgEl)return;
+    if(state._galleryFit){
+      imgEl.style.cssText='width:100%;height:100%;object-fit:contain;cursor:default;max-width:unset;max-height:unset;';
+    } else {
+      imgEl.style.cssText='';
+      _applyZoom();
+    }
+  };
+  const _rebuildBar=()=>{
+    const barEl=host.querySelector('.gallery-bar');
+    if(barEl){barEl.innerHTML=_buildBarHtml();_bindZoom();}
+  };
   const _bindZoom=()=>{
-    document.getElementById('gz-in')?.addEventListener('click',()=>{state._galleryZoom=Math.min((state._galleryZoom||1)+0.25,5);_applyZoom();});
-    document.getElementById('gz-out')?.addEventListener('click',()=>{state._galleryZoom=Math.max((state._galleryZoom||1)-0.25,0.25);_applyZoom();});
-    document.getElementById('gz-reset')?.addEventListener('click',()=>{state._galleryZoom=1;_applyZoom();});
+    document.getElementById('gallery-slideshow')?.addEventListener('click',()=>{
+      state._galSlideshow=!state._galSlideshow;
+      _rebuildBar();
+      if(state._galSlideshow){
+        // Start slideshow — advance every 3s
+        clearInterval(state._galSSTimer);
+        const _startSSBar=()=>{const el=document.getElementById('gallery-ss-bar');if(!el)return;el.style.transition='none';el.style.width='0%';requestAnimationFrame(()=>{el.style.transition=`width ${(state._galSSInterval||3)*1000}ms linear`;el.style.width='100%';});};
+        _startSSBar();
+        state._galSSTimer=setInterval(async()=>{
+          const ents=d().getVisibleEntries?.()??[];
+          const nonDir=ents.filter(e=>!e.is_dir);
+          if(!nonDir.length) return;
+          const cur=state.gallerySelIdx>=0?state.gallerySelIdx:0;
+          const curNonDir=nonDir.findIndex(e=>ents[cur]?.path===e.path);
+          const nextNonDir=(curNonDir+1)%nonDir.length;
+          const nextIdx=ents.indexOf(nonDir[nextNonDir]);
+          state.gallerySelIdx=nextIdx>=0?nextIdx:0;
+          state.selIdx=state.gallerySelIdx;
+          await renderGalleryView(host);
+          await d().loadPreview?.(ents[state.gallerySelIdx]);
+          _startSSBar();
+        }, (state._galSSInterval||3)*1000);
+      } else {
+        clearInterval(state._galSSTimer);
+        state._galSSTimer=null;
+      }
+    });
+    document.getElementById('gz-fit')?.addEventListener('click',()=>{
+      state._galleryFit=!state._galleryFit;
+      if(state._galleryFit)state._galleryZoom=1;
+      _rebuildBar(); _applyFit();
+    });
+    document.getElementById('gz-in')?.addEventListener('click',()=>{if(state._galleryFit)return;state._galleryZoom=Math.min((state._galleryZoom||1)+0.25,5);_applyZoom();});
+    document.getElementById('gz-out')?.addEventListener('click',()=>{if(state._galleryFit)return;state._galleryZoom=Math.max((state._galleryZoom||1)-0.25,0.25);_applyZoom();});
+    document.getElementById('gz-reset')?.addEventListener('click',()=>{state._galleryFit=false;state._galleryZoom=1;_rebuildBar();_applyZoom();});
     if(!host._gzKeyBound){
       host._gzKeyBound=true;
       // Store the listener so the full-rebuild path can remove it before re-adding,
@@ -2253,7 +2583,12 @@ export async function renderGalleryView(host){
   // Only swap main area + bar + update selection on already-rendered strip items.
   // Strip DOM, thumb images, and virtual scroll position are completely untouched.
   const meta=host._galleryMeta;
-  if(meta&&meta.path===state.currentPath&&meta.count===entries.length){
+  // CRITICAL: host._galleryMeta is a JS property that survives host.innerHTML
+  // reassignment by other views (column/list/icon all clobber gallery DOM via
+  // host.innerHTML). Without the querySelector guard, switching Column→Gallery
+  // matches the stale meta, takes the incremental path, finds no #gallery-strip
+  // (null), renders no thumbnail strip, and adds no click listener — broken gallery.
+  if(meta&&meta.path===state.currentPath&&meta.count===entries.length&&host.querySelector('.gallery-wrap')){
     const mainEl=host.querySelector('#gallery-main');
     if(mainEl) mainEl.innerHTML=_buildMainHtml();
     const barEl=host.querySelector('.gallery-bar');
@@ -2292,8 +2627,16 @@ export async function renderGalleryView(host){
     <div class="gallery-bar">${_buildBarHtml()}</div>
     <div class="gallery-strip-wrap"><div class="gallery-strip" id="gallery-strip"></div></div>
   </div>`;
+  // Capture previous path BEFORE stamping new meta so the slideshow check below
+  // can compare old vs new. Stamping first made meta.path === currentPath always
+  // true, so the slideshow never stopped on directory navigation.
+  const _prevGalleryPath = host._galleryMeta?.path;
   // Stamp meta so incremental path can identify this render
   host._galleryMeta={path:state.currentPath,count:entries.length};
+  // Stop slideshow if we navigated to a different directory
+  if(state._galSlideshow && _prevGalleryPath !== state.currentPath){
+    clearInterval(state._galSSTimer); state._galSSTimer=null; state._galSlideshow=false;
+  }
   // Remove any previous zoom keydown listener before the new one is wired up in _bindZoom()
   if(host._gzKeyFn){document.removeEventListener('keydown',host._gzKeyFn);host._gzKeyFn=null;}
   host._gzKeyBound=false;
@@ -2409,7 +2752,18 @@ function _loadGthumb(el){
     const img=document.createElement('img');
     img.decoding='async';img.loading='lazy';img.className='gthumb-img';
     img.style.cssText='width:100%;height:60px;object-fit:cover;border-radius:4px 4px 0 0;display:block;flex-shrink:0;opacity:0;transition:opacity .15s ease-out;';
-    img.onload=()=>{img.style.opacity='1';};
+    const isVid = VIDEO_EXTS.includes((el.dataset.thumbPath||'').split('.').pop().toLowerCase());
+    img.onload=()=>{
+      img.style.opacity='1';
+      // Play indicator for video thumbnails in the gallery strip
+      if (isVid && !el.querySelector('.gthumb-play')) {
+        const play = document.createElement('div');
+        play.className = 'gthumb-play';
+        play.style.cssText = 'position:absolute;top:2px;right:3px;pointer-events:none;';
+        play.innerHTML = '<div style="width:16px;height:16px;background:rgba(0,0,0,0.6);border-radius:50%;display:flex;align-items:center;justify-content:center;"><svg width="6" height="8" viewBox="0 0 6 8" fill="white"><polygon points="0,0 6,4 0,8"/></svg></div>';
+        el.appendChild(play);
+      }
+    };
     img.src=url;
     if(existing)existing.replaceWith(img);else el.prepend(img);
   };
@@ -2496,7 +2850,7 @@ export function renderPreview(){
     };
     renderFolderPanel(null);
     // Fetch real folder size async — show nothing (not '--') for empty/inaccessible folders
-    invoke('get_dir_size',{path:e.path}).then(bytes=>{
+    invoke('get_dir_size_fast',{path:e.path}).then(bytes=>{
       if(state.previewEntry===e) renderFolderPanel(bytes>0?fmtSize(bytes):null);
     }).catch(()=>{});
     return;
@@ -2521,6 +2875,49 @@ export function renderPreview(){
     const src=thumbUrl||imgUrl;
     content=`<div class="preview-image-wrap"><img src="${src}" decoding="async" loading="lazy" class="preview-img" id="preview-img"
       ${thumbUrl?'data-full="' + (imgUrl) + '"':''}/><div class="preview-img-hint">Click for fullscreen</div></div>`;
+  }else if(ARCHIVE_EXTS.includes(ext2)||['zip','tar','gz','bz2','xz','zst','7z','rar','tgz','tbz2','txz'].includes(ext2)){
+    // ── Archive content preview ──────────────────────────────────────────────
+    content=`<div class="preview-archive-wrap" id="archive-preview-wrap">
+      <div class="archive-header">
+        <span style="color:${fileColor(e)}">${fileIcon(e).replace('<svg','<svg style="width:36px;height:36px"')}</span>
+        <div>
+          <div class="archive-name">${escHtml(e.name)}</div>
+          <div class="archive-size">${e.size!=null?fmtSize(e.size):''}</div>
+        </div>
+      </div>
+      <div class="archive-contents" id="archive-contents">
+        <div class="archive-loading"><div class="spinner" style="width:14px;height:14px"></div><span>Reading archive…</span></div>
+      </div>
+    </div>`;
+    // Load archive contents async after panel renders
+    requestAnimationFrame(()=>{
+      const contEl=document.getElementById('archive-contents');
+      if(!contEl)return;
+      invoke('get_archive_contents',{path:e.path}).then(items=>{
+        if(!contEl.isConnected)return;
+        if(!items||!items.length){contEl.innerHTML='<div class="archive-empty">Archive is empty</div>';return;}
+        const dirs=new Set();
+        items.forEach(it=>{
+          const parts=it.name.split('/');
+          for(let i=1;i<parts.length;i++)dirs.add(parts.slice(0,i).join('/'));
+        });
+        const files=items.filter(it=>!it.name.endsWith('/'));
+        const totalSize=files.reduce((a,b)=>a+(b.size||0),0);
+        contEl.innerHTML=`<div class="archive-stats">${files.length} file${files.length!==1?'s':''} · ${dirs.size} folder${dirs.size!==1?'s':''} · ${fmtSize(totalSize)} uncompressed</div>`+
+          items.slice(0,80).map(it=>{
+            const isDir=it.name.endsWith('/');
+            const depth=(it.name.split('/').length-1)-(isDir?1:0);
+            const nm=it.name.split('/').filter(Boolean).pop()||it.name;
+            return `<div class="archive-item" style="padding-left:${8+depth*14}px">
+              <span class="archive-item-icon">${isDir?I.folder.replace('<svg','<svg style="width:12px;height:12px"'):''}</span>
+              <span class="archive-item-name">${escHtml(nm)}</span>
+              ${!isDir&&it.size?`<span class="archive-item-size">${fmtSize(it.size)}</span>`:''}
+            </div>`;
+          }).join('')+(items.length>80?`<div class="archive-more">…and ${items.length-80} more items</div>`:'');
+      }).catch(err=>{
+        if(contEl.isConnected)contEl.innerHTML=`<div class="archive-error">Cannot read archive: ${escHtml(String(err))}</div>`;
+      });
+    });
   }else if(ISO_EXTS.includes(ext2)){
     // ── ISO disc image preview ──────────────────────────────────────────────
     // Shows mount/unmount and write-to-USB controls. Mount state is determined
@@ -2578,7 +2975,13 @@ export function renderPreview(){
     content=`<div class="preview-binary"><span style="color:${fileColor(e)}">${fileIcon(e).replace('<svg','<svg style="width:40px;height:40px"')}</span><span>${mimeLabel(d2.mime_type)}</span></div>`;
   }
   const extLabel=(e.extension||'').toUpperCase();
-  panel.innerHTML='\n    <div class="preview-header">\n      <span class="preview-icon" style="color:' + (fileColor(e)) + '">' + (fileIcon(e).replace('<svg','<svg style="width:48px;height:48px"')) + '</span>\n      <div class="preview-name">' + escHtml(e.name) + '</div>\n      <div class="preview-kind">' + (extLabel?extLabel+' · ':'') + (d2?mimeLabel(d2.mime_type):'') + '</div>\n    </div>\n    ' + (content) + '\n    ' + (renderTagsUI(e,state)) + '\n    <div class="preview-meta">\n      <div class="preview-row"><span>Size</span><span>' + (fmtSize(e.size)) + '</span></div>\n      <div class="preview-row"><span>Modified</span><span>' + (fmtDate(e.modified)) + '</span></div>\n      <div class="preview-row"><span>Permissions</span><span class="mono">' + (e.permissions||'--') + '</span></div>\n      ' + (d2?.line_count!=null?'<div class="preview-row"><span>Lines</span><span>' + (d2.line_count.toLocaleString()) + '</span></div>':'') + '\n    </div>\n    <button class="preview-open-btn" id="preview-open">' + (I.openExt) + ' Open with default app</button>';
+  // r125-r138: determine which meta editors apply to this file
+  const _isImg   = IMAGE_EXTS.includes(ext2);
+  const _isAudio = AUDIO_EXTS.includes(ext2);
+  const _isPdf   = ext2 === 'pdf';
+  const _hasMetaEditor = _isImg || _isAudio || _isPdf;
+
+  panel.innerHTML='\n    <div class="preview-header">\n      <span class="preview-icon" style="color:' + (fileColor(e)) + '">' + (fileIcon(e).replace('<svg','<svg style="width:48px;height:48px"')) + '</span>\n      <div class="preview-name">' + escHtml(e.name) + '</div>\n      <div class="preview-kind">' + (extLabel?extLabel+' · ':'') + (d2?mimeLabel(d2.mime_type):'') + '</div>\n    </div>\n    ' + (content) + '\n    ' + (renderTagsUI(e,state)) + '\n    <div class="preview-meta">\n      <div class="preview-row"><span>Size</span><span>' + (fmtSize(e.size)) + '</span></div>\n      <div class="preview-row"><span>Modified</span><span>' + (fmtDate(e.modified)) + '</span></div>\n      <div class="preview-row"><span>Permissions</span><span class="mono">' + (e.permissions||'--') + '</span></div>\n      ' + (d2?.line_count!=null?'<div class="preview-row"><span>Lines</span><span>' + (d2.line_count.toLocaleString()) + '</span></div>':'') + '\n      <div class="preview-row" id="pv-checksum-row">\n        <span>Checksum</span>\n        <button class="pv-checksum-reveal" id="pv-checksum-btn" style="background:none;border:none;color:var(--accent-blue);font-size:10px;cursor:pointer;padding:0;">Reveal</button>\n      </div>\n    </div>\n    ' + (_hasMetaEditor ? '<button class="preview-open-btn pv-edit-meta-btn" id="pv-edit-meta-btn" style="margin-top:0">✏ Edit Metadata</button>' : '') + '\n    <button class="preview-open-btn" id="preview-open">' + (I.openExt) + ' Open with default app</button>';
 
   document.getElementById('preview-open')?.addEventListener('click',()=>invoke('open_file',{path:e.path}).catch(()=>{}));
   // Track file currently shown in preview (used for same-file guard on next render)
@@ -2606,6 +3009,8 @@ export function renderPreview(){
     if(VIDEO_EXTS.includes(ext2)){
       // Slot was already stopped before panel.innerHTML; just mount fresh player
       _mountMpvPlayer(slot, e.path).catch(()=>{});
+      // r42: codec badge
+      injectVideoCodecBadge(panel, e.path);
     }else if(AUDIO_EXTS.includes(ext2)){
       // Reuse existing audio element if it's the same file — avoids double createMediaElementSource
       const existing=slot.querySelector('audio');
@@ -2649,6 +3054,39 @@ export function renderPreview(){
   if (ISO_EXTS.includes(ext2)) {
     _wireIsoPreview(e.path, panel);
   }
+
+  // ── r135: Checksum reveal ─────────────────────────────────────────────────
+  document.getElementById('pv-checksum-btn')?.addEventListener('click', async () => {
+    const row = document.getElementById('pv-checksum-row');
+    if (!row || !panel.isConnected) return;
+    row.innerHTML = '<span>Checksum</span><span style="color:var(--text-tertiary);font-size:10px">Computing…</span>';
+    try {
+      const h = await invoke('get_file_checksums', {path: e.path});
+      if (!row.isConnected) return;
+      const fmt = (label, val) =>
+        `<div class="pv-hash-row"><span class="pv-hash-label">${label}</span>`
+        + `<span class="pv-hash-val" title="${val}">${val.slice(0,16)}…</span>`
+        + `<button class="pv-hash-copy" data-hash="${val}" title="Copy ${label}">⎘</button></div>`;
+      row.innerHTML = '<span style="color:var(--text-tertiary)">Checksum</span>'
+        + `<div class="pv-hash-block">${fmt('MD5',h.md5)}${fmt('SHA-1',h.sha1)}${fmt('SHA-256',h.sha256)}</div>`;
+      row.querySelectorAll('.pv-hash-copy').forEach(btn =>
+        btn.addEventListener('click', () =>
+          navigator.clipboard.writeText(btn.dataset.hash)
+            .then(() => { btn.textContent = '✓'; setTimeout(() => btn.textContent = '⎘', 1500); })
+            .catch(() => {})
+        )
+      );
+    } catch(err) {
+      if (row.isConnected) row.innerHTML = '<span>Checksum</span><span style="color:#f87171;font-size:10px">Failed</span>';
+    }
+  });
+
+  // ── r125/r128/r136: Edit Metadata wiring ─────────────────────────────────
+  document.getElementById('pv-edit-meta-btn')?.addEventListener('click', () => {
+    if (_isImg)   _showExifEditor(e, panel);
+    else if (_isAudio) _showAudioTagEditor(e, panel);
+    else if (_isPdf)   _showPdfMetaEditor(e, panel);
+  });
 }
 
 // ── ISO preview controller ─────────────────────────────────────────────────
@@ -2705,7 +3143,7 @@ function _wireIsoPreview(isoPath, panel) {
       _loopDev = await invoke('get_iso_loop_device', {isoPath});
       setStatus(`Mounted at ${mountpoint}`, true);
       const {showToast, navigate} = d();
-      showToast(`ISO mounted at ${mountpoint}`, 'success');
+      showToast(t('toast.iso_mounted',{path:mountpoint}),'success');
       // Navigate into the mounted ISO automatically
       if (mountpoint) navigate(mountpoint, 0);
     } catch(err) {
@@ -2726,7 +3164,7 @@ function _wireIsoPreview(isoPath, panel) {
       await invoke('unmount_iso', {loopDev: dev});
       _loopDev = '';
       setStatus('Not mounted', false);
-      d().showToast('ISO unmounted', 'success');
+      d().showToast(t('toast.iso_unmounted'),'success');
     } catch(err) {
       setError(`Unmount failed: ${err}`);
     } finally {
@@ -2857,23 +3295,62 @@ function renderTagsUI(e,state){
     return `<button class="tag-swatch${active?' tag-swatch-active':''}" data-tag="${p.name}" data-color="${p.color}"
       style="--sw-color:${p.color};" title="${p.name}${active?' (click to remove)':''}">${active?'<svg viewBox="0 0 10 10" fill="none" stroke="white" stroke-width="2"><polyline points="1.5,5 4,7.5 8.5,2"/></svg>':''}</button>`;
   }).join('');
+  const allTagsManage = (state._allTags||[]).length > 0 ? `
+    <div class="preview-tags-manage" id="preview-tags-manage">
+      ${(state._allTags||[]).map(t=>`<span class="manage-tag-pill" style="background:${tagColor(t)}22;color:${tagColor(t)};border:1px solid ${tagColor(t)}44">
+        ${escHtml(t)}
+        <button class="manage-tag-del" data-tag="${escHtml(t)}" title="Delete tag">×</button>
+      </span>`).join('')}
+    </div>` : '';
   return `<div class="preview-tags" id="preview-tags-section">
     <div class="preview-tags-header">
       <span class="preview-tags-label">${I.tag} Tags</span>
+      <button class="tags-manage-btn" id="tags-manage-toggle" title="Manage tags" style="background:none;border:none;color:#636368;font-size:10px;cursor:pointer;padding:2px 6px;border-radius:4px;">Manage</button>
     </div>
+    ${allTagsManage}
     <div class="preview-tag-swatches" id="preview-tag-swatches">${swatches}</div>
     ${tags.length?'<div class="preview-tags-list" id="preview-tags-list">\n      ' + (tags.map(t=>`<span class="preview-tag" style="background:${tagColor(t)}22;color:${tagColor(t)};border:1px solid ${tagColor(t)}55">${t}</span>`).join('')) + '\n    </div>':''}
   </div>`;
 }
 
 function attachTagHandlers(panel,e,state){
+  // Tags manage toggle
+  panel.querySelector('#tags-manage-toggle')?.addEventListener('click',()=>{
+    const m=panel.querySelector('#preview-tags-manage');
+    if(m) m.style.display = m.style.display==='none'?'flex':'none';
+  });
+  // Delete a tag entirely (from all files)
+  panel.querySelectorAll('.manage-tag-del').forEach(btn=>{
+    btn.addEventListener('click',async ev=>{
+      ev.stopPropagation();
+      const tag=btn.dataset.tag;
+      if(!confirm(`Delete tag "${tag}" from all files? This cannot be undone.`))return;
+      try{
+        // Remove tag from all files that have it
+        const results=await invoke('search_by_tag',{tag});
+        await Promise.all(results.map(async r=>{
+          const cur=await invoke('get_file_tags_v2',{path:r.path}).catch(()=>[]);
+          await invoke('set_file_tags_v2',{path:r.path,tags:cur.filter(t=>t!==tag)}).catch(()=>{});
+        }));
+        // Clear from local state
+        if(state._allTags)state._allTags=state._allTags.filter(t=>t!==tag);
+        if(state._fileTags){
+          Object.keys(state._fileTags).forEach(p=>{
+            state._fileTags[p]=(state._fileTags[p]||[]).filter(t=>t!==tag);
+          });
+        }
+        const {render,renderSidebar}=d();
+        render?.();renderSidebar?.();
+      }catch(err){const {showToast}=d();showToast?.('Delete tag failed: '+err,'error');}
+    });
+  });
   panel.querySelectorAll('.tag-swatch').forEach(btn=>{
     btn.addEventListener('click',async()=>{
       const tag=btn.dataset.tag, color=btn.dataset.color;
       const cur=state._fileTags?.[e.path]||[];
       const newTags=cur.includes(tag)?cur.filter(t=>t!==tag):[...cur,tag];
       await invoke('set_tag_color',{tag,color});
-      await invoke('set_file_tags',{path:e.path,tags:newTags});
+      await invoke('set_file_tags_v2',{path:e.path,tags:newTags});
       if(!state._fileTags)state._fileTags={};
       state._fileTags[e.path]=newTags;
       if(!state._tagColors)state._tagColors={};
@@ -3130,13 +3607,7 @@ export async function openQuickLook(entry, allEntries, startIdx, iconCols) {
   } else {
     window.FF?.log('QL_OPEN_ALREADY_VISIBLE', {});
   }
-  // Do NOT call setFocus() on subsequent calls (arrow key updates).
-}
-
-// quickLookNavigate — reserved for future in-window QL prev/next wiring.
-// Currently QL navigation is handled entirely by openQuickLook() calls from main.js.
-export function quickLookNavigate(dir) {
-  // stub — not used
+   // Do NOT call setFocus() on subsequent calls (arrow key updates).
 }
 
 // Returns true if the QL window is currently visible to the user.
@@ -3154,19 +3625,652 @@ export function closeQuickLook() {
 }
 
 export function renderStatus(){
-  const {state,sel,getCurrentEntries}=d();
+  const {state,sel,getCurrentEntries,sortEntries}=d();
   const entries=getCurrentEntries();
   let count=entries.length,selEntry=null;
   if(state.viewMode==='column'&&!state.searchMode){
     const last=state.columns[state.columns.length-1];
-    if(last){let e=last.entries;if(!state.showHidden)e=e.filter(x=>!x.is_hidden);count=e.length;if(last.selIdx>=0)selEntry=e[last.selIdx];}
+    if(last){
+      // Sort entries to match the sorted display order — selIdx is a display index,
+      // not a raw filesystem index. Without sorting, the status bar showed the
+      // wrong filename whenever the directory wasn't already in sort order on disk.
+      let e=last.entries;
+      if(!state.showHidden)e=e.filter(x=>!x.is_hidden);
+      e=sortEntries(e);
+      count=e.length;
+      if(last.selIdx>=0)selEntry=e[last.selIdx];
+    }
   }else{selEntry=state.selIdx>=0?entries[state.selIdx]:null;}
   const multiSel=sel.size>1;
   const hints={icon:'Icon',list:'List',column:'Column',gallery:'Gallery'};
+  // Total size of multi-selection (only files that have size populated)
+  const selEntries = multiSel ? sel.arr.map(i=>entries[i]).filter(Boolean) : [];
+  const selTotalSize = multiSel ? selEntries.reduce((a,e)=>a+(e.size||0),0) : 0;
   let txt=state.searchMode?(count) + ' result' + (count!==1?'s':'')
-    :multiSel?(sel.size) + ' selected of ' + (count):`${count} item${count!==1?'s':''}`;
+    :multiSel?`${sel.size} selected of ${count} · ${fmtSize(selTotalSize)}`:`${count} item${count!==1?'s':''}`;
   if(!multiSel&&selEntry)txt+=selEntry.is_dir?' · ' + (selEntry.name) + ' (folder)':` · ${selEntry.name} · ${fmtSize(selEntry.size)}`;
   if(state.clipboard.entries.length)txt+=` · ${state.clipboard.entries.length} in clipboard (${state.clipboard.op})`;
   if(!state.searchMode)txt+=`  ·  ${hints[state.viewMode]||''} View`;
   document.getElementById('status').textContent=txt;
+}
+
+// ── Batch Rename Dialog ─────────────────────────────────────────────────────────
+export function showBatchRenameDialog(paths) {
+  document.getElementById('ff-batch-rename-dialog')?.remove();
+  const dlg = document.createElement('div');
+  dlg.id = 'ff-batch-rename-dialog';
+  dlg.style.cssText = 'position:fixed;inset:0;z-index:9200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);';
+  dlg.innerHTML = `
+    <div style="background:#1e1e21;border:1px solid rgba(255,255,255,.13);border-radius:14px;padding:28px 28px 22px;min-width:420px;max-width:500px;box-shadow:0 16px 48px rgba(0,0,0,.75);">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px;">
+        <span style="color:#3b82f6;line-height:0">${I.edit.replace('<svg','<svg style="width:22px;height:22px"')}</span>
+        <div>
+          <div style="font-size:14px;font-weight:600;color:#f1f5f9">Batch Rename</div>
+          <div style="font-size:11px;color:#636368;margin-top:2px;">${paths.length} file${paths.length!==1?'s':''} selected</div>
+        </div>
+      </div>
+      <div style="margin-bottom:16px;">
+        <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Rename Mode</label>
+        <select id="ff-rename-mode" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;cursor:pointer;">
+          <option value="find_replace">Find & Replace</option>
+          <option value="prefix">Add Prefix</option>
+          <option value="suffix">Add Suffix</option>
+          <option value="number">Numbering</option>
+          <option value="case">Change Case</option>
+        </select>
+      </div>
+      <div id="ff-rename-options">
+        <div id="ff-opt-find-replace" class="rename-opt">
+          <input id="ff-find-text" placeholder="Find..." style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;margin-bottom:8px;">
+          <input id="ff-replace-text" placeholder="Replace with..." style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+        <div id="ff-opt-prefix" class="rename-opt" style="display:none;">
+          <input id="ff-prefix-text" placeholder="Prefix text..." style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+        <div id="ff-opt-suffix" class="rename-opt" style="display:none;">
+          <input id="ff-suffix-text" placeholder="Suffix text..." style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+        <div id="ff-opt-number" class="rename-opt" style="display:none;">
+          <div style="display:flex;gap:8px;">
+            <div style="flex:1;">
+              <label style="display:block;font-size:10px;color:#98989f;margin-bottom:4px;">Start #</label>
+              <input id="ff-start-num" type="number" value="1" min="0" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+            </div>
+            <div style="flex:1;">
+              <label style="display:block;font-size:10px;color:#98989f;margin-bottom:4px;">Padding</label>
+              <input id="ff-num-padding" type="number" value="1" min="1" max="10" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px;">
+            <input id="ff-num-prefix" placeholder="Prefix (optional)" style="flex:1;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+            <input id="ff-num-suffix" placeholder="Suffix (optional)" style="flex:1;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+          </div>
+        </div>
+        <div id="ff-opt-case" class="rename-opt" style="display:none;">
+          <select id="ff-case-mode" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;cursor:pointer;">
+            <option value="lower">lowercase</option>
+            <option value="upper">UPPERCASE</option>
+            <option value="title">Title Case</option>
+          </select>
+        </div>
+      </div>
+      <div id="ff-rename-preview-wrap" style="margin-top:12px;display:none;border:1px solid rgba(255,255,255,.08);border-radius:8px;overflow:hidden;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 12px;background:rgba(255,255,255,.03);border-bottom:1px solid rgba(255,255,255,.06);">
+          <span style="font-size:10px;color:#636368;text-transform:uppercase;letter-spacing:.06em;">Preview</span>
+          <span id="ff-rename-preview-count" style="font-size:10px;color:#636368;"></span>
+        </div>
+        <div id="ff-rename-preview" style="max-height:220px;overflow-y:auto;background:#111113;"></div>
+      </div>
+      <div id="ff-rename-err" style="color:#f87171;font-size:11px;margin-top:8px;min-height:16px;"></div>
+      <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+        <button id="ff-rename-cancel-btn" style="padding:7px 16px;background:rgba(255,255,255,.07);border:none;border-radius:7px;color:#98989f;font-size:13px;cursor:pointer;">Cancel</button>
+        <button id="ff-rename-preview-btn" style="padding:7px 16px;background:rgba(59,130,246,.2);border:1px solid #3b82f6;border-radius:7px;color:#3b82f6;font-size:13px;cursor:pointer;">Preview</button>
+        <button id="ff-rename-ok-btn" style="padding:7px 18px;background:#3b82f6;border:none;border-radius:7px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;">Rename</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dlg);
+
+  const cancel = () => dlg.remove();
+  dlg.querySelector('#ff-rename-cancel-btn').addEventListener('click', cancel);
+  dlg.addEventListener('click', ev => { if (ev.target === dlg) cancel(); });
+
+  const modeSelect = dlg.querySelector('#ff-rename-mode');
+  const _livePreview = async () => {
+    const opts = getOptions();
+    if (!opts) return;
+    // Don't preview if no input has been provided
+    const hasInput = (opts.mode==='find_replace'&&(opts.find||opts.replace)) ||
+      (opts.mode==='prefix'&&opts.prefix) || (opts.mode==='suffix'&&opts.suffix) ||
+      opts.mode==='number' || opts.mode==='case';
+    if (!hasInput) return;
+    try {
+      const results = await invoke('batch_rename', { paths, options: { ...opts, dry_run: true } });
+      const previewWrap = dlg.querySelector('#ff-rename-preview-wrap');
+      const preview = dlg.querySelector('#ff-rename-preview');
+      const previewCount = dlg.querySelector('#ff-rename-preview-count');
+      previewWrap.style.display = 'block';
+      const errors = results.filter(r => r.startsWith('ERROR'));
+      const successes = results.filter(r => !r.startsWith('ERROR'));
+      if(previewCount) previewCount.textContent = `${successes.length} file${successes.length!==1?'s':''} will be renamed${errors.length?' · '+errors.length+' error(s)':''}`;
+      preview.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:11.5px;">
+        <thead><tr style="position:sticky;top:0;background:#1a1a1d;border-bottom:1px solid rgba(255,255,255,.08);">
+          <th style="padding:6px 12px;text-align:left;font-weight:500;color:#636368;width:50%;">Before</th>
+          <th style="padding:6px 4px;color:#636368;width:16px;">→</th>
+          <th style="padding:6px 12px;text-align:left;font-weight:500;color:#636368;width:50%;">After</th>
+        </tr></thead>
+        <tbody>${results.map((r,i) => {
+          if(r.startsWith('ERROR')) return `<tr style="background:rgba(248,113,113,.06);">
+            <td style="padding:4px 12px;color:#636368;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:0;">\${escHtml(paths[i]?.split('/').pop()||'')}</td>
+            <td></td>
+            <td style="padding:4px 12px;color:#f87171;font-size:10.5px;">\${escHtml(r.replace('ERROR: ',''))}</td>
+          </tr>`;
+          const newName = r.split('/').pop();
+          const origName = paths[i]?.split('/').pop() || '';
+          const changed = newName !== origName;
+          return `<tr style="border-bottom:1px solid rgba(255,255,255,.04);\${changed?'':'opacity:.4'}">
+            <td style="padding:4px 12px;color:\${changed?'#94a3b8':'#636368'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:0;" title="\${escHtml(origName)}">\${escHtml(origName)}</td>
+            <td style="padding:4px;color:#636368;font-size:10px;">\${changed?'→':'='}</td>
+            <td style="padding:4px 12px;color:\${changed?'#34d399':'#636368'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:0;font-weight:\${changed?500:400};" title="\${escHtml(newName)}">\${escHtml(newName)}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>`;
+    } catch (e) {
+      dlg.querySelector('#ff-rename-err').textContent = e.toString();
+    }
+  };
+  // Debounced live preview on every keystroke
+  let _previewTimer = null;
+  const _schedulePreview = () => { clearTimeout(_previewTimer); _previewTimer = setTimeout(_livePreview, 300); };
+  dlg.addEventListener('input', _schedulePreview);
+
+  modeSelect.addEventListener('change', () => {
+    document.querySelectorAll('.rename-opt').forEach(el => el.style.display = 'none');
+    dlg.querySelector(`#ff-opt-${modeSelect.value}`).style.display = 'block';
+    _schedulePreview();
+  });
+
+  dlg.querySelector('#ff-rename-preview-btn').addEventListener('click', async () => {
+    const opts = getOptions();
+    if (!opts) return;
+    try {
+      const results = await invoke('batch_rename', { paths, options: { ...opts, dry_run: true } });
+      const preview = dlg.querySelector('#ff-rename-preview');
+      preview.style.display = 'block';
+      preview.innerHTML = results.slice(0, 10).map(r => {
+        if (r.startsWith('ERROR')) return `<div style="color:#f87171;">${escHtml(r)}</div>`;
+        return `<div style="color:#34d399;">${escHtml(r.split('/').pop())}</div>`;
+      }).join('') + (results.length > 10 ? `<div style="color:#636368;">...and ${results.length - 10} more</div>` : '');
+    } catch (e) {
+      dlg.querySelector('#ff-rename-err').textContent = e.toString();
+    }
+  });
+
+  function getOptions() {
+    const mode = modeSelect.value;
+    const opts = { mode };
+    if (mode === 'find_replace') {
+      opts.find = dlg.querySelector('#ff-find-text').value;
+      opts.replace = dlg.querySelector('#ff-replace-text').value;
+    } else if (mode === 'prefix') {
+      opts.prefix = dlg.querySelector('#ff-prefix-text').value;
+    } else if (mode === 'suffix') {
+      opts.suffix = dlg.querySelector('#ff-suffix-text').value;
+    } else if (mode === 'number') {
+      opts.start_num = parseInt(dlg.querySelector('#ff-start-num').value) || 1;
+      opts.padding = parseInt(dlg.querySelector('#ff-num-padding').value) || 1;
+      opts.prefix = dlg.querySelector('#ff-num-prefix').value;
+      opts.suffix = dlg.querySelector('#ff-num-suffix').value;
+    } else if (mode === 'case') {
+      opts.case_mode = dlg.querySelector('#ff-case-mode').value;
+    }
+    return opts;
+  }
+
+  dlg.querySelector('#ff-rename-ok-btn').addEventListener('click', async () => {
+    const opts = getOptions();
+    if (!opts) return;
+    try {
+      const newPaths = await invoke('batch_rename', { paths, options: opts });
+      // Build undo items: each {oldPath:paths[i], newPath:newPaths[i], oldName, newName}
+      const { pushUndo } = d();
+      const undoItems = paths
+        .map((oldPath, i) => ({
+          oldPath,
+          newPath: newPaths[i],
+          oldName: oldPath.split('/').pop(),
+          newName: (newPaths[i] || oldPath).split('/').pop(),
+        }))
+        .filter(item => item.oldPath !== item.newPath && !item.newPath?.startsWith('ERROR'));
+      if (undoItems.length) pushUndo({op:'batchRename', items: undoItems});
+      const { render } = d();
+      render();
+      cancel();
+    } catch (e) {
+      dlg.querySelector('#ff-rename-err').textContent = e.toString();
+    }
+  });
+}
+
+// ── SMB Connect Dialog ─────────────────────────────────────────────────────────
+export function showSmbConnectDialog() {
+  document.getElementById('ff-smb-dialog')?.remove();
+  const dlg = document.createElement('div');
+  dlg.id = 'ff-smb-dialog';
+  dlg.style.cssText = 'position:fixed;inset:0;z-index:9200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);';
+  dlg.innerHTML = `
+    <div style="background:#1e1e21;border:1px solid rgba(255,255,255,.13);border-radius:14px;padding:28px 28px 22px;min-width:380px;max-width:440px;box-shadow:0 16px 48px rgba(0,0,0,.75);">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px;">
+        <span style="color:#f59e0b;line-height:0">${I.server.replace('<svg','<svg style="width:22px;height:22px"')}</span>
+        <div>
+          <div style="font-size:14px;font-weight:600;color:#f1f5f9">Connect to SMB/Network Share</div>
+          <div style="font-size:11px;color:#636368;margin-top:2px;">Mount a Windows/Samba network share</div>
+        </div>
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Server Address</label>
+        <input id="ff-smb-server" placeholder="e.g. 192.168.1.100 or smb://server" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Share Name</label>
+        <input id="ff-smb-share" placeholder="e.g. sharedfolder" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+      </div>
+      <div style="display:flex;gap:12px;margin-bottom:12px;">
+        <div style="flex:1;">
+          <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Username</label>
+          <input id="ff-smb-user" placeholder="(optional)" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+        <div style="flex:1;">
+          <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Password</label>
+          <input id="ff-smb-pass" type="password" placeholder="(optional)" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+      </div>
+      <div id="ff-smb-err" style="color:#f87171;font-size:11px;margin-top:8px;min-height:16px;"></div>
+      <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+        <button id="ff-smb-cancel-btn" style="padding:7px 16px;background:rgba(255,255,255,.07);border:none;border-radius:7px;color:#98989f;font-size:13px;cursor:pointer;">Cancel</button>
+        <button id="ff-smb-connect-btn" style="padding:7px 18px;background:#f59e0b;border:none;border-radius:7px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:7px;">${I.server.replace('<svg','<svg style="width:14px;height:14px"')} Connect</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dlg);
+
+  const cancel = () => dlg.remove();
+  dlg.querySelector('#ff-smb-cancel-btn').addEventListener('click', cancel);
+  dlg.addEventListener('click', ev => { if (ev.target === dlg) cancel(); });
+
+  dlg.querySelector('#ff-smb-connect-btn').addEventListener('click', async () => {
+    const server = dlg.querySelector('#ff-smb-server').value.trim();
+    const share = dlg.querySelector('#ff-smb-share').value.trim();
+    const username = dlg.querySelector('#ff-smb-user').value.trim() || null;
+    const password = dlg.querySelector('#ff-smb-pass').value || null;
+
+    if (!server || !share) {
+      dlg.querySelector('#ff-smb-err').textContent = 'Server and share are required';
+      return;
+    }
+
+    dlg.querySelector('#ff-smb-connect-btn').disabled = true;
+    try {
+      const mountPoint = await invoke('mount_smb', { server, share, username, password });
+      const { navigate, showToast } = d();
+      await navigate(mountPoint);
+      showToast(t('toast.smb_connected',{server,share}),'success');
+      cancel();
+    } catch (e) {
+      dlg.querySelector('#ff-smb-err').textContent = e.toString();
+      dlg.querySelector('#ff-smb-connect-btn').disabled = false;
+    }
+  });
+}
+
+// ── Cloud Mount Dialog ─────────────────────────────────────────────────────────
+export function showCloudMountDialog() {
+  document.getElementById('ff-cloud-dialog')?.remove();
+  const dlg = document.createElement('div');
+  dlg.id = 'ff-cloud-dialog';
+  dlg.style.cssText = 'position:fixed;inset:0;z-index:9200;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);';
+  dlg.innerHTML = `
+    <div style="background:#1e1e21;border:1px solid rgba(255,255,255,.13);border-radius:14px;padding:28px 28px 22px;min-width:420px;max-width:480px;box-shadow:0 16px 48px rgba(0,0,0,.75);">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px;">
+        <span style="color:#8b5cf6;line-height:0">${I.cloud.replace('<svg','<svg style="width:22px;height:22px"')}</span>
+        <div>
+          <div style="font-size:14px;font-weight:600;color:#f1f5f9">Mount Cloud Storage</div>
+          <div style="font-size:11px;color:#636368;margin-top:2px;">Connect to WebDAV (Nextcloud, Synology, etc.)</div>
+        </div>
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Connection Name</label>
+        <input id="ff-cloud-name" placeholder="e.g. My Nextcloud" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+      </div>
+      <div style="margin-bottom:12px;">
+        <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">WebDAV URL</label>
+        <input id="ff-cloud-url" placeholder="https://nextcloud.example.com/remote.php/dav/files/user/" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+      </div>
+      <div style="display:flex;gap:12px;margin-bottom:12px;">
+        <div style="flex:1;">
+          <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Username</label>
+          <input id="ff-cloud-user" placeholder="(optional)" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+        <div style="flex:1;">
+          <label style="display:block;font-size:11px;color:#98989f;margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;">Password</label>
+          <input id="ff-cloud-pass" type="password" placeholder="(optional)" style="width:100%;box-sizing:border-box;padding:9px 11px;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#f1f5f9;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+      </div>
+      <div style="padding:10px 12px;background:rgba(139,92,246,.07);border:1px solid rgba(139,92,246,.2);border-radius:8px;font-size:11px;color:#98989f;line-height:1.6;">
+        ℹ Requires <strong style="color:#c4b5fd">davfs2</strong> installed (<code>sudo apt install davfs2</code> on Ubuntu)
+      </div>
+      <div id="ff-cloud-err" style="color:#f87171;font-size:11px;margin-top:8px;min-height:16px;"></div>
+      <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+        <button id="ff-cloud-cancel-btn" style="padding:7px 16px;background:rgba(255,255,255,.07);border:none;border-radius:7px;color:#98989f;font-size:13px;cursor:pointer;">Cancel</button>
+        <button id="ff-cloud-mount-btn" style="padding:7px 18px;background:#8b5cf6;border:none;border-radius:7px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:7px;">${I.cloud.replace('<svg','<svg style="width:14px;height:14px"')} Mount</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dlg);
+
+  const cancel = () => dlg.remove();
+  dlg.querySelector('#ff-cloud-cancel-btn').addEventListener('click', cancel);
+  dlg.addEventListener('click', ev => { if (ev.target === dlg) cancel(); });
+
+  dlg.querySelector('#ff-cloud-mount-btn').addEventListener('click', async () => {
+    const name = dlg.querySelector('#ff-cloud-name').value.trim() || 'Cloud';
+    const url = dlg.querySelector('#ff-cloud-url').value.trim();
+    const username = dlg.querySelector('#ff-cloud-user').value.trim() || null;
+    const password = dlg.querySelector('#ff-cloud-pass').value || null;
+
+    if (!url) {
+      dlg.querySelector('#ff-cloud-err').textContent = 'WebDAV URL is required';
+      return;
+    }
+
+    dlg.querySelector('#ff-cloud-mount-btn').disabled = true;
+    try {
+      const mountPoint = await invoke('mount_webdav', { name, url, username, password });
+      const { navigate, showToast } = d();
+      await navigate(mountPoint);
+      showToast(t('toast.webdav_mounted',{name}),'success');
+      cancel();
+    } catch (e) {
+      dlg.querySelector('#ff-cloud-err').textContent = e.toString();
+      dlg.querySelector('#ff-cloud-mount-btn').disabled = false;
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// r42 VIEWS ADDITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Video codec badge ─────────────────────────────────────────────────────────
+export async function injectVideoCodecBadge(container, path) {
+  const ext = (path.split('.').pop()||'').toLowerCase();
+  const VIDEO_EXTS_SET = new Set(['mp4','mkv','avi','mov','webm','flv','wmv','m4v','ts','vob','ogv','3gp']);
+  if (!VIDEO_EXTS_SET.has(ext)) return;
+  container.querySelector('.video-codec-row')?.remove();
+  const placeholder = document.createElement('div');
+  placeholder.className = 'video-codec-row video-codec-loading';
+  placeholder.innerHTML = '<span class="spinner-xs"></span> Reading codec…';
+  container.appendChild(placeholder);
+  try {
+    const info = await invoke('probe_video_codec', {path});
+    placeholder.remove();
+    if (!info) return;
+    const badges = [];
+    if (info.codec_name) badges.push(`<span class="codec-badge codec-name">${info.codec_name.toUpperCase()}</span>`);
+    if (info.width && info.height) {
+      const p = Math.min(info.width, info.height);
+      const lbl = p>=2160?'4K':p>=1440?'2K':p>=1080?'1080p':p>=720?'720p':p>=480?'480p':`${p}p`;
+      badges.push(`<span class="codec-badge codec-res">${lbl} <span class="codec-dim">${info.width}×${info.height}</span></span>`);
+    }
+    if (info.fps) badges.push(`<span class="codec-badge codec-fps">${parseFloat(info.fps).toFixed(2)} fps</span>`);
+    if (info.duration_secs) {
+      const s=Math.floor(info.duration_secs); const h=Math.floor(s/3600); const m=Math.floor((s%3600)/60); const sec=s%60;
+      const dur = h>0?`${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${m}:${String(sec).padStart(2,'0')}`;
+      badges.push(`<span class="codec-badge codec-dur">${dur}</span>`);
+    }
+    if (info.bit_rate_kbps) badges.push(`<span class="codec-badge codec-br">${info.bit_rate_kbps} kbps</span>`);
+    if (info.audio_codec) badges.push(`<span class="codec-badge codec-audio">${info.audio_codec.toUpperCase()}</span>`);
+    if (!badges.length) return;
+    const row = document.createElement('div'); row.className = 'video-codec-row'; row.innerHTML = badges.join('');
+    container.appendChild(row);
+  } catch (_) { placeholder.remove(); }
+}
+
+// ── Accessibility helpers ─────────────────────────────────────────────────────
+export function trapFocus(dialogEl) {
+  const focusable = () => [...dialogEl.querySelectorAll('a[href],button:not([disabled]),input:not([disabled]),select,textarea,[tabindex]:not([tabindex="-1"])')];
+  function handler(e) {
+    if (e.key !== 'Tab') return;
+    const els = focusable(); if (!els.length) return;
+    const first = els[0]; const last = els[els.length-1];
+    if (e.shiftKey) { if (document.activeElement===first) { e.preventDefault(); last.focus(); } }
+    else { if (document.activeElement===last) { e.preventDefault(); first.focus(); } }
+  }
+  dialogEl.addEventListener('keydown', handler);
+}
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 5 — Metadata editors (r125–r138)
+// Each opens a modal sheet, loads current tags via exiftool, and saves on Apply.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Shared helper: metadata editor overlay shell ──────────────────────────────
+function _metaEditorOverlay(title, bodyHtml, onApply) {
+  document.getElementById('ff-meta-editor')?.remove();
+  const ov = document.createElement('div');
+  ov.id = 'ff-meta-editor';
+  ov.style.cssText = 'position:fixed;inset:0;z-index:9600;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.65);backdrop-filter:blur(7px);';
+  ov.innerHTML = `
+    <div class="meta-editor-box">
+      <div class="meta-editor-header">
+        <span class="meta-editor-title">${escHtml(title)}</span>
+        <button class="meta-editor-close" id="meta-ed-close">✕</button>
+      </div>
+      <div class="meta-editor-body" id="meta-ed-body">${bodyHtml}</div>
+      <div class="meta-editor-footer">
+        <div class="meta-ed-status" id="meta-ed-status"></div>
+        <button class="stg-btn" id="meta-ed-cancel">Cancel</button>
+        <button class="stg-btn meta-ed-apply-btn" id="meta-ed-apply">Apply</button>
+      </div>
+    </div>`;
+  document.body.appendChild(ov);
+  const close = () => ov.remove();
+  ov.querySelector('#meta-ed-close').addEventListener('click', close);
+  ov.querySelector('#meta-ed-cancel').addEventListener('click', close);
+  ov.addEventListener('click', ev => { if (ev.target === ov) close(); });
+  ov.querySelector('#meta-ed-apply').addEventListener('click', () => onApply(ov, close));
+  return ov;
+}
+
+// ── r125: EXIF editor (images) ────────────────────────────────────────────────
+async function _showExifEditor(entry, panel) {
+  const statusEl = document.createElement('div');
+  statusEl.style.cssText = 'padding:24px;text-align:center;color:var(--text-tertiary)';
+  statusEl.textContent = 'Loading EXIF…';
+  const ov = _metaEditorOverlay('Edit EXIF — ' + entry.name, statusEl.outerHTML, async (ov, close) => {
+    const fields = [];
+    const statusDiv = ov.querySelector('#meta-ed-status');
+    // Collect editable fields
+    [
+      ['DateTimeOriginal', '#exif-date'],
+      ['Make',             '#exif-make'],
+      ['Model',            '#exif-model'],
+      ['Orientation',      '#exif-orient'],
+    ].forEach(([tag, sel]) => {
+      const el = ov.querySelector(sel);
+      if (el && el.value.trim()) fields.push([tag, el.value.trim()]);
+    });
+    // GPS clear
+    if (ov.querySelector('#exif-clear-gps')?.checked) {
+      fields.push(['GPSLatitude', ''], ['GPSLongitude', ''], ['GPSAltitude', '']);
+    }
+    if (!fields.length) { close(); return; }
+    if (statusDiv) statusDiv.textContent = 'Saving…';
+    ov.querySelector('#meta-ed-apply').disabled = true;
+    try {
+      await invoke('write_file_meta_exif', {path: entry.path, fields});
+      if (statusDiv) { statusDiv.style.color = '#34d399'; statusDiv.textContent = 'Saved!'; }
+      setTimeout(close, 900);
+    } catch(err) {
+      if (statusDiv) { statusDiv.style.color = '#f87171'; statusDiv.textContent = String(err); }
+      ov.querySelector('#meta-ed-apply').disabled = false;
+    }
+  });
+
+  // Load current EXIF
+  try {
+    const meta = await invoke('get_file_meta_exif', {path: entry.path});
+    const body = ov.querySelector('#meta-ed-body');
+    if (!body || !ov.isConnected) return;
+    const row = (id, label, val, placeholder='') =>
+      `<div class="meta-ed-row">
+        <label class="meta-ed-label" for="${id}">${label}</label>
+        <input class="meta-ed-input" id="${id}" value="${escHtml(val||'')}" placeholder="${placeholder}">
+      </div>`;
+    body.innerHTML =
+      row('exif-date',   'Date taken',  meta.DateTimeOriginal||meta.CreateDate||'', 'YYYY:MM:DD HH:MM:SS') +
+      row('exif-make',   'Camera make', meta.Make||'') +
+      row('exif-model',  'Model',       meta.Model||'') +
+      `<div class="meta-ed-row">
+        <label class="meta-ed-label" for="exif-orient">Orientation</label>
+        <select class="meta-ed-input" id="exif-orient">
+          ${[1,2,3,4,5,6,7,8].map(n => `<option value="${n}"${(meta.Orientation||1)==n?' selected':''}>${n}</option>`).join('')}
+        </select>
+      </div>` +
+      `<div class="meta-ed-row meta-ed-check-row">
+        <label class="meta-ed-label">GPS</label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)">
+          <input type="checkbox" id="exif-clear-gps"> Clear GPS coordinates
+        </label>
+      </div>` +
+      (meta.GPSLatitude ? `<div class="meta-ed-hint">Current: ${Number(meta.GPSLatitude).toFixed(5)}, ${Number(meta.GPSLongitude||0).toFixed(5)}</div>` : '');
+  } catch(err) {
+    const body = ov.querySelector('#meta-ed-body');
+    if (body) body.innerHTML = `<div style="padding:16px;color:#f87171;font-size:12px">Could not load metadata: ${escHtml(String(err))}<br>Is <code>exiftool</code> installed?</div>`;
+  }
+}
+
+// ── r128/r25: Audio tag editor — uses native lofty backend (no exiftool) ────
+async function _showAudioTagEditor(entry, panel) {
+  const ov = _metaEditorOverlay('Edit Tags — ' + entry.name,
+    '<div style="padding:24px;text-align:center;color:var(--text-tertiary)">Loading tags…</div>',
+    async (ov, close) => {
+      const statusDiv = ov.querySelector('#meta-ed-status');
+      const get = id => ov.querySelector(id)?.value?.trim() ?? '';
+      const orig = id => ov.querySelector(id)?.dataset?.orig ?? '';
+      // Only send fields that actually changed
+      const tags = {};
+      const fields = [
+        ['title',   '#aud-title'],
+        ['artist',  '#aud-artist'],
+        ['album',   '#aud-album'],
+        ['year',    '#aud-year'],
+        ['track',   '#aud-track'],
+        ['genre',   '#aud-genre'],
+        ['comment', '#aud-comment'],
+      ];
+      let changed = false;
+      for (const [key, sel] of fields) {
+        const val = get(sel);
+        if (val !== orig(sel)) { tags[key] = val; changed = true; }
+      }
+      if (!changed) { close(); return; }
+      if (statusDiv) statusDiv.textContent = 'Saving…';
+      ov.querySelector('#meta-ed-apply').disabled = true;
+      try {
+        await invoke('write_audio_tags', { path: entry.path, tags });
+        if (statusDiv) { statusDiv.style.color = '#34d399'; statusDiv.textContent = 'Saved!'; }
+        setTimeout(close, 900);
+      } catch(err) {
+        if (statusDiv) { statusDiv.style.color = '#f87171'; statusDiv.textContent = String(err); }
+        ov.querySelector('#meta-ed-apply').disabled = false;
+      }
+    }
+  );
+
+  try {
+    const meta = await invoke('get_audio_tags', { path: entry.path });
+    const body = ov.querySelector('#meta-ed-body');
+    if (!body || !ov.isConnected) return;
+    const row = (id, label, val, placeholder='') => {
+      const v = escHtml(String(val ?? ''));
+      return `<div class="meta-ed-row">
+        <label class="meta-ed-label" for="${id}">${label}</label>
+        <input class="meta-ed-input" id="${id}" value="${v}" data-orig="${v}" placeholder="${escHtml(placeholder)}">
+      </div>`;
+    };
+    body.innerHTML =
+      row('aud-title',   'Title',   meta.title,   'Song title') +
+      row('aud-artist',  'Artist',  meta.artist,  'Artist name') +
+      row('aud-album',   'Album',   meta.album,   'Album name') +
+      row('aud-year',    'Year',    meta.year,    'YYYY') +
+      row('aud-track',   'Track #', meta.track,   '1') +
+      row('aud-genre',   'Genre',   meta.genre,   'e.g. Pop') +
+      row('aud-comment', 'Comment', meta.comment, '');
+  } catch(err) {
+    const body = ov.querySelector('#meta-ed-body');
+    if (body) body.innerHTML = `<div style="padding:16px;color:#f87171;font-size:12px">Could not load tags: ${escHtml(String(err))}</div>`;
+  }
+}
+
+// ── r136: PDF metadata editor ─────────────────────────────────────────────────
+async function _showPdfMetaEditor(entry, panel) {
+  const ov = _metaEditorOverlay('Edit PDF Metadata — ' + entry.name,
+    '<div style="padding:24px;text-align:center;color:var(--text-tertiary)">Loading…</div>',
+    async (ov, close) => {
+      const fields = [];
+      const statusDiv = ov.querySelector('#meta-ed-status');
+      [
+        ['Title',    '#pdf-title'],
+        ['Author',   '#pdf-author'],
+        ['Subject',  '#pdf-subject'],
+        ['Keywords', '#pdf-keywords'],
+      ].forEach(([tag, sel]) => {
+        const el = ov.querySelector(sel);
+        if (el && el.value.trim() !== (el.dataset.orig||'')) fields.push([tag, el.value.trim()]);
+      });
+      if (!fields.length) { close(); return; }
+      if (statusDiv) statusDiv.textContent = 'Saving…';
+      ov.querySelector('#meta-ed-apply').disabled = true;
+      try {
+        await invoke('write_file_meta_exif', {path: entry.path, fields});
+        if (statusDiv) { statusDiv.style.color = '#34d399'; statusDiv.textContent = 'Saved!'; }
+        setTimeout(close, 900);
+      } catch(err) {
+        if (statusDiv) { statusDiv.style.color = '#f87171'; statusDiv.textContent = String(err); }
+        ov.querySelector('#meta-ed-apply').disabled = false;
+      }
+    }
+  );
+
+  try {
+    const meta = await invoke('get_file_meta_exif', {path: entry.path});
+    const body = ov.querySelector('#meta-ed-body');
+    if (!body || !ov.isConnected) return;
+    const row = (id, label, val) => {
+      const v = escHtml(String(val||''));
+      return `<div class="meta-ed-row">
+        <label class="meta-ed-label" for="${id}">${label}</label>
+        <input class="meta-ed-input" id="${id}" value="${v}" data-orig="${v}">
+      </div>`;
+    };
+    body.innerHTML =
+      row('pdf-title',    'Title',    meta.Title||'') +
+      row('pdf-author',   'Author',   meta.Author||meta.Creator||'') +
+      row('pdf-subject',  'Subject',  meta.Subject||'') +
+      row('pdf-keywords', 'Keywords', meta.Keywords||'');
+  } catch(err) {
+    const body = ov.querySelector('#meta-ed-body');
+    if (body) body.innerHTML = `<div style="padding:16px;color:#f87171;font-size:12px">Could not load metadata: ${escHtml(String(err))}<br>Is <code>exiftool</code> installed?</div>`;
+  }
+}
+
+export function announceA11y(message) {
+  let el = document.getElementById('a11y-announce');
+  if (!el) {
+    el = document.createElement('div'); el.id = 'a11y-announce';
+    el.setAttribute('role','status'); el.setAttribute('aria-live','polite'); el.setAttribute('aria-atomic','true');
+    el.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);';
+    document.body.appendChild(el);
+  }
+  el.textContent = ''; requestAnimationFrame(() => { el.textContent = message; });
 }

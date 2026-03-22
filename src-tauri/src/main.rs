@@ -1,7 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use serde_json;
 use rayon::prelude::*;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -14,18 +13,45 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 // ── Filesystem watcher ────────────────────────────────────────────────────────
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Config as NotifyConfig};
-use std::sync::mpsc;
 use std::time::Duration;
 
 /// Holds the active directory watcher.
 /// Replaced atomically on each watch_dir call; dropped (unwatched) on unwatch_dir.
+// Watch mode reported back to JS for the status-bar indicator.
+#[derive(Debug, Clone, PartialEq)]
+enum WatchMode { Inotify, Polling }
+
 struct DirWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: Option<RecommendedWatcher>, // None when polling
+    mode: WatchMode,
+    _poll_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 static ACTIVE_WATCHER: Mutex<Option<DirWatcher>> = Mutex::new(None);
 
 static MEDIA_PORT: AtomicU16 = AtomicU16::new(0);
 static EXTRACT_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// ── Phase 7: File-op cancel token ─────────────────────────────────────────────
+// Set to true by cancel_file_op(); copy_files_batch / move_files_batch check it
+// between files and abort early. Cleared at the start of each new operation.
+static FILE_OP_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// ── Phase 7: In-memory search index ──────────────────────────────────────────
+// Built at startup by index_home_dir(); kept in sync by the inotify watcher.
+// Each entry: (lowercase_name, full_path, is_dir, size, modified_secs)
+#[derive(Clone)]
+struct IndexEntry {
+    name_lc: String,
+    path: String,
+    is_dir: bool,
+    size: u64,
+    modified: u64,
+}
+static SEARCH_INDEX: OnceLock<RwLock<Vec<IndexEntry>>> = OnceLock::new();
+
+fn search_index_store() -> &'static RwLock<Vec<IndexEntry>> {
+    SEARCH_INDEX.get_or_init(|| RwLock::new(Vec::new()))
+}
 
 // Cached tar binary path — resolved once on first extraction, reused forever.
 static TAR_BIN: OnceLock<Option<String>> = OnceLock::new();
@@ -50,6 +76,40 @@ static MPV_CHILD: OnceLock<Mutex<Option<std::process::Child>>> = OnceLock::new()
 
 fn mpv_child() -> &'static Mutex<Option<std::process::Child>> {
     MPV_CHILD.get_or_init(|| Mutex::new(None))
+}
+
+/// Check if a binary exists in PATH
+fn which(cmd: &str) -> bool {
+    std::process::Command::new("which").arg(cmd).output()
+        .map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Check all optional dependencies and return their availability status
+#[tauri::command]
+fn check_optional_deps() -> std::collections::HashMap<String, bool> {
+    let mut deps = std::collections::HashMap::new();
+    deps.insert("ffmpeg".to_string(), which("ffmpeg"));
+    deps.insert("ffprobe".to_string(), which("ffprobe"));
+    deps.insert("heif_convert".to_string(), which("heif-convert"));
+    deps.insert("rclone".to_string(), which("rclone"));
+    deps.insert("gocryptfs".to_string(), which("gocryptfs"));
+    deps.insert("sshfs".to_string(), which("sshfs"));
+    deps.insert("curlftpfs".to_string(), which("curlftpfs"));
+    deps.insert("mpv".to_string(), which("mpv"));
+    deps.insert("mpv_mpris".to_string(), which("mpv"));
+    deps
+}
+
+#[tauri::command]
+fn get_platform() -> String {
+    #[cfg(target_os = "linux")]
+    { "linux".to_string() }
+    #[cfg(target_os = "macos")]
+    { "macos".to_string() }
+    #[cfg(target_os = "windows")]
+    { "windows".to_string() }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    { "unknown".to_string() }
 }
 
 // ── Quick Look payload cache ──────────────────────────────────────────────────
@@ -129,7 +189,7 @@ fn get_permissions(metadata: &fs::Metadata) -> String {
         for &(r,w,x) in &[(0o400u32,0o200u32,0o100u32),(0o040,0o020,0o010),(0o004,0o002,0o001)] {
             s.push(if mode&r!=0{'r'}else{'-'}); s.push(if mode&w!=0{'w'}else{'-'}); s.push(if mode&x!=0{'x'}else{'-'});
         }
-        return s;
+        s
     }
     #[cfg(not(unix))]
     {
@@ -161,8 +221,8 @@ fn _get_disk_space_impl(path: &str) -> (u64, u64) {
     unsafe {
         let mut st: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c.as_ptr(), &mut st) == 0 {
-            let b = st.f_frsize as u64;
-            return (st.f_blocks as u64 * b, st.f_bavail as u64 * b);
+            let b = st.f_frsize;
+            return (st.f_blocks * b, st.f_bavail * b);
         }
     }
     (0, 0)
@@ -236,14 +296,14 @@ fn classify_drive(device:&str,mountpoint:&str,fstype:&str)->Option<DriveInfo> {
     ];
     if exact_hide.contains(&mountpoint){return None;}
     // Hide anything whose last path component is "cache" or "tmp" or "log"
-    let last_seg=mountpoint.split('/').filter(|s|!s.is_empty()).last().unwrap_or("");
+    let last_seg=mountpoint.split('/').filter(|s|!s.is_empty()).next_back().unwrap_or("");
     if["cache","tmp","log","lost+found","proc","sys"].contains(&last_seg){return None;}
     // Always allow /run/media and /media (standard Linux USB mount points)
     if !device.starts_with('/')&&!device.starts_with("//"){return None;}
     let (total,free)=get_disk_space(mountpoint);
     // Skip zero-size pseudo mounts (but keep root)
     if total == 0 && mountpoint != "/" { return None; }
-    let dev_short=device.split('/').last().unwrap_or(device);
+    let dev_short=device.split('/').next_back().unwrap_or(device);
     let drive_type=if fstype.starts_with("nfs")||fstype=="cifs"||fstype=="fuse.sshfs"{"network"}
         else if dev_short.contains("sr")||dev_short.contains("cdrom"){"optical"}
         // Check device name first — NVMe/SSD/HDD must keep their type regardless of
@@ -255,10 +315,9 @@ fn classify_drive(device:&str,mountpoint:&str,fstype:&str)->Option<DriveInfo> {
             else if dev_short.starts_with("nvme"){"nvme"}
             else if is_rotational(dev_short){"hdd"}
             else{"ssd"}
-        }
         // Only fall back to "usb" from mountpoint path if the device wasn't already
         // identified above (e.g. unknown device names under /run/media or /media)
-        else if mountpoint.starts_with("/run/media")||mountpoint.starts_with("/media"){"usb"}
+        } else if mountpoint.starts_with("/run/media")||mountpoint.starts_with("/media"){"usb"}
         // Common USB/removable filesystem types on unrecognised device names
         else if (fstype=="vfat"||fstype=="exfat"||fstype=="ntfs"||fstype=="ntfs-3g"||fstype=="fuseblk")&&is_usb_device(dev_short){"usb"}
         else{"internal"};
@@ -454,6 +513,112 @@ fn deep_search_dir(dir:&Path,q:&str,include_hidden:bool,max:usize,results:&mut V
 }
 
 
+// ── p7: In-memory filename index ─────────────────────────────────────────────
+// Walk the home directory once at startup, populate SEARCH_INDEX.
+// The inotify dir-changed events keep it current by calling index_apply_event().
+// Only filenames are indexed — content search still uses search_advanced / deep_search.
+
+fn index_home_dir() {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let mut entries: Vec<IndexEntry> = Vec::with_capacity(50_000);
+    index_walk(&home, &mut entries, 0);
+    *search_index_store().write().unwrap_or_else(|e| e.into_inner()) = entries;
+}
+
+fn index_walk(dir: &Path, out: &mut Vec<IndexEntry>, depth: u8) {
+    if depth > 12 { return; }
+    let ps = dir.to_string_lossy();
+    if ps.starts_with("/proc") || ps.starts_with("/sys") || ps.starts_with("/dev") { return; }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.filter_map(|x| x.ok()) {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') { continue; }
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        let is_dir = meta.is_dir();
+        let size   = if is_dir { 0 } else { meta.len() };
+        let modified = meta.modified().ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()).unwrap_or(0);
+        out.push(IndexEntry {
+            name_lc: name.to_lowercase(),
+            path: path.to_string_lossy().into_owned(),
+            is_dir, size, modified,
+        });
+        if is_dir && !meta.file_type().is_symlink() {
+            index_walk(&path, out, depth + 1);
+        }
+    }
+}
+
+/// Called from the inotify watcher when a directory changes: re-index that dir only.
+fn index_apply_event(changed_dir: &str) {
+    let dir = Path::new(changed_dir);
+    let prefix = format!("{}/", changed_dir.trim_end_matches('/'));
+    // Remove stale entries for the changed directory
+    {
+        let mut idx = search_index_store().write().unwrap_or_else(|e| e.into_inner());
+        idx.retain(|e| {
+            // Keep entries NOT under changed_dir and NOT directly in it
+            !e.path.starts_with(&prefix) && e.path != changed_dir
+        });
+    }
+    // Re-add entries (shallow — just top level of changed dir)
+    let mut fresh: Vec<IndexEntry> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.filter_map(|x| x.ok()) {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+            let is_dir = meta.is_dir();
+            let size   = if is_dir { 0 } else { meta.len() };
+            let modified = meta.modified().ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()).unwrap_or(0);
+            fresh.push(IndexEntry {
+                name_lc: name.to_lowercase(),
+                path: path.to_string_lossy().into_owned(),
+                is_dir, size, modified,
+            });
+        }
+    }
+    search_index_store().write().unwrap_or_else(|e| e.into_inner()).extend(fresh);
+}
+
+#[derive(serde::Serialize)]
+struct IndexSearchResult {
+    path: String,
+    name: String,
+    is_dir: bool,
+    size: u64,
+    modified: u64,
+}
+
+/// Fast filename-only search against the in-memory index.
+/// Falls back gracefully to an empty Vec if the index is not yet ready.
+#[tauri::command]
+fn search_index_query(query: String, max_results: usize) -> Vec<IndexSearchResult> {
+    let q = query.to_lowercase();
+    let max = max_results.min(2000);
+    let idx = search_index_store().read().unwrap_or_else(|e| e.into_inner());
+    let mut results: Vec<IndexSearchResult> = idx.iter()
+        .filter(|e| e.name_lc.contains(&q))
+        .take(max)
+        .map(|e| {
+            let name = Path::new(&e.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            IndexSearchResult { path: e.path.clone(), name, is_dir: e.is_dir, size: e.size, modified: e.modified }
+        })
+        .collect();
+    results.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    results
+}
+
 fn load_tags_db()->serde_json::Value {
     let p=tags_db_path();
     if let Ok(s)=fs::read_to_string(&p) { serde_json::from_str(&s).unwrap_or(serde_json::json!({})) }
@@ -530,19 +695,19 @@ static DIR_CACHE: RwLock<Option<DirCache>> = RwLock::new(None);
 
 fn cache_get(path: &str) -> Option<Vec<FileEntryFast>> {
     // Read lock — multiple threads can hold this simultaneously.
-    let lock = DIR_CACHE.read().unwrap();
+    let lock = DIR_CACHE.read().unwrap_or_else(|e| e.into_inner());
     lock.as_ref()?.get(path).cloned()
 }
 
 fn cache_insert(path: String, entries: Vec<FileEntryFast>) {
     // Write lock — exclusive, brief.
-    let mut lock = DIR_CACHE.write().unwrap();
+    let mut lock = DIR_CACHE.write().unwrap_or_else(|e| e.into_inner());
     let cache = lock.get_or_insert_with(DirCache::new);
     cache.insert(path, entries);
 }
 
 fn cache_evict(path: &str) {
-    let mut lock = DIR_CACHE.write().unwrap();
+    let mut lock = DIR_CACHE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(cache) = lock.as_mut() {
         cache.evict(path);
     }
@@ -924,11 +1089,11 @@ fn lsblk_unmounted_all(
                 // Classify drive type from transport + device name
                 let drive_type = {
                     let rm = disk_rm || part["rm"].as_bool().unwrap_or(false);
-                    if rm || disk_tran == "usb" || part_name.starts_with("sd") && is_usb_device(part_name.split('/').last().unwrap_or(part_name)) {
+                    if rm || disk_tran == "usb" || part_name.starts_with("sd") && is_usb_device(part_name.split('/').next_back().unwrap_or(part_name)) {
                         "usb"
                     } else if disk_tran == "nvme" || part_name.starts_with("nvme") || disk_name.starts_with("nvme") {
                         "nvme"
-                    } else if is_rotational(disk_name.split('/').last().unwrap_or(disk_name)) {
+                    } else if is_rotational(disk_name.split('/').next_back().unwrap_or(disk_name)) {
                         "hdd"
                     } else {
                         "ssd"
@@ -997,16 +1162,14 @@ fn get_sidebar_data()->SidebarData {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let trash_path = home.join("Trash"); // fallback
     let _=fs::create_dir_all(&trash_path);
-    let raw_favs=vec![
-        ("Home",home.to_string_lossy().to_string(),"home"),
+    let raw_favs=[("Home",home.to_string_lossy().to_string(),"home"),
         ("Desktop",home.join("Desktop").to_string_lossy().to_string(),"folder"),
         ("Documents",home.join("Documents").to_string_lossy().to_string(),"doc"),
         ("Downloads",home.join("Downloads").to_string_lossy().to_string(),"download"),
         ("Pictures",home.join("Pictures").to_string_lossy().to_string(),"img"),
         ("Music",home.join("Music").to_string_lossy().to_string(),"music"),
         ("Videos",home.join("Videos").to_string_lossy().to_string(),"video"),
-        ("Trash",trash_path.to_string_lossy().to_string(),"trash"),
-    ];
+        ("Trash",trash_path.to_string_lossy().to_string(),"trash")];
     let favorites=raw_favs.iter().map(|(n,p,i)|SidebarFavorite{
         name:n.to_string(),path:p.to_string(),icon:i.to_string(),
         exists:if *i=="trash"{true}else{Path::new(p).exists()}
@@ -1044,7 +1207,86 @@ fn get_drives_platform() -> Vec<DriveInfo> {
 
 /// Windows / other: return an empty list — full drive enumeration requires
 /// WinAPI (GetLogicalDriveStrings) which is not currently implemented.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows: enumerate logical drives via `wmic logicaldisk` (no unsafe code needed).
+#[cfg(target_os = "windows")]
+fn get_drives_platform() -> Vec<DriveInfo> {
+    // wmic logicaldisk get DeviceID,Size,FreeSpace,VolumeName,DriveType /format:csv
+    // DriveType: 2=removable, 3=local, 4=network, 5=CD/DVD
+    let out = std::process::Command::new("wmic")
+        .args(["logicaldisk", "get",
+               "DeviceID,Size,FreeSpace,VolumeName,DriveType",
+               "/format:csv"])
+        .output();
+
+    let Ok(out) = out else { return Vec::new(); };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut drives = Vec::new();
+
+    for line in text.lines().skip(2) {  // skip header rows
+        let cols: Vec<&str> = line.split(',').collect();
+        // csv: Node,DeviceID,DriveType,FreeSpace,Size,VolumeName
+        if cols.len() < 6 { continue; }
+        let device_id  = cols[1].trim();
+        let drive_type = cols[2].trim().parse::<u32>().unwrap_or(0);
+        let free_bytes = cols[3].trim().parse::<u64>().unwrap_or(0);
+        let total_bytes= cols[4].trim().parse::<u64>().unwrap_or(0);
+        let label      = cols[5].trim().to_string();
+
+        if device_id.is_empty() || drive_type == 5 { continue; } // skip CD/DVD
+
+        let display = if label.is_empty() {
+            format!("Local Disk ({})", device_id)
+        } else {
+            format!("{} ({})", label, device_id)
+        };
+
+        drives.push(DriveInfo {
+            name:        display,
+            path:        format!("{}\\", device_id),
+            device:      device_id.to_string(),
+            drive_type:  if drive_type == 2 { "usb".to_string() } else { "internal".to_string() },
+            total_bytes,
+            free_bytes,
+            is_mounted:  true,
+            filesystem:  String::new(),
+        });
+    }
+    drives
+}
+
+#[cfg(target_os = "windows")]
+fn get_windows_volume_label(path: &str) -> Option<String> {
+    // Shell out to cmd /c vol — simpler than unsafe WinAPI in this context
+    let out = std::process::Command::new("cmd")
+        .args(["/c", &format!("vol {}", &path[..2])])
+        .output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Line 1: "Volume in drive X is <label>" or "has no label"
+    let line = text.lines().next()?;
+    if line.contains("has no label") { return None; }
+    let label = line.split(" is ").nth(1)?.trim().to_string();
+    if label.is_empty() { None } else { Some(label) }
+}
+
+#[cfg(target_os = "windows")]
+fn get_windows_disk_space(path: &str) -> (u64, u64) {
+    let out = std::process::Command::new("wmic")
+        .args(["logicaldisk", "where", &format!("DeviceID='{}'", &path[..2]),
+               "get", "Size,FreeSpace", "/value"])
+        .output();
+    if let Ok(out) = out {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut free = 0u64; let mut total = 0u64;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("FreeSpace=") { free = v.trim().parse().unwrap_or(0); }
+            if let Some(v) = line.strip_prefix("Size=")      { total = v.trim().parse().unwrap_or(0); }
+        }
+        (total, free)
+    } else { (0, 0) }
+}
+
+/// Non-Windows, non-macOS, non-Linux fallback (BSDs, etc.)
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn get_drives_platform() -> Vec<DriveInfo> { Vec::new() }
 
 /// Mount a block device via udisksctl (Linux only).
@@ -1310,7 +1552,7 @@ fn get_file_preview(path:String)->Result<FilePreview,String> {
     if is_text {
         let limit=262144usize;
         let raw=fs::read(p).map_err(|e|e.to_string())?;
-        if !raw.is_empty() && raw[..raw.len().min(4096)].iter().any(|&b|b==0) { return Ok(FilePreview{path,content:None,image_base64:None,mime_type:"application/octet-stream".into(),size,modified,is_text:false,is_image:false,is_video:false,is_audio:false,line_count:None,permissions,thumb_path:None}); }
+        if !raw.is_empty() && raw[..raw.len().min(4096)].contains(&0) { return Ok(FilePreview{path,content:None,image_base64:None,mime_type:"application/octet-stream".into(),size,modified,is_text:false,is_image:false,is_video:false,is_audio:false,line_count:None,permissions,thumb_path:None}); }
         let trunc=&raw[..raw.len().min(limit)];
         let raw_str=String::from_utf8_lossy(trunc).to_string();
         // RTF: strip control words before displaying — raw markup is unreadable
@@ -1321,6 +1563,49 @@ fn get_file_preview(path:String)->Result<FilePreview,String> {
     }
     Ok(FilePreview{path,content:None,image_base64:None,mime_type,size,modified,is_text:false,is_image:false,is_video:false,is_audio:false,line_count:None,permissions,thumb_path:None})
 }
+
+
+// ── Text file read / write (Phase 2: inline editor) ───────────────────────────
+/// Read a text file for the inline editor. Capped at 2 MB to avoid freezing
+/// the UI on huge logs. Returns the raw UTF-8 content (invalid bytes replaced).
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let meta = fs::metadata(p).map_err(|e| e.to_string())?;
+    const MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
+    if meta.len() > MAX_BYTES {
+        return Err(format!(
+            "File is {:.1} MB — too large for the inline editor (limit 2 MB). Open in an external editor instead.",
+            meta.len() as f64 / 1_048_576.0
+        ));
+    }
+    let bytes = fs::read(p).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Atomically write text back to disk. Writes to a temp file beside the target
+/// then renames, so a crash mid-write never corrupts the original.
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    let parent = p.parent().ok_or("Cannot determine parent directory")?;
+    // Write to a sibling temp file first
+    let tmp_path = parent.join(format!(
+        ".frostfinder_tmp_{}.tmp",
+        p.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    fs::write(&tmp_path, content.as_bytes()).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        e.to_string()
+    })?;
+    // Atomic rename
+    fs::rename(&tmp_path, p).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        e.to_string()
+    })?;
+    Ok(())
+}
+
 
 
 
@@ -1408,6 +1693,71 @@ fn make_thumbnail(path:&str)->Result<PathBuf,String> {
              ffmpeg stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         ));
+    }
+
+    // ── Video: extract a single frame via ffmpeg ──────────────────────────────
+    // ffmpeg is an optional runtime dependency (listed in README optdepends).
+    // If not present, we fall through to Err and let the caller show a generic icon.
+    // Seek to 3 seconds in — avoids black leader frames common in many videos.
+    // Use -vframes 1 and pipe MJPEG to stdout for zero temp-file overhead.
+    const VIDEO_EXTS: &[&str] = &["mp4","mkv","webm","avi","mov","ogv","m4v","flv","ts","wmv","3gp"];
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        // Attempt to extract frame with ffmpeg
+        let ffmpeg_result = std::process::Command::new("ffmpeg")
+            .args([
+                "-ss", "00:00:03",          // seek to 3s (fast seek)
+                "-i", path,
+                "-vframes", "1",            // one frame only
+                "-q:v", "5",               // JPEG quality (2=best, 31=worst)
+                "-vf", "scale=256:-1",      // resize to 256px wide, keep AR
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "pipe:1",                   // write to stdout
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())   // suppress ffmpeg banner spam
+            .output();
+
+        match ffmpeg_result {
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+                // Validate the JPEG bytes before caching
+                let jpeg_bytes = out.stdout;
+                if jpeg_bytes.starts_with(&[0xFF, 0xD8]) {
+                    thumb_cache_put(path, mtime, &jpeg_bytes);
+                    return Ok(thumb_cache_path(path, mtime));
+                }
+                // Invalid JPEG — fall through to error
+                return Err(format!("ffmpeg returned invalid JPEG for {path}"));
+            }
+            Ok(_) => {
+                // ffmpeg ran but produced no output (very short video, seek past end).
+                // Retry from the start (seek to 0).
+                let retry = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-i", path,
+                        "-vframes", "1",
+                        "-q:v", "5",
+                        "-vf", "scale=256:-1",
+                        "-f", "image2pipe",
+                        "-vcodec", "mjpeg",
+                        "pipe:1",
+                    ])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                if let Ok(r) = retry {
+                    if r.status.success() && r.stdout.starts_with(&[0xFF, 0xD8]) {
+                        thumb_cache_put(path, mtime, &r.stdout);
+                        return Ok(thumb_cache_path(path, mtime));
+                    }
+                }
+                return Err(format!("ffmpeg produced no frame for {path}"));
+            }
+            Err(_) => {
+                // ffmpeg not installed
+                return Err(format!("ffmpeg not found; install it for video thumbnails"));
+            }
+        }
     }
 
     let reader=image::ImageReader::open(p).map_err(|e|e.to_string())?
@@ -1573,9 +1923,8 @@ fn gc_thumbnail_cache()->usize {
         let path=entry.path();
         if let Ok(meta)=fs::metadata(&path){
             if let Ok(modified)=meta.modified(){
-                if modified<cutoff{
-                    if fs::remove_file(&path).is_ok(){deleted+=1;}
-                }
+                if modified<cutoff
+                    && fs::remove_file(&path).is_ok(){deleted+=1;}
             }
         }
     }
@@ -1635,6 +1984,106 @@ fn rename_file(old_path:String,new_name:String)->Result<String,String> {
     let old=Path::new(&old_path); let new=old.parent().ok_or("No parent")?.join(&new_name);
     if new.exists(){return Err(format!("'{}' already exists",new_name));}
     fs::rename(old,&new).map_err(|e|e.to_string())?; Ok(new.to_string_lossy().to_string())
+}
+
+#[derive(serde::Deserialize)]
+pub struct BatchRenameOptions {
+    pub mode: String,
+    pub find: Option<String>,
+    pub replace: Option<String>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub start_num: Option<u32>,
+    pub padding: Option<u32>,
+    pub case_mode: Option<String>,
+    // p8: when true, compute new names but do NOT rename on disk
+    pub dry_run: Option<bool>,
+}
+
+#[tauri::command]
+async fn batch_rename(paths: Vec<String>, options: BatchRenameOptions) -> Result<Vec<String>, String> {
+    let mut results = Vec::new();
+    let start_num = options.start_num.unwrap_or(1);
+    let padding = options.padding.unwrap_or(1) as usize;
+    
+    for (i, old_path) in paths.iter().enumerate() {
+        let old = Path::new(old_path);
+        let _file_name = old.file_name()
+            .ok_or("Invalid path")?
+            .to_string_lossy()
+            .to_string();
+        let stem = old.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = old.extension()
+            .map(|s| format!(".{}", s.to_string_lossy()))
+            .unwrap_or_default();
+        
+        let new_stem = match options.mode.as_str() {
+            "find_replace" => {
+                let find = options.find.as_deref().unwrap_or("");
+                let replace = options.replace.as_deref().unwrap_or("");
+                stem.replace(find, replace)
+            }
+            "prefix" => {
+                let prefix = options.prefix.as_deref().unwrap_or("");
+                format!("{}{}", prefix, stem)
+            }
+            "suffix" => {
+                let suffix = options.suffix.as_deref().unwrap_or("");
+                format!("{}{}", stem, suffix)
+            }
+            "number" => {
+                // p11: saturating_add prevents wrapping on extremely large batches
+                let num = start_num.saturating_add(i as u32);
+                let num_str = format!("{:0width$}", num, width = padding);
+                let prefix = options.prefix.as_deref().unwrap_or("");
+                let suffix = options.suffix.as_deref().unwrap_or("");
+                format!("{}{}{}", prefix, num_str, suffix)
+            }
+            "case" => {
+                let case = options.case_mode.as_deref().unwrap_or("lower");
+                match case {
+                    "upper" => stem.to_uppercase(),
+                    "title" => {
+                        stem.split_whitespace()
+                            .map(|word| {
+                                let mut chars = word.chars();
+                                match chars.next() {
+                                    None => String::new(),
+                                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                    _ => stem.to_lowercase(),
+                }
+            }
+            _ => stem,
+        };
+        
+        let new_name = format!("{}{}", new_stem, ext);
+        let new_path = old.parent().ok_or("No parent")?.join(&new_name);
+        
+        if new_path.exists() && options.dry_run != Some(true) {
+            results.push(format!("ERROR: '{}' already exists", new_name));
+            continue;
+        }
+
+        if options.dry_run == Some(true) {
+            // p8: dry-run — return the computed path without touching the filesystem
+            results.push(new_path.to_string_lossy().to_string());
+            continue;
+        }
+
+        match fs::rename(old, &new_path) {
+            Ok(_) => results.push(new_path.to_string_lossy().to_string()),
+            Err(e) => results.push(format!("ERROR: {}", e)),
+        }
+    }
+    
+    Ok(results)
 }
 
 /// Strip RTF control words and return plain text.
@@ -1946,7 +2395,7 @@ fn epub_to_text(path: &Path) -> Option<String> {
             match ch {
                 '<' => { in_tag = true; tag_buf.clear(); }
                 '>' => {
-                    let t = tag_buf.trim_start_matches('/').trim().split_whitespace().next().unwrap_or("").to_lowercase();
+                    let t = tag_buf.trim_start_matches('/').split_whitespace().next().unwrap_or("").to_lowercase();
                     match t.as_str() {
                         "p"|"div"|"br"|"h1"|"h2"|"h3"|"h4"|"h5"|"h6"|"li"|"tr"|"dt"|"dd" => out.push('\n'),
                         _ => {}
@@ -2021,7 +2470,7 @@ fn mobi_to_text(path: &Path) -> Option<String> {
         match ch {
             '<' => { in_tag = true; tag_buf.clear(); }
             '>' => {
-                let t = tag_buf.trim_start_matches('/').trim().split_whitespace().next().unwrap_or("").to_lowercase();
+                let t = tag_buf.trim_start_matches('/').split_whitespace().next().unwrap_or("").to_lowercase();
                 match t.as_str() {
                     "p"|"br"|"div"|"h1"|"h2"|"h3"|"h4"|"li" => out.push('\n'),
                     _ => {}
@@ -2046,6 +2495,34 @@ fn mobi_to_text(path: &Path) -> Option<String> {
 
 /// Emits "delete-progress": {name, done, total, finished, error?}
 #[tauri::command]
+/// Format a Unix timestamp as ISO 8601 for FreeDesktop.org Trash spec DeletionDate.
+fn fmt_iso8601(ts: u64) -> String {
+    let secs = ts;
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    // Date calculation (proleptic Gregorian)
+    let days = secs / 86400;
+    let (yr, mo, dy) = days_to_ymd(days);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", yr, mo, dy, h, m, s)
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365*yoe + yoe/4 - yoe/100);
+    let mp = (5*doy + 2)/153;
+    let d = doy - (153*mp+2)/5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+#[tauri::command]
 async fn delete_file(window: tauri::Window, path: String, trash: bool) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = Path::new(&path);
@@ -2068,7 +2545,7 @@ async fn delete_file(window: tauri::Window, path: String, trash: bool) -> Result
         let dest = trash_files.join(&dest_name);
         let abs_path = fs::canonicalize(p).unwrap_or_else(|_|p.to_path_buf());
         let _ = fs::write(trash_info_dir.join(format!("{}.trashinfo",&dest_name)),
-            format!("[Trash Info]\nPath={}\nDeletionDate={}\n",abs_path.display(),ts));
+            format!("[Trash Info]\nPath={}\nDeletionDate={}\n",abs_path.display(),fmt_iso8601(ts)));
         // Fast path: same-filesystem rename is instant — no progress needed
         if fs::rename(p, &dest).is_ok() {
             let _ = window.emit("delete-progress", serde_json::json!({"name":&name,"done":1,"total":1,"finished":true}));
@@ -2105,58 +2582,74 @@ async fn delete_file(window: tauri::Window, path: String, trash: bool) -> Result
     }).await.map_err(|e|e.to_string())?
 }
 
-/// Securely delete a file by overwriting with random data before deletion.
-/// Emits "secure-delete-progress": {path, done, total, finished, error?}
+/// Securely delete files by overwriting with random data before deletion.
+/// Emits "secure-delete-progress": {pass, total_passes, file, finished, error?}
+/// JS listener expects: const {pass, total_passes, file, finished} = ev.payload;
 #[tauri::command]
 async fn secure_delete(window: tauri::Window, paths: Vec<String>, passes: u32) -> Result<(), String> {
     use rand::Rng;
-    
-    let total = paths.len() as u64;
-    let _ = window.emit("secure-delete-progress", serde_json::json!({"done":0,"total":total,"finished":false}));
-    
-    for (idx, path) in paths.iter().enumerate() {
-        let path_clone = path.clone();
-        
-        let _ = window.emit("secure-delete-progress", serde_json::json!({"path":path,"done":idx as u64,"total":total,"finished":false}));
-        
-        if let Err(e) = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-            let p = Path::new(&path_clone);
-            if !p.exists() { return Ok(()); }
-            
-            if p.is_dir() {
-                return Err("secure_delete does not support directories".into());
-            }
-            
-            let metadata = fs::metadata(p).map_err(|e|e.to_string())?;
-            let size = metadata.len() as usize;
-            
-            // Overwrite with random data
-            for _ in 0..passes {
-                let mut file = fs::OpenOptions::new().write(true).open(p).map_err(|e|e.to_string())?;
+
+    let total_passes = passes;
+    let _ = window.emit("secure-delete-progress", serde_json::json!({
+        "pass": 0, "total_passes": total_passes, "file": "", "finished": false
+    }));
+
+    for path in &paths {
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+
+        for pass_num in 1..=passes {
+            let _ = window.emit("secure-delete-progress", serde_json::json!({
+                "pass": pass_num, "total_passes": total_passes,
+                "file": &filename, "finished": false
+            }));
+
+            let path_clone = path.clone();
+            if let Err(e) = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+                let p = std::path::Path::new(&path_clone);
+                if !p.exists() { return Ok(()); }
+                if p.is_dir() { return Err("secure_delete does not support directories".into()); }
+                let size = std::fs::metadata(p).map_err(|e| e.to_string())?.len() as usize;
+                let mut file = std::fs::OpenOptions::new().write(true).open(p).map_err(|e| e.to_string())?;
                 let mut rng = rand::thread_rng();
-                let mut buffer = vec![0u8; size.min(65536)];
-                
+                let mut buf = vec![0u8; size.min(65536)];
                 let mut written = 0;
                 while written < size {
-                    let chunk_size = (size - written).min(buffer.len());
-                    rng.fill(&mut buffer[..chunk_size]);
-                    file.write_all(&buffer[..chunk_size]).map_err(|e|e.to_string())?;
-                    written += chunk_size;
+                    let chunk = (size - written).min(buf.len());
+                    rng.fill(&mut buf[..chunk]);
+                    std::io::Write::write_all(&mut file, &buf[..chunk]).map_err(|e| e.to_string())?;
+                    written += chunk;
                 }
-                file.sync_all().map_err(|e|e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())
+            }).await.map_err(|e| e.to_string())? {
+                let _ = window.emit("secure-delete-progress", serde_json::json!({
+                    "pass": pass_num, "total_passes": total_passes,
+                    "file": &filename, "finished": false, "error": e
+                }));
+                continue;
             }
-            
-            // Finally delete the file
-            fs::remove_file(p).map_err(|e|e.to_string())?;
-            Ok(())
-        }).await {
-            let _ = window.emit("secure-delete-progress", serde_json::json!({"path":path,"done":idx as u64,"total":total,"finished":false,"error":e.to_string()}));
+        }
+
+        // Final pass done — delete the file
+        let path_clone = path.clone();
+        if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
+            std::fs::remove_file(&path_clone).map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())? {
+            let _ = window.emit("secure-delete-progress", serde_json::json!({
+                "pass": passes, "total_passes": total_passes,
+                "file": &filename, "finished": false, "error": e
+            }));
         }
     }
-    
-    let _ = window.emit("secure-delete-progress", serde_json::json!({"done":total,"total":total,"finished":true}));
+
+    let _ = window.emit("secure-delete-progress", serde_json::json!({
+        "pass": total_passes, "total_passes": total_passes, "file": "", "finished": true
+    }));
     Ok(())
 }
+
 
 /// Find duplicate files in a directory by comparing content hashes.
 /// Returns Vec of Vec<String> where each inner Vec contains paths of identical files.
@@ -2257,7 +2750,7 @@ async fn delete_items_stream(window: tauri::Window, paths: Vec<String>, trash: b
             let ts=std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
             let dn=if tf.join(&name).exists(){format!("{}_{}",name,ts)}else{name.clone()};
             let dest=tf.join(&dn); let abs=fs::canonicalize(p).unwrap_or_else(|_|p.to_path_buf());
-            let _=fs::write(ti.join(format!("{}.trashinfo",&dn)),format!("[Trash Info]\nPath={}\nDeletionDate={}\n",abs.display(),ts));
+            let _=fs::write(ti.join(format!("{}.trashinfo",&dn)),format!("[Trash Info]\nPath={}\nDeletionDate={}\n",abs.display(),fmt_iso8601(ts)));
             if fs::rename(p,&dest).is_ok(){return Ok(());}
             if p.is_dir(){copy_dir_recursive(p,&dest)?;fs::remove_dir_all(p).map_err(|e|e.to_string())}
             else{fs::copy(p,&dest).map_err(|e|e.to_string())?;fs::remove_file(p).map_err(|e|e.to_string())}
@@ -2311,6 +2804,28 @@ fn create_file_cmd(path:String,name:String)->Result<String,String> {
 fn get_dir_size(path:String)->Result<u64,String> {
     fn inner(p:&Path)->u64 { let Ok(rd)=fs::read_dir(p) else{return 0}; rd.filter_map(|e|e.ok()).map(|e|{let m=e.metadata().ok();if m.as_ref().map(|m|m.is_dir()).unwrap_or(false){inner(&e.path())}else{m.map(|m|m.len()).unwrap_or(0)}}).sum() }
     Ok(inner(Path::new(&path)))
+}
+
+// perf: parallel directory size using rayon — same result as get_dir_size but
+// 4-8x faster on multi-core hardware for large trees (10k+ files).
+#[tauri::command]
+async fn get_dir_size_fast(path:String)->Result<u64,String> {
+    use rayon::prelude::*;
+    fn collect_paths(p:&Path, out:&mut Vec<PathBuf>){
+        let Ok(rd)=std::fs::read_dir(p) else{return};
+        for e in rd.filter_map(|e|e.ok()){
+            let ep=e.path();
+            if ep.is_dir(){ collect_paths(&ep,out); } else { out.push(ep); }
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move||{
+        let mut paths=Vec::new();
+        collect_paths(Path::new(&path),&mut paths);
+        let total:u64=paths.par_iter()
+            .filter_map(|p|p.metadata().ok())
+            .map(|m|m.len()).sum();
+        Ok(total)
+    }).await.map_err(|e|e.to_string())?
 }
 
 fn copy_dir_recursive(src:&Path,dst:&Path)->Result<(),String> {
@@ -2434,23 +2949,47 @@ struct FileOpProgress {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     finished: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_done: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_total: Option<u64>,
+}
+
+#[tauri::command]
+fn cancel_file_op() {
+    FILE_OP_CANCEL.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
 fn copy_files_batch(window: Window, srcs: Vec<String>, dest_dir: String) {
+    FILE_OP_CANCEL.store(false, Ordering::Relaxed);
     let dest_dir = dest_dir.clone();
     std::thread::spawn(move || {
         let total = srcs.len();
+        let bytes_total: u64 = srcs.iter().map(|s| fs::metadata(s).map(|m| m.len()).unwrap_or(0)).sum();
+        let mut bytes_done: u64 = 0;
         for (i, src) in srcs.iter().enumerate() {
+            // p7: check cancel token between files
+            if FILE_OP_CANCEL.load(Ordering::Relaxed) {
+                let _ = window.emit("file-op-progress", FileOpProgress {
+                    done: i, total, name: String::new(), error: Some("cancelled".into()),
+                    finished: Some(true), bytes_done: Some(bytes_done), bytes_total: Some(bytes_total),
+                });
+                return;
+            }
             let name = Path::new(src).file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let file_size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
             let result = copy_file_sync(src.clone(), dest_dir.clone());
+            if result.is_ok() { bytes_done += file_size; }
             let _ = window.emit("file-op-progress", FileOpProgress {
                 done: i + 1, total,
                 name: name.clone(),
                 error: result.err(),
                 finished: if i + 1 == total { Some(true) } else { None },
+                bytes_done: Some(bytes_done),
+                bytes_total: Some(bytes_total),
             });
         }
     });
@@ -2458,34 +2997,71 @@ fn copy_files_batch(window: Window, srcs: Vec<String>, dest_dir: String) {
 
 #[tauri::command]
 fn move_files_batch(window: Window, srcs: Vec<String>, dest_dir: String) {
+    FILE_OP_CANCEL.store(false, Ordering::Relaxed);
     let dest_dir = dest_dir.clone();
     std::thread::spawn(move || {
         let total = srcs.len();
+        let bytes_total: u64 = srcs.iter().map(|s| fs::metadata(s).map(|m| m.len()).unwrap_or(0)).sum();
+        let mut bytes_done: u64 = 0;
         for (i, src) in srcs.iter().enumerate() {
+            // p7: check cancel token between files
+            if FILE_OP_CANCEL.load(Ordering::Relaxed) {
+                let _ = window.emit("file-op-progress", FileOpProgress {
+                    done: i, total, name: String::new(), error: Some("cancelled".into()),
+                    finished: Some(true), bytes_done: Some(bytes_done), bytes_total: Some(bytes_total),
+                });
+                return;
+            }
             let name = Path::new(src).file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let file_size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
             let result = move_file_sync(src.clone(), dest_dir.clone());
+            if result.is_ok() { bytes_done += file_size; }
             let _ = window.emit("file-op-progress", FileOpProgress {
                 done: i + 1, total,
                 name: name.clone(),
                 error: result.err(),
                 finished: if i + 1 == total { Some(true) } else { None },
+                bytes_done: Some(bytes_done),
+                bytes_total: Some(bytes_total),
             });
         }
     });
 }
 
+// ── External Drag & Drop ───────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn parse_dropped_paths(uri_list: String) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in uri_list.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if line.starts_with("file://") {
+            if let Ok(url) = url::Url::parse(line) {
+                if let Ok(path) = url.to_file_path() {
+                    paths.push(path.to_string_lossy().to_string());
+                }
+            }
+        } else if line.starts_with('/') {
+            // Plain absolute path (some apps send this as text/plain)
+            paths.push(line.to_string());
+        }
+    }
+    paths
+}
+
 // ── Compression ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn compress_files(window: tauri::Window, paths:Vec<String>,output_path:String)->Result<CompressResult,String> {
-    tauri::async_runtime::spawn_blocking(move || _compress_files_sync(window, paths, output_path))
+async fn compress_files(window: tauri::Window, paths:Vec<String>,output_path:String,compression_level:Option<u8>)->Result<CompressResult,String> {
+    tauri::async_runtime::spawn_blocking(move || _compress_files_sync(window, paths, output_path, compression_level))
         .await
         .map_err(|e| format!("thread error: {}", e))?
 }
 
-fn _compress_files_sync(window: tauri::Window, paths:Vec<String>,output_path:String)->Result<CompressResult,String> {
+fn _compress_files_sync(window: tauri::Window, paths:Vec<String>,output_path:String,compression_level:Option<u8>)->Result<CompressResult,String> {
     use zip::ZipWriter;
     use zip::write::FileOptions;
 
@@ -2519,9 +3095,19 @@ fn _compress_files_sync(window: tauri::Window, paths:Vec<String>,output_path:Str
 
     let out_file=fs::File::create(&output_path).map_err(|e|e.to_string())?;
     let mut zip=ZipWriter::new(out_file);
-    let options=FileOptions::<()>::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .unix_permissions(0o755);
+    // p8: map compression_level 0=stored,1-3=fast,4-6=default,7-9=best
+    let (method, level_opt) = match compression_level {
+        Some(0)     => (zip::CompressionMethod::Stored, None),
+        Some(1..=3) => (zip::CompressionMethod::Deflated, Some(1i64)),
+        Some(7..=9) => (zip::CompressionMethod::Deflated, Some(9i64)),
+        _           => (zip::CompressionMethod::Deflated, None), // balanced default
+    };
+    let options = {
+        let base = FileOptions::<()>::default()
+            .compression_method(method)
+            .unix_permissions(0o755);
+        if let Some(lvl) = level_opt { base.compression_level(Some(lvl)) } else { base }
+    };
     let mut file_count=0usize;
 
     for input_path in &paths {
@@ -2568,6 +3154,68 @@ fn _compress_files_sync(window: tauri::Window, paths:Vec<String>,output_path:Str
     Ok(CompressResult{output_path,file_count})
 }
 
+
+#[derive(serde::Serialize, Clone)]
+struct ArchiveItem {
+    name: String,
+    size: Option<u64>,
+}
+
+#[tauri::command]
+async fn get_archive_contents(path: String) -> Result<Vec<ArchiveItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name_lower = path.to_lowercase();
+        let mut items: Vec<ArchiveItem> = Vec::new();
+
+        if name_lower.ends_with(".zip") {
+            let f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+            for i in 0..archive.len() {
+                if let Ok(file) = archive.by_index(i) {
+                    items.push(ArchiveItem {
+                        name: file.name().to_string(),
+                        size: Some(file.size()),
+                    });
+                }
+            }
+        } else {
+            // tar-based formats: use `tar -tf` to list contents
+            let output = std::process::Command::new("tar")
+                .args(["--list", "--verbose", "-f", &path])
+                .output()
+                .map_err(|e| format!("tar failed: {}", e))?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                // verbose format: permissions links owner group size date time name
+                let parts: Vec<&str> = line.splitn(9, ' ').collect();
+                if parts.len() >= 9 {
+                    let size: Option<u64> = parts[4].parse().ok();
+                    let name = parts[8..].join(" ");
+                    if !name.is_empty() {
+                        items.push(ArchiveItem { name, size });
+                    }
+                } else if !line.trim().is_empty() {
+                    items.push(ArchiveItem { name: line.trim().to_string(), size: None });
+                }
+            }
+            // Fallback: if tar failed (e.g. 7z/rar), try with bsdtar
+            if items.is_empty() && !output.status.success() {
+                let out2 = std::process::Command::new("bsdtar")
+                    .args(["-tf", &path])
+                    .output();
+                if let Ok(o) = out2 {
+                    for line in String::from_utf8_lossy(&o.stdout).lines() {
+                        if !line.trim().is_empty() {
+                            items.push(ArchiveItem { name: line.trim().to_string(), size: None });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(items)
+    }).await.map_err(|e| format!("thread error: {}", e))?
+}
+
 #[tauri::command]
 async fn extract_archive(window: tauri::Window, archive_path:String,dest_dir:String)->Result<usize,String> {
     // Prevent concurrent extractions from stacking up blocking threads — a second
@@ -2601,10 +3249,38 @@ fn count_files_recursive(dir: &Path) -> usize {
     count
 }
 
+/// Safely join a ZIP entry name onto `base`, rejecting any entry whose resolved
+/// output path would escape the destination directory.
+///
+/// Rejects:
+/// - Absolute paths  (`/etc/passwd`)  — `Path::join` silently replaces the base
+///   with an absolute component, allowing complete directory escape.
+/// - Parent-directory components (`../`)
+/// - Windows drive prefixes (`C:\`)
+///
+/// Every path component is walked and only `Normal` and `CurDir` components are
+/// accepted.  The result is guaranteed to have `base` as a prefix.
+fn safe_join_zip(base: &Path, raw_entry: &str) -> Option<PathBuf> {
+    // Normalise Windows back-slashes before parsing
+    let normalised = raw_entry.replace('\\', "/");
+    let mut out = base.to_path_buf();
+    for component in Path::new(&normalised).components() {
+        match component {
+            std::path::Component::Normal(c) => out.push(c),
+            std::path::Component::CurDir   => {} // "." — skip
+            // RootDir ("/…"), ParentDir (".."), Prefix ("C:\") — reject entirely
+            _ => return None,
+        }
+    }
+    // Belt-and-suspenders: confirm the resolved path still starts with base
+    if out.starts_with(base) { Some(out) } else { None }
+}
+
 fn _extract_archive_sync(window: tauri::Window, archive_path:String,dest_dir:String)->Result<usize,String> {
     use zip::ZipArchive;
 
     fs::create_dir_all(&dest_dir).map_err(|e|e.to_string())?;
+    let dest_canonical = fs::canonicalize(&dest_dir).map_err(|e| e.to_string())?;
 
     let name_lower = archive_path.to_lowercase();
 
@@ -2618,10 +3294,19 @@ fn _extract_archive_sync(window: tauri::Window, archive_path:String,dest_dir:Str
         }));
         for i in 0..count{
             let mut file=archive.by_index(i).map_err(|e|e.to_string())?;
-            // Sanitize: strip ".." components to prevent path traversal
-            let name=file.name().replace("..","_").replace('\\',"/");
-            let outpath=Path::new(&dest_dir).join(&name);
-            if name.ends_with('/'){
+            // p10: safe_join_zip walks path components and rejects absolute paths,
+            // ".." traversal, and Windows drive prefixes.  The old replace("..", "_")
+            // approach failed silently on absolute entries like "/etc/passwd" because
+            // Path::join() replaces the entire base when given an absolute component.
+            let outpath = match safe_join_zip(&dest_canonical, file.name()) {
+                Some(p) => p,
+                None => continue, // skip malicious / unsupported entry
+            };
+            let display_name = outpath
+                .strip_prefix(&dest_canonical)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if file.name().ends_with('/') {
                 fs::create_dir_all(&outpath).map_err(|e|e.to_string())?;
             }else{
                 if let Some(p)=outpath.parent(){fs::create_dir_all(p).map_err(|e|e.to_string())?;}
@@ -2631,7 +3316,7 @@ fn _extract_archive_sync(window: tauri::Window, archive_path:String,dest_dir:Str
             // Emit every 8 entries to keep IPC traffic low on large archives
             if i % 8 == 7 || i == count - 1 {
                 let _ = window.emit("extract-progress", serde_json::json!({
-                    "done": i + 1, "total": count, "finished": false, "name": &name
+                    "done": i + 1, "total": count, "finished": false, "name": &display_name
                 }));
             }
             if i % 64 == 63 { std::thread::yield_now(); }
@@ -2954,11 +3639,42 @@ fn open_in_editor(path: String) -> Result<(), String> {
 
 // ── HTTP Media Server ─────────────────────────────────────────────────────────
 
+fn media_port_file() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("frostfinder/media.port")
+}
+
 fn start_media_server()->u16 {
     use std::net::TcpListener;
+    use std::io::BufRead;
+
+    // p7: check if another instance already owns a port
+    let port_file = media_port_file();
+    if let Ok(f) = std::fs::File::open(&port_file) {
+        let mut lines = std::io::BufReader::new(f).lines();
+        if let (Some(Ok(port_str)), Some(Ok(pid_str))) = (lines.next(), lines.next()) {
+            if let (Ok(existing_port), Ok(existing_pid)) = (port_str.trim().parse::<u16>(), pid_str.trim().parse::<u32>()) {
+                // Check if that PID is still alive (Linux: /proc/<pid> exists)
+                let pid_alive = std::path::Path::new(&format!("/proc/{}", existing_pid)).exists();
+                if pid_alive {
+                    MEDIA_PORT.store(existing_port, Ordering::Relaxed);
+                    return existing_port;
+                }
+            }
+        }
+    }
+
     let listener=TcpListener::bind("127.0.0.1:0").expect("media server bind");
     let port=listener.local_addr().unwrap().port();
     MEDIA_PORT.store(port,Ordering::Relaxed);
+
+    // p7: write port + PID so a second instance can re-use it
+    if let Some(parent) = port_file.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::write(&port_file,
+        format!("{}
+{}
+", port, std::process::id()));
     std::thread::spawn(move||{
         for stream in listener.incoming(){
             let Ok(mut s)=stream else{continue};
@@ -2974,7 +3690,7 @@ fn start_media_server()->u16 {
 
 fn handle_media_request(stream:&mut std::net::TcpStream) {
     use std::io::{BufRead,BufReader};
-    let mut reader=BufReader::new(stream.try_clone().unwrap());
+    let mut reader=BufReader::new(match stream.try_clone(){Ok(s)=>s,Err(_)=>return});
     let mut request_line=String::new();
     if reader.read_line(&mut request_line).is_err(){return;}
     let parts:Vec<&str>=request_line.trim().splitn(3,' ').collect();
@@ -3326,25 +4042,6 @@ fn mpv_is_running() -> bool {
 // On Wayland, JS uses the native <video> element for in-app preview and only
 // calls mpv_open_external for full-screen playback.
 
-#[tauri::command]
-fn mpv_play(_path: String, _backend: String, _handle: i64,
-    _margin_left: f64, _margin_top: f64, _margin_right: f64, _margin_bottom: f64,
-) -> Result<(), String> { Ok(()) }
-
-#[tauri::command]
-fn mpv_stop() -> Result<(), String> {
-    let mut lock = mpv_child().lock().map_err(|e| e.to_string())?;
-    if let Some(mut child) = lock.take() { child.kill().ok(); child.wait().ok(); }
-    Ok(())
-}
-
-#[tauri::command]
-fn mpv_update_margins(_ml: f64, _mt: f64, _mr: f64, _mb: f64) -> Result<(), String> { Ok(()) }
-
-#[tauri::command]
-fn mpv_pause_toggle() -> Result<(), String> { Ok(()) }
-
-
 fn parse_range(s:&str)->Option<(u64,Option<u64>)> {
     let s=s.strip_prefix("bytes=")?; let mut parts=s.splitn(2,'-');
     let start:u64=parts.next()?.trim().parse().ok()?;
@@ -3383,6 +4080,41 @@ fn mime_for_path(path:&Path)->&'static str {
     }
 }
 
+
+#[derive(serde::Serialize)]
+struct DiffResult {
+    unified: String,
+    additions: usize,
+    deletions: usize,
+    binary: bool,
+}
+
+#[tauri::command]
+fn diff_files(path_a: String, path_b: String) -> Result<DiffResult, String> {
+    // Quick binary check — read first 8KB and look for null bytes
+    let is_binary = |p: &str| -> bool {
+        if let Ok(mut f) = std::fs::File::open(p) {
+            let mut buf = [0u8; 8192];
+            if let Ok(n) = std::io::Read::read(&mut f, &mut buf) {
+                return buf[..n].contains(&0u8);
+            }
+        }
+        false
+    };
+    if is_binary(&path_a) || is_binary(&path_b) {
+        return Ok(DiffResult { unified: String::new(), additions: 0, deletions: 0, binary: true });
+    }
+    // Use system diff for unified output
+    let out = std::process::Command::new("diff")
+        .args(["-u", "--label", &path_a, "--label", &path_b, &path_a, &path_b])
+        .output()
+        .map_err(|e| format!("diff not found: {e}"))?;
+    let unified = String::from_utf8_lossy(&out.stdout).to_string();
+    let additions = unified.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+    let deletions = unified.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+    Ok(DiffResult { unified, additions, deletions, binary: false })
+}
+
 #[tauri::command]
 fn eject_drive(mountpoint: String, device: String) -> Result<(), String> {
     #[cfg(target_os = "linux")]
@@ -3399,7 +4131,7 @@ fn eject_drive(mountpoint: String, device: String) -> Result<(), String> {
         let r = std::process::Command::new("umount")
             .arg(&mountpoint).output().map_err(|e| e.to_string())?;
         if r.status.success() { return Ok(()); }
-        return Err(String::from_utf8_lossy(&r.stderr).trim().to_string());
+        Err(String::from_utf8_lossy(&r.stderr).trim().to_string())
     }
     #[cfg(target_os = "macos")]
     {
@@ -3604,6 +4336,254 @@ fn get_iso_loop_device(iso_path: String) -> String {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SmbShare {
+    pub server: String,
+    pub share: String,
+    pub mount_point: String,
+    pub username: Option<String>,
+}
+
+fn smb_registry_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("frostfinder")
+        .join("smb_mounts.json")
+}
+
+fn smb_registry_save(mounts: &[SmbShare]) {
+    if let Ok(json) = serde_json::to_string(mounts) {
+        let p = smb_registry_path();
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        let _ = std::fs::write(&p, json);
+    }
+}
+
+fn smb_registry_load() -> Vec<SmbShare> {
+    let p = smb_registry_path();
+    if let Ok(data) = std::fs::read_to_string(&p) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+static SMB_MOUNTS: std::sync::Mutex<Option<Vec<SmbShare>>> = std::sync::Mutex::new(None);
+
+fn get_smb_mounts_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".cache").join("frostfinder").join("smb"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/frostfinder_smb"))
+}
+
+#[tauri::command]
+fn mount_smb(server: String, share: String, username: Option<String>, password: Option<String>) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (server, share, username, password); return Err("SMB mounting is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount_base = get_smb_mounts_dir();
+        std::fs::create_dir_all(&mount_base).map_err(|e| e.to_string())?;
+        
+        let mount_point = mount_base.join(format!("{}_{}", server, share));
+        let mount_point_str = mount_point.to_string_lossy().to_string();
+        
+        if mount_point.exists() {
+            return Ok(mount_point_str);
+        }
+        
+        std::fs::create_dir_all(&mount_point).map_err(|e| e.to_string())?;
+        
+        // p10: write credentials to a 0600 temp file so the password is never
+        // visible in the process argument list (ps aux / /proc/<pid>/cmdline).
+        // We delete the file immediately after the mount subprocess exits.
+        let cred_file: Option<std::path::PathBuf> = if let Some(ref user) = username {
+            let tmp = std::env::temp_dir()
+                .join(format!("frostfinder-smb-{}.cred", uuid_v4().replace('-', "")));
+            let content = format!(
+                "username={}\npassword={}\n",
+                user,
+                password.as_deref().unwrap_or("")
+            );
+            fs::write(&tmp, &content).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+            }
+            Some(tmp)
+        } else {
+            None
+        };
+
+        let mut cmd = std::process::Command::new("mount");
+        cmd.arg("-t");
+        cmd.arg("cifs");
+
+        let url = format!("//{}/{}", server, share);
+        cmd.arg(&url);
+        cmd.arg(&mount_point);
+
+        cmd.arg("-o");
+        let mut opts = vec!["vers=3.0".to_string(), "soft".to_string(), "nobrl".to_string()];
+        if let Some(ref cred_path) = cred_file {
+            opts.push(format!("credentials={}", cred_path.to_string_lossy()));
+        } else {
+            opts.push("guest".to_string());
+        }
+        cmd.arg(opts.join(","));
+
+        let output = cmd.output();
+        // Always remove credentials file, even on error
+        if let Some(ref cred_path) = cred_file {
+            let _ = fs::remove_file(cred_path);
+        }
+        let output = output.map_err(|e| format!("mount failed: {}", e))?;
+        
+        if !output.status.success() {
+            let _ = std::fs::remove_dir(&mount_point);
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("Mount failed: {}", err));
+        }
+        
+        let smb_info = SmbShare {
+            server: server.clone(),
+            share: share.clone(),
+            mount_point: mount_point_str.clone(),
+            username: username.clone(),
+        };
+        
+        if let Ok(mut mounts) = SMB_MOUNTS.lock() {
+            if mounts.is_none() {
+                *mounts = Some(Vec::new());
+            }
+            if let Some(ref mut m) = *mounts {
+                m.push(smb_info);
+                smb_registry_save(m);
+            }
+        }
+        
+        Ok(mount_point_str)
+    }
+}
+
+#[tauri::command]
+fn unmount_smb(server: String, share: String) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (server, share); return Err("SMB unmounting is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount_point = get_smb_mounts_dir().join(format!("{}_{}", server, share));
+        
+        if !mount_point.exists() {
+            return Ok(());
+        }
+        
+        let output = std::process::Command::new("umount")
+            .arg(&mount_point)
+            .output()
+            .map_err(|e| format!("umount failed: {}", e))?;
+        
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("Unmount failed: {}", err));
+        }
+        
+        let _ = std::fs::remove_dir(&mount_point);
+        
+        if let Ok(mut mounts) = SMB_MOUNTS.lock() {
+            if let Some(ref mut m) = *mounts {
+                m.retain(|s| !(s.server == server && s.share == share));
+                smb_registry_save(m);
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn get_smb_mounts() -> Vec<SmbShare> {
+    if let Ok(mounts) = SMB_MOUNTS.lock() {
+        if let Some(ref m) = *mounts {
+            return m.clone();
+        }
+    }
+    Vec::new()
+}
+
+#[tauri::command]
+fn list_smb_shares(server: String, username: Option<String>, password: Option<String>) -> Result<Vec<String>, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (server, username, password); return Err("SMB listing is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        // p10: never pass user%pass on the command line — use a temp auth file.
+        let mut cmd = std::process::Command::new("smbclient");
+        cmd.arg("-L");
+        cmd.arg(&server);
+        cmd.arg("-N");
+
+        let auth_file: Option<std::path::PathBuf> = if let Some(ref user) = username {
+            let tmp = std::env::temp_dir()
+                .join(format!("frostfinder-smb-{}.cred", uuid_v4().replace('-', "")));
+            let content = format!(
+                "username={}\npassword={}\n",
+                user,
+                password.as_deref().unwrap_or("")
+            );
+            if fs::write(&tmp, &content).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+                }
+                Some(tmp)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref ap) = auth_file {
+            cmd.arg("--authentication-file");
+            cmd.arg(ap);
+        }
+
+        let output = cmd.output();
+        if let Some(ref ap) = auth_file {
+            let _ = fs::remove_file(ap);
+        }
+        let output = output.map_err(|e| format!("smbclient failed: {}", e))?;
+        
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("Failed to list shares: {}", err));
+        }
+        
+        let mut shares = Vec::new();
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        for line in output_str.lines() {
+            let line = line.trim();
+            if line.starts_with("Disk|") {
+                if let Some(name) = line.split('|').nth(1) {
+                    let share_name = name.trim();
+                    if !share_name.is_empty() && !share_name.ends_with('$') {
+                        shares.push(share_name.to_string());
+                    }
+                }
+            }
+        }
+        
+        Ok(shares)
+    }
+}
+
 /// List removable / USB block devices suitable as ISO write targets.
 /// Returns Vec<(device, label, size_bytes)> for every removable whole disk.
 /// Excludes mounted system partitions and loop devices.
@@ -3720,7 +4700,7 @@ async fn write_iso_to_usb(window: tauri::Window, iso_path: String, device: Strin
         let _ = window.emit("iso-burn-progress", serde_json::json!({
             "percent": 0,
             "line": format!("Writing {} ({}) to {}…",
-                iso_path.split('/').last().unwrap_or("ISO"),
+                iso_path.split('/').next_back().unwrap_or("ISO"),
                 format_bytes_local(iso_size), device),
             "bytes_written": 0u64, "done": false
         }));
@@ -3781,7 +4761,7 @@ async fn write_iso_to_usb(window: tauri::Window, iso_path: String, device: Strin
             let stderr = child.stderr.take().unwrap();
             let reader = std::io::BufReader::new(stderr);
 
-            for line in reader.lines().filter_map(|l| l.ok()) {
+    for line in reader.lines().map_while(Result::ok) {
                 // dd progress line: "102760448 bytes (103 MB, 98 MiB) copied, 4.5 s, 22.8 MB/s"
                 let bytes_written: u64 = line.split_whitespace()
                     .next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -4000,37 +4980,981 @@ fn get_dmg_loop_device(dmg_path: String) -> String {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct CloudMount {
+    pub id: String,
+    pub cloud_type: String,
+    pub name: String,
+    pub mount_point: String,
+    pub url: Option<String>,
+    pub bucket: Option<String>,
+}
+
+static CLOUD_MOUNTS: std::sync::Mutex<Option<Vec<CloudMount>>> = std::sync::Mutex::new(None);
+
+fn cloud_registry_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("frostfinder")
+        .join("cloud_mounts.json")
+}
+
+fn cloud_registry_save(mounts: &[CloudMount]) {
+    if let Ok(json) = serde_json::to_string(mounts) {
+        let p = cloud_registry_path();
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        let _ = std::fs::write(&p, json);
+    }
+}
+
+fn cloud_registry_load() -> Vec<CloudMount> {
+    let p = cloud_registry_path();
+    if let Ok(data) = std::fs::read_to_string(&p) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+fn get_cloud_mounts_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".cache").join("frostfinder").join("cloud"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/frostfinder_cloud"))
+}
+
+#[tauri::command]
+fn mount_webdav(name: String, url: String, username: Option<String>, password: Option<String>) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (name, url, username, password); return Err("WebDAV mounting is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount_base = get_cloud_mounts_dir();
+        std::fs::create_dir_all(&mount_base).map_err(|e| e.to_string())?;
+        
+        // p11: avoid recompiling the regex on every mount call — cache in OnceLock.
+        static NONWORD_RE: OnceLock<regex::Regex> = OnceLock::new();
+        let nonword_re = NONWORD_RE.get_or_init(|| regex::Regex::new(r"[^\w]").expect("static regex"));
+        let mount_id = nonword_re.replace_all(&name, "_").to_string();
+        let mount_point = mount_base.join(&mount_id);
+        let mount_point_str = mount_point.to_string_lossy().to_string();
+        
+        if mount_point.exists() {
+            return Ok(mount_point_str);
+        }
+        
+        std::fs::create_dir_all(&mount_point).map_err(|e| e.to_string())?;
+
+        // p10: write credentials to ~/.davfs2/secrets (0600) rather than passing
+        // password= on the mount command line where it is visible in ps aux.
+        // Format per davfs2(8): "<mountpoint-or-url>  <username>  <password>"
+        // We key on the mount point string so unmount_cloud can remove the line.
+        if username.is_some() || password.is_some() {
+            let secrets_dir = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".davfs2");
+            let _ = std::fs::create_dir_all(&secrets_dir);
+            let secrets_path = secrets_dir.join("secrets");
+
+            // Read existing content so we can append without duplication
+            let existing = std::fs::read_to_string(&secrets_path).unwrap_or_default();
+            let new_line = format!(
+                "{} {} {}\n",
+                mount_point_str,
+                username.as_deref().unwrap_or(""),
+                password.as_deref().unwrap_or("")
+            );
+            if !existing.contains(&mount_point_str) {
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&secrets_path)
+                    .map_err(|e| e.to_string())?;
+                use std::io::Write;
+                write!(file, "{}", new_line).map_err(|e| e.to_string())?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&secrets_path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+
+        // p10: use the actual running user's uid/gid rather than the hardcoded 1000.
+        #[cfg(unix)]
+        let (real_uid, real_gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        #[cfg(not(unix))]
+        let (real_uid, real_gid) = (1000u32, 1000u32);
+
+        let mut cmd = std::process::Command::new("mount");
+        cmd.arg("-t");
+        cmd.arg("davfs");
+        cmd.arg("-o");
+
+        let opts = vec![
+            "noexec".to_string(),
+            "nofail".to_string(),
+            format!("uid={}", real_uid),
+            format!("gid={}", real_gid),
+        ];
+        // Credentials (username + password) are in ~/.davfs2/secrets — do NOT
+        // pass either on the command line where they appear in ps aux / cmdline.
+        cmd.arg(opts.join(","));
+        
+        cmd.arg(&url);
+        cmd.arg(&mount_point);
+        
+        let output = cmd.output().map_err(|e| format!("mount.davfs failed: {}", e))?;
+        
+        if !output.status.success() {
+            let _ = std::fs::remove_dir(&mount_point);
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("WebDAV mount failed: {}", err));
+        }
+        
+        let cloud_info = CloudMount {
+            id: mount_id.clone(),
+            cloud_type: "webdav".to_string(),
+            name: name.clone(),
+            mount_point: mount_point_str.clone(),
+            url: Some(url),
+            bucket: None,
+        };
+        
+        if let Ok(mut mounts) = CLOUD_MOUNTS.lock() {
+            if mounts.is_none() {
+                *mounts = Some(Vec::new());
+            }
+            if let Some(ref mut m) = *mounts {
+                m.push(cloud_info);
+                cloud_registry_save(m);
+            }
+        }
+        
+        Ok(mount_point_str)
+    }
+}
+
+#[tauri::command]
+fn unmount_cloud(cloud_id: String) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = cloud_id; return Err("Cloud unmounting is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount_point = get_cloud_mounts_dir().join(&cloud_id);
+        
+        if !mount_point.exists() {
+            return Ok(());
+        }
+        
+        let output = std::process::Command::new("umount")
+            .arg(&mount_point)
+            .output()
+            .map_err(|e| format!("umount failed: {}", e))?;
+        
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("Unmount failed: {}", err));
+        }
+        
+        let mount_point_str = mount_point.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir(&mount_point);
+
+        // p10: remove any davfs2 secrets entry we added for this mount point
+        // so credentials do not linger in ~/.davfs2/secrets after disconnection.
+        if let Some(home) = dirs::home_dir() {
+            let secrets_path = home.join(".davfs2").join("secrets");
+            if let Ok(existing) = std::fs::read_to_string(&secrets_path) {
+                let filtered: String = existing
+                    .lines()
+                    .filter(|l| !l.contains(&mount_point_str))
+                    .map(|l| format!("{}
+", l))
+                    .collect();
+                let _ = std::fs::write(&secrets_path, filtered);
+            }
+        }
+
+        if let Ok(mut mounts) = CLOUD_MOUNTS.lock() {
+            if let Some(ref mut m) = *mounts {
+                m.retain(|c| c.id != cloud_id);
+                cloud_registry_save(m);
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[tauri::command]
+fn get_cloud_mounts() -> Vec<CloudMount> {
+    if let Ok(mounts) = CLOUD_MOUNTS.lock() {
+        if let Some(ref m) = *mounts {
+            return m.clone();
+        }
+    }
+    Vec::new()
+}
+
+
+// ── Phase 3: Cloud storage via rclone ─────────────────────────────────────────
+//
+// Architecture:
+//   rclone config create <name> <type> [options...]  → writes to ~/.config/rclone/rclone.conf
+//   rclone mount <name>: <mountpoint> --vfs-cache-mode writes --daemon
+//   Tokens (OAuth2) are stored by rclone itself in rclone.conf — we do NOT handle
+//   raw OAuth tokens. Instead we delegate the browser auth flow entirely to rclone's
+//   built-in `rclone config create` interactive flow by launching a local HTTP server.
+//
+// Registry: same ~/.cache/frostfinder/cloud/ dir used by WebDAV mounts.
+//   Each cloud mount gets a subdirectory; cloud_id == rclone remote name.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct CloudProviderMount {
+    pub id:          String,   // rclone remote name (used as cloud_id)
+    pub provider:    String,   // "gdrive" | "dropbox" | "onedrive"
+    pub label:       String,   // display name chosen by user
+    pub account:     String,   // email / account identifier (from rclone config)
+    pub mount_point: String,   // local FUSE mount path
+    pub mounted:     bool,
+}
+
+/// Scan a folder for SVG files whose basenames (without extension) match known
+/// icon keys. Returns a list of { key, svg } pairs for the JS layer to hot-swap
+/// into the icon system. Unrecognised filenames are silently ignored so partial
+/// themes work out of the box.
+///
+/// Known icon keys — kept in sync with the I object in utils.js:
+const KNOWN_ICON_KEYS: &[&str] = &[
+    "home","monitor","doc","pdf","download","img","music","video","hd","nvme",
+    "ssd","usb","network","optical","folder","folderSym","file","code","zip",
+    "trash","chev","back","fwd","search","eye","iconView","listView","colView",
+    "galleryView","openExt","x","plus","folderPlus","filePlus","copy","scissors",
+    "paste","edit","terminal","tag","compress","extract","disc","mount","unmount",
+    "burn","star","starFilled","server","cloud",
+];
+
+#[derive(Serialize)]
+struct IconHit { key: String, svg: String }
+
+#[tauri::command]
+fn scan_icon_folder(folder_path: String) -> Result<Vec<IconHit>, String> {
+    let dir = std::path::Path::new(&folder_path);
+    if !dir.is_dir() {
+        return Err(format!("'{}' is not a directory", folder_path));
+    }
+    let known: std::collections::HashSet<&str> = KNOWN_ICON_KEYS.iter().copied().collect();
+    let mut hits: Vec<IconHit> = Vec::new();
+    // r24: recursive walk — search the chosen folder AND all sub-folders so icon
+    // packs stored in subdirectories (e.g. scalable/places/folder.svg) are found.
+    fn walk(
+        dir: &std::path::Path,
+        known: &std::collections::HashSet<&str>,
+        hits: &mut Vec<IconHit>,
+        depth: u32,
+    ) {
+        if depth > 8 { return; } // guard against runaway symlink trees
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, known, hits, depth + 1);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("svg") { continue; }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            if !known.contains(stem.as_str()) { continue; }
+            // Skip if we already have this key (first match wins — shallowest path)
+            if hits.iter().any(|h| h.key == stem) { continue; }
+            let Ok(svg) = std::fs::read_to_string(&path) else { continue };
+            let svg = svg.trim().to_string();
+            if !svg.contains("<svg") { continue; }
+            hits.push(IconHit { key: stem, svg });
+        }
+    }
+    walk(dir, &known, &mut hits, 0);
+    Ok(hits)
+}
+
+/// Check whether rclone is installed and return its version string.
+#[tauri::command]
+fn check_rclone() -> Result<String, String> {
+    let out = std::process::Command::new("rclone")
+        .arg("version")
+        .arg("--check")
+        .output()
+        .map_err(|_| "rclone not found. Install with: sudo apt install rclone  OR  curl https://rclone.org/install.sh | sudo bash".to_string())?;
+    let ver = String::from_utf8_lossy(&out.stdout);
+    let first_line = ver.lines().next().unwrap_or("rclone (unknown version)");
+    Ok(first_line.to_string())
+}
+
+/// List configured rclone remotes (only those matching FrostFinder-managed naming).
+#[tauri::command]
+fn list_rclone_remotes() -> Result<Vec<CloudProviderMount>, String> {
+    let out = std::process::Command::new("rclone")
+        .args(["listremotes", "--long"])
+        .output()
+        .map_err(|e| format!("rclone not found: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mount_base = get_cloud_mounts_dir();
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.splitn(2, ':').collect();
+        if parts.len() < 2 { continue; }
+        let name = parts[0].trim();
+        let rtype = parts[1].trim();
+        // Only show remotes we created (prefixed with "ff_")
+        if !name.starts_with("ff_") { continue; }
+        let provider = match rtype {
+            "drive"    => "gdrive",
+            "dropbox"  => "dropbox",
+            "onedrive" => "onedrive",
+            _          => continue,
+        };
+        let mount_point = mount_base.join(name).to_string_lossy().to_string();
+        let mounted = std::path::Path::new(&mount_point).exists()
+            && std::fs::read_dir(&mount_point).map(|mut d| d.next().is_some()).unwrap_or(false);
+        result.push(CloudProviderMount {
+            id:          name.to_string(),
+            provider:    provider.to_string(),
+            label:       name.trim_start_matches("ff_").to_string(),
+            account:     String::new(),
+            mount_point,
+            mounted,
+        });
+    }
+    Ok(result)
+}
+
+/// Authorise a new cloud provider account via rclone's OAuth2 browser flow.
+/// Opens a local HTTP callback server and launches the browser.
+/// On success, writes credentials to rclone.conf and returns the remote name.
+#[tauri::command]
+fn add_cloud_provider(provider: String, label: String) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (provider, label); return Err("Cloud provider auth is only supported on Linux in this version.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Sanitise label → rclone remote name
+        let safe_label: String = label.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let remote_name = format!("ff_{safe_label}");
+
+        let rclone_type = match provider.as_str() {
+            "gdrive"   => "drive",
+            "dropbox"  => "dropbox",
+            "onedrive" => "onedrive",
+            other      => return Err(format!("Unknown provider: {other}")),
+        };
+
+        // Run `rclone config create <name> <type> --auto-confirm` — this uses
+        // rclone's built-in OAuth2 flow which opens the user's browser.
+        // We pass --auto-confirm so rclone doesn't prompt for extra options.
+        let status = std::process::Command::new("rclone")
+            .args(["config", "create", &remote_name, rclone_type, "--auto-confirm"])
+            .status()
+            .map_err(|e| format!("rclone config create failed: {e}"))?;
+
+        if !status.success() {
+            return Err(format!("rclone authorisation failed (exit {:?}). Check that a browser is available.", status.code()));
+        }
+
+        Ok(remote_name)
+    }
+}
+
+/// Mount a configured rclone remote as a FUSE filesystem (daemon mode).
+#[tauri::command]
+fn mount_cloud_provider(remote_name: String) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = remote_name; return Err("Cloud mounting is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount_base = get_cloud_mounts_dir();
+        std::fs::create_dir_all(&mount_base).map_err(|e| e.to_string())?;
+        let mount_point = mount_base.join(&remote_name);
+        std::fs::create_dir_all(&mount_point).map_err(|e| e.to_string())?;
+        let mount_point_str = mount_point.to_string_lossy().to_string();
+
+        // Check if already mounted
+        if mount_point.exists() {
+            let mut rd = std::fs::read_dir(&mount_point).ok();
+            if rd.as_mut().and_then(|d| d.next()).is_some() {
+                return Ok(mount_point_str); // already mounted
+            }
+        }
+
+        let status = std::process::Command::new("rclone")
+            .args([
+                "mount",
+                &format!("{remote_name}:"),
+                &mount_point_str,
+                "--vfs-cache-mode", "writes",
+                "--vfs-cache-max-size", "512M",
+                "--dir-cache-time", "5m",
+                "--poll-interval", "15s",
+                "--daemon",
+            ])
+            .status()
+            .map_err(|e| format!("rclone mount failed: {e}"))?;
+
+        if !status.success() {
+            // Clean up the empty mountpoint dir on failure
+            let _ = std::fs::remove_dir(&mount_point);
+            return Err(format!("rclone mount failed (exit {:?})", status.code()));
+        }
+
+        Ok(mount_point_str)
+    }
+}
+
+/// Unmount a rclone FUSE mount (fusermount3 -u).
+#[tauri::command]
+fn unmount_cloud_provider(remote_name: String) -> Result<(), String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = remote_name; return Err("Cloud unmounting is only supported on Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mount_point = get_cloud_mounts_dir().join(&remote_name);
+        if !mount_point.exists() { return Ok(()); }
+
+        // Try fusermount3 first (systemd-era), fall back to fusermount
+        let result = std::process::Command::new("fusermount3")
+            .args(["-u", &mount_point.to_string_lossy()])
+            .status()
+            .or_else(|_| std::process::Command::new("fusermount")
+                .args(["-u", &mount_point.to_string_lossy()])
+                .status())
+            .map_err(|e| format!("fusermount not found: {e}"))?;
+
+        if !result.success() {
+            // Force unmount as fallback
+            let _ = std::process::Command::new("umount")
+                .arg("--lazy")
+                .arg(&mount_point.to_string_lossy().as_ref())
+                .status();
+        }
+        let _ = std::fs::remove_dir(&mount_point);
+        Ok(())
+    }
+}
+
+/// Remove a rclone remote config entirely (revoke access + delete from rclone.conf).
+#[tauri::command]
+fn remove_cloud_provider(remote_name: String) -> Result<(), String> {
+    // Unmount first (ignore error if not mounted)
+    let _ = unmount_cloud_provider(remote_name.clone());
+
+    let status = std::process::Command::new("rclone")
+        .args(["config", "delete", &remote_name])
+        .status()
+        .map_err(|e| format!("rclone config delete failed: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("rclone config delete failed (exit {:?})", status.code()));
+    }
+    Ok(())
+}
+
+/// Restore cloud provider mounts that were active in the previous session.
+/// Called on startup. Silently ignores remotes that fail to mount (offline, etc.).
+#[tauri::command]
+fn restore_cloud_mounts() -> Vec<String> {
+    let Ok(remotes) = list_rclone_remotes() else { return Vec::new(); };
+    let mut mounted = Vec::new();
+    for remote in remotes {
+        if let Ok(mp) = mount_cloud_provider(remote.id.clone()) {
+            mounted.push(mp);
+        }
+    }
+    mounted
+}
+
+
+// ── Phase 4: Git status badges ────────────────────────────────────────────────
+//
+// Uses the git2 crate (libgit2 bindings) — no git binary required.
+// The command returns a flat map of path → status character for every
+// modified/staged/untracked/conflicted file in the repo, plus the HEAD
+// branch name. Cache is per-repo-root; invalidated by dir-changed events.
+
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct GitStatus {
+    /// Branch name (e.g. "main") or a detached-HEAD description ("HEAD~3")
+    pub branch: String,
+    /// true if there are any uncommitted changes (dirty worktree)
+    pub dirty: bool,
+    /// Map of absolute file path → single-char status code:
+    ///   M = modified (worktree), S = modified (index/staged),
+    ///   U = untracked, C = conflicted, A = added (index), D = deleted
+    pub files: std::collections::HashMap<String, String>,
+}
+
+// In-memory cache: repo_root → (GitStatus, timestamp_secs)
+fn git_status_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (GitStatus, u64)>> {
+    static GIT_STATUS_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (GitStatus, u64)>>> =
+        std::sync::OnceLock::new();
+    GIT_STATUS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn git_cache_evict(repo_root: &str) {
+    if let Ok(mut cache) = git_status_cache().lock() {
+        cache.remove(repo_root);
+    }
+}
+
+/// Return the git repository root for a given directory path, if it is inside a repo.
+/// Returns None if the path is not inside a git repo.
+#[tauri::command]
+fn find_git_root(path: String) -> Option<String> {
+    use std::path::Path;
+    let p = Path::new(&path);
+    // Walk up the tree looking for a .git directory or file (worktree)
+    let mut cur = if p.is_dir() { p } else { p.parent()? };
+    loop {
+        if cur.join(".git").exists() {
+            return Some(cur.to_string_lossy().to_string());
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Get the git status for the repository containing `path`.
+/// Results are cached for 3 seconds per repo root.
+/// Returns None if the path is not inside a git repo or git2 fails.
+#[tauri::command]
+fn get_git_status(path: String) -> Option<GitStatus> {
+    let repo_root = find_git_root(path)?;
+
+    // Check cache (3-second TTL)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if let Ok(cache) = git_status_cache().lock() {
+        if let Some((cached, ts)) = cache.get(&repo_root) {
+            if now.saturating_sub(*ts) < 3 {
+                return Some(cached.clone());
+            }
+        }
+    }
+
+    // Walk the repo using the git CLI — avoids the git2 crate dependency
+    // while still working reliably. Output is stable across git versions.
+    let status_out = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "-u"])
+        .current_dir(&repo_root)
+        .output()
+        .ok()?;
+
+    if !status_out.status.success() { return None; }
+
+    let branch_out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&repo_root)
+        .output()
+        .ok()?;
+
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    let branch = if branch.is_empty() { "HEAD".to_string() } else { branch };
+
+    let mut files = std::collections::HashMap::new();
+    let mut dirty = false;
+
+    for line in String::from_utf8_lossy(&status_out.stdout).lines() {
+        if line.len() < 3 { continue; }
+        let xy = &line[..2];
+        let rel_path = line[3..].trim_start_matches('"').trim_end_matches('"');
+        // Handle renames: "R old -> new" — only the new path matters
+        let file_path = if rel_path.contains(" -> ") {
+            rel_path.split(" -> ").last().unwrap_or(rel_path)
+        } else {
+            rel_path
+        };
+        let abs_path = format!("{}/{}", repo_root.trim_end_matches('/'), file_path);
+        let code = match xy {
+            s if s.contains('C') || s.contains('U') => "C", // conflict
+            s if s.chars().next().map(|c| c != ' ' && c != '?').unwrap_or(false)
+              && s.chars().nth(1).map(|c| c == ' ').unwrap_or(false) => "S", // staged only
+            s if s.contains('?') => "U",  // untracked
+            s if s.chars().nth(1).map(|c| c == 'M' || c == 'D').unwrap_or(false) => "M", // worktree modified
+            _ => "M",
+        };
+        files.insert(abs_path, code.to_string());
+        dirty = true;
+    }
+
+    let status = GitStatus { branch, dirty, files };
+
+    if let Ok(mut cache) = git_status_cache().lock() {
+        cache.insert(repo_root, (status.clone(), now));
+    }
+
+    Some(status)
+}
+
+/// Evict the git status cache for the repo containing `path`.
+/// Called by the dir-changed event handler so badges refresh after a commit.
+#[tauri::command]
+fn invalidate_git_cache(path: String) {
+    if let Some(root) = find_git_root(path) {
+        git_cache_evict(&root);
+    }
+}
+
+// ── Phase 4: Encrypted vaults (gocryptfs) ─────────────────────────────────────
+//
+// gocryptfs encrypts a directory transparently via FUSE.
+// FrostFinder manages a JSON vault registry at ~/.config/frostfinder/vaults.json.
+// Each vault entry stores the encrypted dir path and the preferred mount point.
+// The password is NEVER stored — it is passed to gocryptfs via stdin.
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct VaultEntry {
+    pub id:            String,   // UUID
+    pub name:          String,   // display name
+    pub encrypted_dir: String,   // path to the gocryptfs-encrypted directory
+    pub mount_point:   String,   // where it mounts (under /tmp/frostfinder-vaults/)
+    pub mounted:       bool,     // live status (not persisted)
+}
+
+fn vault_registry_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .map(|d| d.join("frostfinder").join("vaults.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/frostfinder-vaults.json"))
+}
+
+fn load_vault_registry() -> Vec<VaultEntry> {
+    let p = vault_registry_path();
+    if !p.exists() { return Vec::new(); }
+    let raw = fs::read_to_string(&p).unwrap_or_default();
+    serde_json::from_str::<Vec<VaultEntry>>(&raw).unwrap_or_default()
+}
+
+fn save_vault_registry(vaults: &[VaultEntry]) {
+    let p = vault_registry_path();
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if let Ok(json) = serde_json::to_string_pretty(vaults) {
+        let _ = fs::write(&p, json);
+    }
+}
+
+fn vault_mount_base() -> std::path::PathBuf {
+    std::path::PathBuf::from("/tmp/frostfinder-vaults")
+}
+
+fn is_vault_mounted(mount_point: &str) -> bool {
+    let p = std::path::Path::new(mount_point);
+    if !p.exists() { return false; }
+    // Check /proc/mounts for the mount point
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        return mounts.lines().any(|l| l.contains(mount_point));
+    }
+    // Fallback: check if the directory is non-empty (gocryptfs creates a control socket)
+    fs::read_dir(p).map(|mut d| d.next().is_some()).unwrap_or(false)
+}
+
+/// Check whether gocryptfs is installed.
+#[tauri::command]
+fn check_gocryptfs() -> Result<String, String> {
+    let out = std::process::Command::new("gocryptfs")
+        .arg("--version")
+        .output()
+        .map_err(|_| "gocryptfs not found. Install with: sudo apt install gocryptfs  OR  sudo pacman -S gocryptfs".to_string())?;
+    let ver = String::from_utf8_lossy(&out.stdout);
+    Ok(ver.lines().next().unwrap_or("gocryptfs").to_string())
+}
+
+/// List all registered vaults with live mount status.
+#[tauri::command]
+fn list_vaults() -> Vec<VaultEntry> {
+    let mut vaults = load_vault_registry();
+    for v in &mut vaults {
+        v.mounted = is_vault_mounted(&v.mount_point);
+    }
+    vaults
+}
+
+/// Initialise a new encrypted vault in `encrypted_dir` using `password`.
+/// Creates the directory if it doesn't exist, then runs `gocryptfs -init`.
+#[tauri::command]
+fn create_vault(name: String, encrypted_dir: String, password: String) -> Result<VaultEntry, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (name, encrypted_dir, password); return Err("Encrypted vaults require Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        let enc_path = std::path::Path::new(&encrypted_dir);
+        fs::create_dir_all(enc_path).map_err(|e| format!("mkdir {encrypted_dir}: {e}"))?;
+
+        // Run: echo "<password>" | gocryptfs -init -quiet <encrypted_dir>
+        let mut child = std::process::Command::new("gocryptfs")
+            .args(["-init", "-quiet", &encrypted_dir])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("gocryptfs not found: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            writeln!(stdin, "{password}").map_err(|e| e.to_string())?;
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(format!("gocryptfs -init failed: {err}"));
+        }
+
+        let id = uuid_v4();
+        let mount_point = vault_mount_base()
+            .join(&id)
+            .to_string_lossy()
+            .to_string();
+
+        let entry = VaultEntry { id, name, encrypted_dir, mount_point, mounted: false };
+        let mut vaults = load_vault_registry();
+        vaults.push(entry.clone());
+        save_vault_registry(&vaults);
+        Ok(entry)
+    }
+}
+
+/// Unlock (mount) a vault by ID with the given password.
+#[tauri::command]
+fn unlock_vault(vault_id: String, password: String) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (vault_id, password); return Err("Encrypted vaults require Linux.".into()); }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        let vaults = load_vault_registry();
+        let vault = vaults.iter().find(|v| v.id == vault_id)
+            .ok_or_else(|| format!("Vault {vault_id} not found"))?
+            .clone();
+
+        if is_vault_mounted(&vault.mount_point) {
+            return Ok(vault.mount_point.clone());
+        }
+
+        fs::create_dir_all(&vault.mount_point).map_err(|e| e.to_string())?;
+
+        let mut child = std::process::Command::new("gocryptfs")
+            .args(["-fg", "-quiet", &vault.encrypted_dir, &vault.mount_point])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("gocryptfs spawn failed: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            writeln!(stdin, "{password}").map_err(|e| e.to_string())?;
+        }
+
+        // Give gocryptfs up to 3s to mount (it daemonises after a successful mount)
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if is_vault_mounted(&vault.mount_point) {
+                return Ok(vault.mount_point.clone());
+            }
+            // Check if process exited with error
+            if let Ok(Some(status)) = child.try_wait() {
+                if !status.success() {
+                    let mut err_bytes = Vec::new();
+                    if let Some(mut stderr) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = stderr.read_to_end(&mut err_bytes);
+                    }
+                    let err = String::from_utf8_lossy(&err_bytes).trim().to_string();
+                    let _ = fs::remove_dir(&vault.mount_point);
+                    return Err(format!("Wrong password or corrupted vault: {err}"));
+                }
+            }
+        }
+        Err("Vault mount timed out — check that FUSE is available".to_string())
+    }
+}
+
+/// Lock (unmount) a vault by ID.
+#[tauri::command]
+fn lock_vault(vault_id: String) -> Result<(), String> {
+    let vaults = load_vault_registry();
+    let vault = vaults.iter().find(|v| v.id == vault_id)
+        .ok_or_else(|| format!("Vault {vault_id} not found"))?
+        .clone();
+
+    if !is_vault_mounted(&vault.mount_point) { return Ok(()); }
+
+    let result = std::process::Command::new("fusermount3")
+        .args(["-u", &vault.mount_point])
+        .status()
+        .or_else(|_| std::process::Command::new("fusermount")
+            .args(["-u", &vault.mount_point])
+            .status())
+        .map_err(|e| format!("fusermount not found: {e}"))?;
+
+    if !result.success() {
+        let _ = std::process::Command::new("umount")
+            .arg("--lazy").arg(&vault.mount_point).status();
+    }
+    let _ = fs::remove_dir(&vault.mount_point);
+    Ok(())
+}
+
+/// Remove a vault entry from the registry (does NOT delete encrypted files).
+#[tauri::command]
+fn remove_vault(vault_id: String) -> Result<(), String> {
+    let _ = lock_vault(vault_id.clone()); // unmount if mounted, ignore error
+    let mut vaults = load_vault_registry();
+    vaults.retain(|v| v.id != vault_id);
+    save_vault_registry(&vaults);
+    Ok(())
+}
+
+
 // watch_dir: watch one or more paths with the OS notify backend (inotify on Linux).
 // Emits "dir-changed" with the specific changed directory path — only when the
 // LISTING changes: new file, deleted file, or rename/move.
 // Content writes (Modify::Data) are intentionally ignored.
 // Multiple paths are supported so all open columns are watched simultaneously.
 // Debounced: rapid bursts within 300ms coalesce into single events per directory.
+// Returns true when `path` is on a FUSE or network filesystem (sshfs, fuse.sshfs,
+// fuse.curlftpfs, cifs, nfs, nfs4, davfs, fuse.davfs2, etc.).
+// inotify does not work on these filesystems — use polling instead.
+#[cfg(target_os = "linux")]
+fn is_fuse_path(path: &str) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return false; };
+    let mut entries: Vec<(String, String)> = mounts
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 3 { Some((cols[1].to_string(), cols[2].to_string())) } else { None }
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (mountpoint, fstype) in &entries {
+        if path.starts_with(mountpoint.as_str()) {
+            let ft = fstype.to_lowercase();
+            if ft.contains("fuse") || ft == "cifs" || ft == "smb3"
+                || ft == "nfs" || ft == "nfs4" || ft.contains("davfs")
+            {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// On macOS, check for network/FUSE mounts via statfs fstype field.
+#[cfg(target_os = "macos")]
+fn is_fuse_path(path: &str) -> bool {
+    use std::ffi::CString;
+    let cpath = CString::new(path).unwrap_or_default();
+    unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(cpath.as_ptr(), &mut st) != 0 { return false; }
+        let fstype = std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr())
+            .to_string_lossy()
+            .to_lowercase();
+        // macFUSE mounts appear as "macfuse", SMB as "smbfs", NFS as "nfs"
+        fstype.contains("fuse") || fstype == "smbfs" || fstype == "nfs"
+            || fstype == "webdav" || fstype == "afpfs"
+    }
+}
+
+/// On Windows, all remote paths (UNC \\server\share) are treated as polling paths.
+#[cfg(target_os = "windows")]
+fn is_fuse_path(path: &str) -> bool {
+    path.starts_with("\\\\") || path.starts_with("//")
+}
+
+
+
 #[tauri::command]
 fn watch_dir(window: Window, paths: Vec<String>) -> Result<(), String> {
-    let (tx, rx) = mpsc::channel::<String>();
+    // Determine if any of the requested paths are on a FUSE/network filesystem.
+    // inotify is silently broken on sshfs, curlftpfs, cifs, nfs, davfs.
+    // Fall back to polling for those paths.
+    let use_polling = paths.iter().any(|p| is_fuse_path(p));
+
+    if use_polling {
+        // ── Polling path ────────────────────────────────────────────────────
+        // Snapshot mtime+entry-count for each watched directory.
+        // Re-snapshot every POLL_MS milliseconds; emit "dir-changed" when anything differs.
+        const POLL_MS: u64 = 3_000;
+
+        fn dir_snapshot(path: &str) -> Option<(u64, usize)> {
+            let rd = std::fs::read_dir(path).ok()?;
+            let entries: Vec<_> = rd.flatten().collect();
+            let count = entries.len();
+            let max_mtime = entries.iter()
+                .filter_map(|e| e.metadata().ok()?.modified().ok())
+                .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .max()
+                .unwrap_or(0);
+            Some((max_mtime, count))
+        }
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let emit_win = window.clone();
+        let watch_paths = paths.clone();
+
+        std::thread::spawn(move || {
+            // Initial snapshots
+            let mut snapshots: std::collections::HashMap<String, Option<(u64, usize)>> =
+                watch_paths.iter().map(|p| (p.clone(), dir_snapshot(p))).collect();
+
+            loop {
+                std::thread::sleep(Duration::from_millis(POLL_MS));
+                if stop_clone.load(std::sync::atomic::Ordering::Relaxed) { break; }
+
+                for path in &watch_paths {
+                    let fresh = dir_snapshot(path);
+                    if fresh != *snapshots.get(path).unwrap_or(&None) {
+                        snapshots.insert(path.clone(), fresh);
+                        cache_evict(path);
+                        let _ = emit_win.emit("dir-changed", path);
+                    }
+                }
+            }
+        });
+
+        *ACTIVE_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(DirWatcher {
+            _watcher: None,
+            mode: WatchMode::Polling,
+            _poll_stop: Some(stop),
+        });
+        return Ok(());
+    }
+
+    // ── inotify path (local filesystems) ────────────────────────────────────
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
                 use notify::EventKind::*;
                 use notify::event::ModifyKind;
                 let should_emit = match event.kind {
-                    // A file or directory was created or deleted — listing changed.
                     Create(_) | Remove(_) => true,
-                    // Rename / move: fires as Modify(Name(_)) in notify v6 on Linux.
-                    // This is the event that fires when a browser download completes:
-                    //   video.mp4.crdownload  →  video.mp4
-                    // We must not drop it, because this IS a listing change.
                     Modify(ModifyKind::Name(_)) => true,
-                    // Content writes (Modify::Data) fire on every write to a file.
-                    // A content write does NOT change what files exist in the directory.
                     Modify(_) => false,
                     _ => false,
                 };
                 if should_emit {
-                    // Derive the parent directory from the affected file path.
-                    // This is always valid: notify events for NonRecursive watchers
-                    // only fire for direct children of the watched directory.
                     if let Some(changed_file) = event.paths.first() {
                         let dir = changed_file
                             .parent()
@@ -4054,19 +5978,12 @@ fn watch_dir(window: Window, paths: Vec<String>) -> Result<(), String> {
         }
     }
 
-    // Debounce thread: coalesce rapid bursts into one "dir-changed" per directory.
-    // Collects all changed paths within a 300ms window, then emits each once.
     let emit_window = window.clone();
     std::thread::spawn(move || {
         loop {
-            // Block until at least one event arrives
-            let first = match rx.recv() {
-                Ok(p) => p,
-                Err(_) => break,
-            };
+            let first = match rx.recv() { Ok(p) => p, Err(_) => break };
             let mut changed = std::collections::HashSet::new();
             changed.insert(first);
-            // Drain any burst within the debounce window
             let deadline = std::time::Instant::now() + Duration::from_millis(300);
             loop {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -4076,22 +5993,204 @@ fn watch_dir(window: Window, paths: Vec<String>) -> Result<(), String> {
                     Err(_) => break,
                 }
             }
-            // One coalesced emit per unique changed directory
             for dir in changed {
+                // p7: keep in-memory search index in sync with filesystem changes
+                index_apply_event(&dir);
                 let _ = emit_window.emit("dir-changed", &dir);
             }
         }
     });
 
-    *ACTIVE_WATCHER.lock().unwrap() = Some(DirWatcher { _watcher: watcher });
+    *ACTIVE_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(DirWatcher {
+        _watcher: Some(watcher),
+        mode: WatchMode::Inotify,
+        _poll_stop: None,
+    });
     Ok(())
 }
 
 /// Stop watching. Called on navigate-away or app teardown.
 #[tauri::command]
 fn unwatch_dir() {
-    *ACTIVE_WATCHER.lock().unwrap() = None;
+    // Dropping the DirWatcher signals the poll thread via AtomicBool
+    // and drops the inotify RecommendedWatcher — both stop immediately.
+    if let Some(dw) = ACTIVE_WATCHER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(stop) = &dw._poll_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(dw);
+    }
 }
+
+/// Returns the current watch mode as a string for the JS status-bar indicator.
+/// "inotify"  — local filesystem, real-time events
+/// "polling"  — FUSE/network mount, 3s polling
+/// "off"      — no watcher active
+#[tauri::command]
+fn get_watch_mode() -> String {
+    match ACTIVE_WATCHER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(dw) => match dw.mode {
+            WatchMode::Inotify => "inotify".to_string(),
+            WatchMode::Polling => "polling".to_string(),
+        },
+        None => "off".to_string(),
+    }
+}
+
+
+// ── Persistent error log ───────────────────────────────────────────────────────
+// JS calls append_error_log on every caught error so failures survive
+// session restarts and can be copied for bug reports.
+// Rotates at 512 KB to prevent unbounded growth.
+
+fn error_log_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("frostfinder")
+        .join("error.log")
+}
+
+#[tauri::command]
+fn append_error_log(message: String) -> Result<(), String> {
+    let p = error_log_path();
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // p9: strip the user's home directory from paths before writing
+    // Replaces /home/username/ with ~/ to avoid leaking full filesystem layout
+    let sanitised = {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            message.clone()
+        } else {
+            message.replace(&format!("{}/", home.trim_end_matches('/')), "~/")
+                   .replace(&home, "~")
+        }
+    };
+
+    // Rotate at 512 KB
+    const MAX_BYTES: u64 = 512 * 1024;
+    if p.exists() {
+        if let Ok(meta) = std::fs::metadata(&p) {
+            if meta.len() > MAX_BYTES {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    let half = content.len() / 2;
+                    let trimmed = &content[half..];
+                    let _ = std::fs::write(&p, trimmed);
+                }
+            }
+        }
+    }
+
+    use std::io::Write;
+    let newly_created = !p.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(&p)
+        .map_err(|e| e.to_string())?;
+
+    // p9: set 0600 on first creation so only the owner can read the log
+    #[cfg(unix)]
+    if newly_created {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+
+    writeln!(file, "{}", sanitised).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_error_log() -> String {
+    std::fs::read_to_string(error_log_path()).unwrap_or_default()
+}
+
+#[tauri::command]
+fn clear_error_log() -> Result<(), String> {
+    let p = error_log_path();
+    if p.exists() {
+        std::fs::write(&p, "").map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+
+// ── Tag database integrity ─────────────────────────────────────────────────────
+// Files renamed or moved outside FrostFinder leave orphaned rows in tags.db.
+// migrate_tag_path handles in-app moves, but external moves are invisible.
+// These three commands let JS audit and repair the database.
+
+/// Scan every path in tags.db and return the ones whose file no longer exists.
+/// Read-only — never modifies the database.
+#[tauri::command]
+fn audit_tag_db() -> Vec<String> {
+    let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut stmt = match db.prepare("SELECT path FROM file_tags") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let paths: Vec<String> = rows.flatten().collect();
+    drop(stmt);
+    paths.into_iter()
+        .filter(|p| !std::path::Path::new(p).exists())
+        .collect()
+}
+
+/// Delete all rows whose file path no longer exists on the filesystem.
+/// Returns the number of rows removed.
+#[tauri::command]
+fn cleanup_tag_db() -> Result<usize, String> {
+    let orphans = {
+        let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = db.prepare("SELECT path FROM file_tags")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let paths: Vec<String> = rows.flatten().collect();
+        paths.into_iter()
+            .filter(|p| !std::path::Path::new(p).exists())
+            .collect::<Vec<_>>()
+    };
+    let count = orphans.len();
+    if count == 0 { return Ok(0); }
+    let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+    for path in &orphans {
+        let _ = db.execute("DELETE FROM file_tags WHERE path=?1",
+            rusqlite::params![path]);
+    }
+    Ok(count)
+}
+
+/// Return total row count in the tag database (for the Settings UI).
+#[tauri::command]
+fn tag_db_stats() -> serde_json::Value {
+    let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+    let total: i64 = db
+        .query_row("SELECT COUNT(*) FROM file_tags", [], |r| r.get(0))
+        .unwrap_or(0);
+    let orphan_count = {
+        let mut stmt = match db.prepare("SELECT path FROM file_tags") {
+            Ok(s) => s,
+            Err(_) => return serde_json::json!({"total": total, "orphans": 0}),
+        };
+        let all_paths: Vec<String> = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => Vec::new(),
+        };
+        // stmt borrow ends here — safe to filter on the collected Vec
+        all_paths.iter()
+            .filter(|p| !std::path::Path::new(p.as_str()).exists())
+            .count() as i64
+    };
+    serde_json::json!({"total": total, "orphans": orphan_count})
+}
+
 
 fn main() {
     // ── WebKit2GTK / GStreamer env vars (Linux only) ──────────────────────
@@ -4120,6 +6219,328 @@ fn main() {
     start_media_server();
     // Clean up thumbnails older than 30 days (background, non-blocking)
     std::thread::spawn(||{ gc_thumbnail_cache(); });
+    // p7: build in-memory filename search index at startup (background, non-blocking)
+    std::thread::spawn(|| { index_home_dir(); });
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 5 — Metadata editing (r125-r140)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// r135: Checksum panel — MD5, SHA-1, SHA-256 computed in parallel.
+// Reuses sha2 already present; adds md-5 and sha1 from the same RustCrypto org.
+#[tauri::command]
+async fn get_file_checksums(path: String) -> Result<serde_json::Value, String> {
+    use md5::{Md5};
+    use sha1::{Sha1};
+    use sha2::{Sha256, Digest};
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+
+        let md5_hash  = format!("{:x}", Md5::digest(&data));
+        let sha1_hash = format!("{:x}", Sha1::digest(&data));
+        let sha256_hash = format!("{:x}", Sha256::digest(&data));
+
+        Ok(serde_json::json!({
+            "md5":    md5_hash,
+            "sha1":   sha1_hash,
+            "sha256": sha256_hash,
+        }))
+    }).await.map_err(|e| e.to_string())?
+}
+
+// r125/r128/r136: Read file metadata via exiftool (covers EXIF, audio tags, PDF meta).
+// Returns raw JSON from `exiftool -j -n`; the JS layer picks out the fields it needs.
+#[tauri::command]
+async fn get_file_meta_exif(path: String) -> Result<serde_json::Value, String> {
+    let output = std::process::Command::new("exiftool")
+        .args(["-j", "-n", "--", &path])
+        .output()
+        .map_err(|e| format!("exiftool not found or failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut arr: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
+
+    // exiftool returns an array; unwrap the first element
+    Ok(arr.as_array_mut()
+        .and_then(|a| a.first().cloned())
+        .unwrap_or(serde_json::json!({})))
+}
+
+// r125/r128/r136: Write metadata fields via exiftool.
+// `fields` is a list of ["TAG", "VALUE"] pairs, e.g. [["Title","My Doc"],["Author","Alice"]].
+// Overwrites the original file in-place (exiftool default creates _original backup).
+#[tauri::command]
+async fn write_file_meta_exif(path: String, fields: Vec<[String; 2]>) -> Result<(), String> {
+    if fields.is_empty() { return Ok(()); }
+    let mut args: Vec<String> = Vec::new();
+    for [tag, val] in &fields {
+        // Sanitise tag name (alphanumeric + colon for namespace only)
+        let safe_tag: String = tag.chars()
+            .filter(|c| c.is_alphanumeric() || *c == ':' || *c == '_')
+            .collect();
+        if safe_tag.is_empty() { continue; }
+        args.push(format!("-{}={}", safe_tag, val));
+    }
+    args.push("-overwrite_original".to_string());
+    args.push("--".to_string());
+    args.push(path.clone());
+
+    let output = std::process::Command::new("exiftool")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("exiftool not found: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(())
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// r25: Native audio tag read/write via lofty — no exiftool dependency.
+// Supports MP3 (ID3v2), FLAC, OGG/Vorbis, OGG/Opus, MP4/M4A, WAV, AIFF.
+// Fields returned/accepted: title, artist, album, year, track, genre, comment.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default, Debug)]
+pub struct AudioTags {
+    pub title:   Option<String>,
+    pub artist:  Option<String>,
+    pub album:   Option<String>,
+    pub year:    Option<String>,
+    pub track:   Option<String>,
+    pub genre:   Option<String>,
+    pub comment: Option<String>,
+}
+
+#[tauri::command]
+fn get_audio_tags(path: String) -> Result<AudioTags, String> {
+    use lofty::prelude::{Accessor, TaggedFileExt};
+    use lofty::probe::Probe;
+
+    let tagged = Probe::open(&path)
+        .map_err(|e| format!("Cannot open file: {e}"))?
+        .guess_file_type()
+        .map_err(|e| format!("Cannot guess type: {e}"))?
+        .read()
+        .map_err(|e| format!("Cannot read tags: {e}"))?;
+
+    // Prefer the primary tag; fall back to first available
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None     => return Ok(AudioTags::default()),
+    };
+
+    Ok(AudioTags {
+        title:   tag.title().map(|s| s.into_owned()),
+        artist:  tag.artist().map(|s| s.into_owned()),
+        album:   tag.album().map(|s| s.into_owned()),
+        year:    tag.year().map(|y| y.to_string()),
+        track:   tag.track().map(|t| t.to_string()),
+        genre:   tag.genre().map(|s| s.into_owned()),
+        comment: tag.get_string(&lofty::prelude::ItemKey::Comment).map(|s| s.to_owned()),
+    })
+}
+
+#[tauri::command]
+fn write_audio_tags(path: String, tags: AudioTags) -> Result<(), String> {
+    use lofty::prelude::{Accessor, AudioFile, TaggedFileExt};
+    use lofty::probe::Probe;
+
+    let mut tagged = Probe::open(&path)
+        .map_err(|e| format!("Cannot open file: {e}"))?
+        .guess_file_type()
+        .map_err(|e| format!("Cannot guess type: {e}"))?
+        .read()
+        .map_err(|e| format!("Cannot read tags: {e}"))?;
+
+    // Use file's preferred tag type; create tag if absent
+    let tag_type = tagged.primary_tag().map(|t| t.tag_type())
+        .or_else(|| tagged.first_tag().map(|t| t.tag_type()))
+        .unwrap_or(lofty::tag::TagType::Id3v2);
+
+    if tagged.primary_tag().is_none() {
+        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+    }
+
+    let tag = tagged.primary_tag_mut()
+        .ok_or_else(|| "No tag available to write".to_string())?;
+
+    if let Some(v) = &tags.title   { tag.set_title(v.clone()); }
+    if let Some(v) = &tags.artist  { tag.set_artist(v.clone()); }
+    if let Some(v) = &tags.album   { tag.set_album(v.clone()); }
+    if let Some(v) = &tags.year    {
+        if let Ok(y) = v.trim().parse::<u32>() { tag.set_year(y); }
+    }
+    if let Some(v) = &tags.track   {
+        if let Ok(t) = v.trim().parse::<u32>() { tag.set_track(t); }
+    }
+    if let Some(v) = &tags.genre   { tag.set_genre(v.clone()); }
+    if let Some(v) = &tags.comment {
+        // lofty: insert a plain-text comment via the generic ItemKey API
+        tag.insert_text(lofty::prelude::ItemKey::Comment, v.clone());
+    }
+
+    tagged.save_to_path(&path, lofty::config::WriteOptions::default())
+        .map_err(|e| format!("Failed to write tags: {e}"))?;
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 6 — Directory comparison & sync (r141-r160)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum DiffStatus {
+    OnlyLeft,
+    OnlyRight,
+    Same,
+    Different,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DirDiffEntry {
+    pub rel_path: String,      // path relative to both roots
+    pub name: String,          // filename
+    pub status: DiffStatus,
+    pub is_dir: bool,
+    pub size_left: Option<u64>,
+    pub size_right: Option<u64>,
+    pub mtime_left: Option<u64>,
+    pub mtime_right: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DirDiffResult {
+    pub entries: Vec<DirDiffEntry>,
+    pub only_left: usize,
+    pub only_right: usize,
+    pub same: usize,
+    pub different: usize,
+}
+
+// r141: compare_dirs — walk both trees in parallel, classify each entry.
+// Uses size+mtime by default; falls back to SHA-256 when sizes match but
+// mtimes differ (covers copies, touch, etc.).
+#[tauri::command]
+async fn compare_dirs(
+    path_left: String,
+    path_right: String,
+) -> Result<DirDiffResult, String> {
+    use std::collections::HashMap;
+    use sha2::{Sha256, Digest};
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // Walk one directory tree, return map of rel_path → (size, mtime, is_dir)
+        fn walk(root: &Path) -> HashMap<String, (u64, u64, bool)> {
+            let mut map = HashMap::new();
+            fn inner(root: &Path, dir: &Path, map: &mut HashMap<String, (u64, u64, bool)>) {
+                let Ok(rd) = fs::read_dir(dir) else { return };
+                for entry in rd.filter_map(|e| e.ok()) {
+                    let p = entry.path();
+                    let Ok(rel) = p.strip_prefix(root) else { continue };
+                    let rel_str = rel.to_string_lossy().to_string();
+                    let Ok(meta) = fs::metadata(&p) else { continue };
+                    let is_dir = meta.is_dir();
+                    let size = if is_dir { 0 } else { meta.len() };
+                    let mtime = meta.modified().ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    map.insert(rel_str, (size, mtime, is_dir));
+                    if is_dir { inner(root, &p, map); }
+                }
+            }
+            inner(root, root, &mut map);
+            map
+        }
+
+        // Quick file hash for disambiguation when size matches but mtime differs
+        fn file_hash(p: &Path) -> String {
+            if let Ok(data) = fs::read(p) {
+                format!("{:x}", Sha256::digest(&data))
+            } else {
+                String::new()
+            }
+        }
+
+        let root_l = Path::new(&path_left);
+        let root_r = Path::new(&path_right);
+        let map_l = walk(root_l);
+        let map_r = walk(root_r);
+
+        let mut entries: Vec<DirDiffEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Process left tree
+        for (rel, (sz_l, mt_l, is_dir)) in &map_l {
+            seen.insert(rel.clone());
+            let name = Path::new(rel).file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| rel.clone());
+            if let Some(&(sz_r, mt_r, _)) = map_r.get(rel) {
+                let status = if sz_l == &sz_r && mt_l == &mt_r {
+                    DiffStatus::Same
+                } else if sz_l == &sz_r {
+                    // Same size, different mtime — hash to be sure
+                    let pl = root_l.join(rel); let pr = root_r.join(rel);
+                    if !is_dir && file_hash(&pl) == file_hash(&pr) {
+                        DiffStatus::Same
+                    } else { DiffStatus::Different }
+                } else { DiffStatus::Different };
+                entries.push(DirDiffEntry {
+                    rel_path: rel.clone(), name, status,
+                    is_dir: *is_dir,
+                    size_left: Some(*sz_l), size_right: Some(sz_r),
+                    mtime_left: Some(*mt_l), mtime_right: Some(mt_r),
+                });
+            } else {
+                entries.push(DirDiffEntry {
+                    rel_path: rel.clone(), name, status: DiffStatus::OnlyLeft,
+                    is_dir: *is_dir,
+                    size_left: Some(*sz_l), size_right: None,
+                    mtime_left: Some(*mt_l), mtime_right: None,
+                });
+            }
+        }
+
+        // Files only in right
+        for (rel, (sz_r, mt_r, is_dir)) in &map_r {
+            if seen.contains(rel) { continue; }
+            let name = Path::new(rel).file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| rel.clone());
+            entries.push(DirDiffEntry {
+                rel_path: rel.clone(), name, status: DiffStatus::OnlyRight,
+                is_dir: *is_dir,
+                size_left: None, size_right: Some(*sz_r),
+                mtime_left: None, mtime_right: Some(*mt_r),
+            });
+        }
+
+        // Sort: dirs first, then alphabetically by rel_path
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then(a.rel_path.cmp(&b.rel_path))
+        });
+
+        let only_left  = entries.iter().filter(|e| e.status == DiffStatus::OnlyLeft).count();
+        let only_right = entries.iter().filter(|e| e.status == DiffStatus::OnlyRight).count();
+        let same       = entries.iter().filter(|e| e.status == DiffStatus::Same).count();
+        let different  = entries.iter().filter(|e| e.status == DiffStatus::Different).count();
+
+        Ok(DirDiffResult { entries, only_left, only_right, same, different })
+    }).await.map_err(|e| e.to_string())?
+}
+
+
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -4128,25 +6549,53 @@ fn main() {
             list_directory, list_directory_fast, list_directory_streamed, list_directory_chunk, list_directory_full_streamed, get_entry_meta, preload_dir,
             get_home_dir, get_sidebar_data, get_drives,
             open_file, get_file_preview, search_files,
-            rename_file, delete_file, delete_items_stream, create_directory, create_file_cmd, get_dir_size,
+            rename_file, batch_rename, delete_file, delete_items, delete_items_stream, create_directory, create_file_cmd, get_dir_size, get_dir_size_fast,
             window_minimize, window_maximize, window_close, window_set_fullscreen, window_is_maximized,
-            copy_file, move_file, copy_files_batch, move_files_batch, create_new_document,
+            copy_file, move_file, copy_files_batch, move_files_batch, cancel_file_op, create_new_document, parse_dropped_paths,
             get_media_port, get_thumbnail, get_thumbnail_bytes, get_thumbnail_bytes_batch,
             batch_thumbnails, get_thumbnail_url_batch, gc_thumbnail_cache, empty_trash,
             open_as_root, check_permission, read_svg_icon, eject_drive, mount_drive, unlock_and_mount_encrypted,
             get_file_tags, set_file_tags, get_all_tags, search_by_tag,
             get_tag_palette, set_tag_color, get_tags_with_colors, deep_search,
-            compress_files, extract_archive, delete_items,
+            compress_files, extract_archive, get_archive_contents,
             empty_trash_stream,
             open_terminal, open_in_editor,
             list_apps_for_file, open_with_app,
-            get_native_window_handle, mpv_open_external, mpv_is_running, mpv_play, mpv_stop, mpv_update_margins, mpv_pause_toggle,
+             get_native_window_handle, mpv_open_external, mpv_is_running, check_optional_deps, get_platform,
             set_ql_payload, get_ql_payload,
             watch_dir, unwatch_dir,
             mount_iso, unmount_iso, get_iso_loop_device, list_usb_drives, write_iso_to_usb,
+            mount_smb, unmount_smb, get_smb_mounts, list_smb_shares,
+            mount_webdav, unmount_cloud, get_cloud_mounts,
             mount_dmg, unmount_dmg, get_dmg_loop_device,
             install_font, is_font_installed,
-            secure_delete, find_duplicates,
+            secure_delete, find_duplicates, diff_files,
+            // r40-r42 additions
+            trash_items, trash_list, trash_item_count,
+            check_trash_restore_conflicts, trash_restore_with_resolution,
+            mount_sftp, unmount_sftp, get_sftp_mounts,
+            mount_ftp, unmount_ftp, get_ftp_mounts,
+            get_file_permissions, chmod_entry, chown_entry,
+            open_new_window,
+            scan_dir_sizes,
+            search_advanced, search_index_query,
+            get_file_tags_v2, set_file_tags_v2, migrate_tag_path,
+            probe_video_codec,
+            load_plugins, save_plugins, run_plugin_command, check_plugin_trust, approve_plugin,
+            get_settings, set_settings,
+            get_watch_mode,
+            append_error_log, get_error_log, clear_error_log,
+            audit_tag_db, cleanup_tag_db, tag_db_stats,
+            read_text_file, write_text_file,
+            check_rclone, list_rclone_remotes, add_cloud_provider,
+            scan_icon_folder,
+            mount_cloud_provider, unmount_cloud_provider, remove_cloud_provider,
+            restore_cloud_mounts,
+            find_git_root, get_git_status, invalidate_git_cache,
+            check_gocryptfs, list_vaults, create_vault, unlock_vault, lock_vault, remove_vault,
+            get_file_checksums, get_file_meta_exif, write_file_meta_exif,
+            get_audio_tags, write_audio_tags,
+            compare_dirs,
         ])
         // ── Exit when main window closes ──────────────────────────────────────
         // The QL window is kept hidden (never destroyed) to stay warm for instant
@@ -4160,6 +6609,8 @@ fn main() {
             // Tauri v2: closure receives (window, event) separately
             if let tauri::WindowEvent::Destroyed = event {
                 if window.label() == "main" {
+                    // p7: remove media port lockfile on clean exit
+                    let _ = std::fs::remove_file(media_port_file());
                     window.app_handle().exit(0);
                 }
             }
@@ -4225,11 +6676,10 @@ fn main() {
                             let dest = dir.join("frostfinder.png");
                             // Skip if already installed — avoids redundant writes
                             if dest.exists() { continue; }
-                            if fs::create_dir_all(&dir).is_ok() {
-                                if fs::write(&dest, icon.data).is_ok() {
+                            if fs::create_dir_all(&dir).is_ok()
+                                && fs::write(&dest, icon.data).is_ok() {
                                     any_written = true;
                                 }
-                            }
                         }
                         // Rebuild the icon cache so GTK/compositors pick up changes
                         if any_written {
@@ -4276,10 +6726,1590 @@ fn main() {
                     }
                 });
             }
+            // ── Restore persisted SMB mounts ─────────────────────────────
+            // On startup, reload the smb_mounts.json registry. Only keep entries
+            // that are still actually mounted (isMounted check via /proc/mounts).
+            #[cfg(target_os = "linux")]
+            {
+                let saved = smb_registry_load();
+                if !saved.is_empty() {
+                    let proc_mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+                    let still_mounted: Vec<SmbShare> = saved.into_iter()
+                        .filter(|s| proc_mounts.contains(&s.mount_point))
+                        .collect();
+                    if let Ok(mut lock) = SMB_MOUNTS.lock() {
+                        *lock = Some(still_mounted.clone());
+                    }
+                    smb_registry_save(&still_mounted);
+                }
+            }
+
+            // ── r40-r42: restore SFTP and FTP mount registries ────────────
+            {
+                let sftp_loaded = sftp_reg_load();
+                if !sftp_loaded.is_empty() {
+                    *SFTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner()) = sftp_loaded;
+                }
+                let ftp_loaded = ftp_reg_load();
+                if !ftp_loaded.is_empty() {
+                    *FTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner()) = ftp_loaded;
+                }
+            }
+
+            // ── r53: restore WebDAV/Cloud mount registry ──────────────────
+            #[cfg(target_os = "linux")]
+            {
+                let saved = cloud_registry_load();
+                if !saved.is_empty() {
+                    let proc_mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+                    let still_mounted: Vec<CloudMount> = saved.into_iter()
+                        .filter(|c| proc_mounts.contains(&c.mount_point))
+                        .collect();
+                    if let Ok(mut lock) = CLOUD_MOUNTS.lock() {
+                        *lock = Some(still_mounted.clone());
+                    }
+                    cloud_registry_save(&still_mounted);
+                }
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// r40–r42 ADDITIONS  (appended once — all functions are new to r39)
+// ═════════════════════════════════════════════════════════════════════════════
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let p = std::process::id() as u128;
+    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (t & 0xffffffff) as u32, ((t >> 32) & 0xffff) as u16,
+        ((t >> 48) & 0x0fff) as u16, (((t >> 60) & 0x3fff) | 0x8000) as u16,
+        ((t ^ p) & 0xffffffffffff) as u64)
+}
+
+fn copy_recursive_r42(src: &Path, dst: &Path) -> Result<(), String> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
+            copy_recursive_r42(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else { std::fs::copy(src, dst).map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
+fn remove_recursive_r42(path: &Path) -> Result<(), String> {
+    if path.is_dir() { std::fs::remove_dir_all(path).map_err(|e| e.to_string()) }
+    else if path.exists() { std::fs::remove_file(path).map_err(|e| e.to_string()) }
+    else { Ok(()) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. XDG TRASH BROWSING
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn xdg_trash_files_dir() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("Trash/files")
+}
+fn xdg_trash_info_dir() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("Trash/info")
+}
+fn ensure_xdg_trash() -> Result<(), String> {
+    std::fs::create_dir_all(xdg_trash_files_dir()).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(xdg_trash_info_dir()).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct TrashItem {
+    pub name: String, pub trash_path: String,
+    pub original_path: String, pub deleted_at: Option<u64>, pub size: Option<u64>,
+}
+
+#[tauri::command]
+fn trash_items(paths: Vec<String>) -> Result<(), String> {
+    use std::io::Write;
+    ensure_xdg_trash()?;
+    let now_str = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let (s, m, h) = (secs%60, (secs/60)%60, (secs/3600)%24);
+        let days = secs/86400;
+        let z=days+719468; let era=z/146097; let doe=z-era*146097;
+        let yoe=(doe-doe/1460+doe/36524-doe/146096)/365;
+        let y=yoe+era*400; let doy=doe-(365*yoe+yoe/4-yoe/100);
+        let mp=(5*doy+2)/153; let d=doy-(153*mp+2)/5+1;
+        let mo=if mp<10{mp+3}else{mp-9}; let yr=if mo<=2{y+1}else{y};
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", yr, mo, d, h, m, s)
+    };
+    for src_str in &paths {
+        let src = Path::new(src_str);
+        if !src.exists() { continue; }
+        let file_name = src.file_name().ok_or_else(|| format!("invalid path: {src_str}"))?.to_string_lossy().to_string();
+        let mut dest_name = file_name.clone();
+        let mut dest = xdg_trash_files_dir().join(&dest_name);
+        let mut n = 1u32;
+        while dest.exists() { dest_name = format!("{file_name}.{n}"); dest = xdg_trash_files_dir().join(&dest_name); n += 1; }
+        let info_path = xdg_trash_info_dir().join(format!("{dest_name}.trashinfo"));
+        let mut f = std::fs::File::create(&info_path).map_err(|e| format!("trashinfo: {e}"))?;
+        f.write_all(format!("[Trash Info]\nPath={src_str}\nDeletionDate={now_str}\n").as_bytes()).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::rename(src, &dest) {
+            if e.raw_os_error() == Some(18) { copy_recursive_r42(src, &dest)?; remove_recursive_r42(src)?; }
+            else { let _ = std::fs::remove_file(&info_path); return Err(format!("trash move: {e}")); }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn trash_list() -> Result<Vec<TrashItem>, String> {
+    ensure_xdg_trash()?;
+    let mut items = Vec::new();
+    for entry in std::fs::read_dir(xdg_trash_info_dir()).map_err(|e| e.to_string())?.flatten() {
+        let info_path = entry.path();
+        if info_path.extension().and_then(|e| e.to_str()) != Some("trashinfo") { continue; }
+        let content = std::fs::read_to_string(&info_path).unwrap_or_default();
+        let original_path = content.lines().find(|l| l.starts_with("Path=")).map(|l| l[5..].to_string()).unwrap_or_default();
+        let stem = info_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let trash_path = xdg_trash_files_dir().join(&stem);
+        let size = if trash_path.is_file() { trash_path.metadata().ok().map(|m| m.len()) } else { None };
+        items.push(TrashItem { name: stem, trash_path: trash_path.to_string_lossy().to_string(), original_path, deleted_at: None, size });
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+fn trash_item_count() -> Result<usize, String> {
+    ensure_xdg_trash()?;
+    Ok(std::fs::read_dir(xdg_trash_info_dir()).map_err(|e| e.to_string())?.flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("trashinfo")).count())
+}
+
+#[derive(serde::Serialize)]
+pub struct TrashConflict { pub trash_path: String, pub original_path: String }
+
+#[tauri::command]
+fn check_trash_restore_conflicts(paths: Vec<String>) -> Result<Vec<TrashConflict>, String> {
+    let mut conflicts = Vec::new();
+    for tp in &paths {
+        let stem = Path::new(tp).file_name().unwrap_or_default().to_string_lossy().to_string();
+        let content = std::fs::read_to_string(xdg_trash_info_dir().join(format!("{stem}.trashinfo"))).unwrap_or_default();
+        let orig = content.lines().find(|l| l.starts_with("Path=")).map(|l| l[5..].to_string()).unwrap_or_default();
+        if !orig.is_empty() && Path::new(&orig).exists() { conflicts.push(TrashConflict { trash_path: tp.clone(), original_path: orig }); }
+    }
+    Ok(conflicts)
+}
+
+#[derive(serde::Deserialize)]
+pub struct RestoreInstruction { pub path: String, pub resolution: String }
+
+#[tauri::command]
+fn trash_restore_with_resolution(instructions: Vec<RestoreInstruction>) -> Result<(), String> {
+    for inst in &instructions {
+        if inst.resolution == "skip" { continue; }
+        let tp = Path::new(&inst.path);
+        let stem = tp.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let info_path = xdg_trash_info_dir().join(format!("{stem}.trashinfo"));
+        let content = std::fs::read_to_string(&info_path).map_err(|e| format!("trashinfo: {e}"))?;
+        let orig = content.lines().find(|l| l.starts_with("Path=")).map(|l| l[5..].to_string()).ok_or("bad trashinfo")?;
+        let dest = match inst.resolution.as_str() {
+            "keep_both" => {
+                let p = Path::new(&orig); let par = p.parent().unwrap_or(Path::new("/"));
+                let sn = p.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                let mut c = par.join(format!("{sn} (restored){ext}")); let mut n = 2u32;
+                while c.exists() { c = par.join(format!("{sn} (restored {n}){ext}")); n += 1; }
+                c.to_string_lossy().to_string()
+            }
+            _ => { if Path::new(&orig).exists() { let _ = remove_recursive_r42(Path::new(&orig)); } orig.clone() }
+        };
+        let dp = Path::new(&dest);
+        if let Some(par) = dp.parent() { std::fs::create_dir_all(par).map_err(|e| e.to_string())?; }
+        std::fs::rename(tp, dp).or_else(|e| {
+            if e.raw_os_error() == Some(18) { copy_recursive_r42(tp, dp)?; remove_recursive_r42(tp) }
+            else { Err(format!("restore: {e}")) }
+        })?;
+        let _ = std::fs::remove_file(&info_path);
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. SFTP MOUNT
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct SftpMount { pub id: String, pub label: String, pub host: String, pub port: u16, pub username: String, pub remote_path: String, pub mount_path: String, pub key_path: Option<String> }
+
+static SFTP_MOUNTS: std::sync::Mutex<Vec<SftpMount>> = std::sync::Mutex::new(Vec::new());
+
+fn sftp_reg_path() -> PathBuf { dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("frostfinder/sftp_mounts.json") }
+fn sftp_reg_save(m: &[SftpMount]) { if let Some(p) = sftp_reg_path().parent() { let _ = std::fs::create_dir_all(p); } if let Ok(j) = serde_json::to_string(m) { let _ = std::fs::write(sftp_reg_path(), j); } }
+pub fn sftp_reg_load() -> Vec<SftpMount> {
+    let p = sftp_reg_path(); if !p.exists() { return Vec::new(); }
+    let json = match std::fs::read_to_string(&p) { Ok(j) => j, Err(_) => return Vec::new() };
+    let mounts: Vec<SftpMount> = match serde_json::from_str(&json) { Ok(m) => m, Err(_) => return Vec::new() };
+    let proc = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    mounts.into_iter().filter(|m| proc.contains(&m.mount_path)).collect()
+}
+
+#[tauri::command]
+fn mount_sftp(host: String, port: u16, username: String, password: String, key_path: String, remote_path: String) -> Result<String, String> {
+    let id = uuid_v4();
+    let mount_path = format!("/tmp/frostfinder-sftp/{id}");
+    std::fs::create_dir_all(&mount_path).map_err(|e| format!("mkdir: {e}"))?;
+    let remote = format!("{username}@{host}:{remote_path}");
+    let port_str = port.to_string();
+    let status = if !password.is_empty() {
+        let mut c = std::process::Command::new("sshpass");
+        c.arg("-p").arg(&password).arg("sshfs").arg(&remote).arg(&mount_path).arg("-p").arg(&port_str).arg("-o").arg("StrictHostKeyChecking=no");
+        if !key_path.is_empty() { c.arg("-o").arg(format!("IdentityFile={key_path}")); }
+        c.status().map_err(|e| format!("sshpass not found: {e}"))?
+    } else {
+        let mut c = std::process::Command::new("sshfs");
+        c.arg(&remote).arg(&mount_path).arg("-p").arg(&port_str).arg("-o").arg("reconnect").arg("-o").arg("StrictHostKeyChecking=no");
+        if !key_path.is_empty() { c.arg("-o").arg(format!("IdentityFile={key_path}")); }
+        c.status().map_err(|e| format!("sshfs not found: {e}"))?
+    };
+    if !status.success() { let _ = std::fs::remove_dir(&mount_path); return Err("SFTP mount failed".into()); }
+    let mount = SftpMount { id: id.clone(), label: format!("{username}@{host}:{remote_path}"), host, port, username, remote_path, mount_path: mount_path.clone(), key_path: if key_path.is_empty() { None } else { Some(key_path) } };
+    let mut mounts = SFTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner()); mounts.push(mount); sftp_reg_save(&mounts);
+    Ok(mount_path)
+}
+
+#[tauri::command]
+fn unmount_sftp(id: String) -> Result<(), String> {
+    let mut mounts = SFTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = mounts.iter().position(|m| m.id == id) {
+        let mp = mounts[pos].mount_path.clone();
+        let _ = std::process::Command::new("fusermount").arg("-u").arg(&mp).status().or_else(|_| std::process::Command::new("umount").arg(&mp).status());
+        let _ = std::fs::remove_dir(&mp); mounts.remove(pos); sftp_reg_save(&mounts);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_sftp_mounts() -> Vec<SftpMount> { SFTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. FTP MOUNT
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct FtpMount { pub id: String, pub label: String, pub host: String, pub port: u16, pub username: String, pub remote_path: String, pub mount_path: String, pub tls: bool }
+
+static FTP_MOUNTS: std::sync::Mutex<Vec<FtpMount>> = std::sync::Mutex::new(Vec::new());
+
+fn ftp_reg_path() -> PathBuf { dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("frostfinder/ftp_mounts.json") }
+fn ftp_reg_save(m: &[FtpMount]) { if let Some(p) = ftp_reg_path().parent() { let _ = std::fs::create_dir_all(p); } if let Ok(j) = serde_json::to_string(m) { let _ = std::fs::write(ftp_reg_path(), j); } }
+pub fn ftp_reg_load() -> Vec<FtpMount> {
+    let p = ftp_reg_path(); if !p.exists() { return Vec::new(); }
+    let json = match std::fs::read_to_string(&p) { Ok(j) => j, Err(_) => return Vec::new() };
+    let mounts: Vec<FtpMount> = match serde_json::from_str(&json) { Ok(m) => m, Err(_) => return Vec::new() };
+    let proc = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    mounts.into_iter().filter(|m| proc.contains(&m.mount_path)).collect()
+}
+
+#[tauri::command]
+fn mount_ftp(host: String, port: u16, username: String, password: String, remote_path: String, passive: bool, tls: bool) -> Result<String, String> {
+    let id = uuid_v4();
+    let mount_path = format!("/tmp/frostfinder-ftp/{id}");
+    std::fs::create_dir_all(&mount_path).map_err(|e| format!("mkdir: {e}"))?;
+    let scheme = if tls { "ftps" } else { "ftp" };
+    let url = format!("{scheme}://{host}:{port}{remote_path}");
+    let mut cmd = std::process::Command::new("curlftpfs");
+    cmd.arg(&url).arg(&mount_path).arg("-o").arg(format!("user={username}:{password}")).arg("-o").arg("allow_other");
+    if passive { cmd.arg("-o").arg("ftp_port=-"); }
+    if tls { cmd.arg("-o").arg("ssl"); }
+    let status = cmd.status().map_err(|e| format!("curlftpfs not found: {e}"))?;
+    if !status.success() { let _ = std::fs::remove_dir(&mount_path); return Err("FTP mount failed".into()); }
+    let mount = FtpMount { id: id.clone(), label: format!("{username}@{host}{remote_path}"), host, port, username, remote_path, mount_path: mount_path.clone(), tls };
+    let mut mounts = FTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner()); mounts.push(mount); ftp_reg_save(&mounts);
+    Ok(mount_path)
+}
+
+#[tauri::command]
+fn unmount_ftp(id: String) -> Result<(), String> {
+    let mut mounts = FTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pos) = mounts.iter().position(|m| m.id == id) {
+        let mp = mounts[pos].mount_path.clone();
+        let _ = std::process::Command::new("fusermount").arg("-u").arg(&mp).status().or_else(|_| std::process::Command::new("umount").arg(&mp).status());
+        let _ = std::fs::remove_dir(&mp); mounts.remove(pos); ftp_reg_save(&mounts);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_ftp_mounts() -> Vec<FtpMount> { FTP_MOUNTS.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. FILE PERMISSIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct FilePermissionsInfo { pub name: String, pub path: String, pub is_dir: bool, pub size: u64, pub mode: u32, pub owner: String, pub group: String, pub modified: u64, pub created: Option<u64>, pub mime_hint: Option<String> }
+
+#[tauri::command]
+fn get_file_permissions(path: String) -> Result<FilePermissionsInfo, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let p = Path::new(&path);
+    let meta = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let mode = meta.permissions().mode();
+    let owner = { let pw = unsafe { libc::getpwuid(meta.uid()) }; if pw.is_null() { meta.uid().to_string() } else { unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }.to_string_lossy().to_string() } };
+    let group = { let gr = unsafe { libc::getgrgid(meta.gid()) }; if gr.is_null() { meta.gid().to_string() } else { unsafe { std::ffi::CStr::from_ptr((*gr).gr_name) }.to_string_lossy().to_string() } };
+    let modified = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let created = meta.created().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    let mime_hint = p.extension().and_then(|e| e.to_str()).map(|e| match e.to_lowercase().as_str() {
+        "rs"=>"Rust source","js"=>"JavaScript","py"=>"Python","sh"=>"Shell script",
+        "md"=>"Markdown","txt"=>"Text","pdf"=>"PDF",
+        "png"|"jpg"|"jpeg"|"webp"|"gif"=>"Image","mp4"|"mkv"|"avi"|"mov"=>"Video",
+        "mp3"|"flac"|"ogg"=>"Audio","zip"|"tar"|"gz"|"7z"|"rar"=>"Archive",_=>"File",
+    }.to_string());
+    Ok(FilePermissionsInfo { name, path, is_dir: meta.is_dir(), size: meta.len(), mode, owner, group, modified, created, mime_hint })
+}
+
+#[tauri::command]
+fn chmod_entry(path: String, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o777)).map_err(|e| format!("chmod: {e}"))
+}
+
+#[tauri::command]
+fn chown_entry(path: String, owner: String, group: String) -> Result<(), String> {
+    let resolve_uid = |name: &str| -> Option<u32> { if let Ok(n) = name.parse::<u32>() { return Some(n); } let c = std::ffi::CString::new(name).ok()?; let pw = unsafe { libc::getpwnam(c.as_ptr()) }; if pw.is_null() { None } else { Some(unsafe { (*pw).pw_uid }) } };
+    let resolve_gid = |name: &str| -> Option<u32> { if let Ok(n) = name.parse::<u32>() { return Some(n); } let c = std::ffi::CString::new(name).ok()?; let gr = unsafe { libc::getgrnam(c.as_ptr()) }; if gr.is_null() { None } else { Some(unsafe { (*gr).gr_gid }) } };
+    let uid = if owner.is_empty() { !0u32 } else { resolve_uid(&owner).ok_or_else(|| format!("Unknown user: {owner}"))? };
+    let gid = if group.is_empty() { !0u32 } else { resolve_gid(&group).ok_or_else(|| format!("Unknown group: {group}"))? };
+    let c_path = std::ffi::CString::new(path.as_bytes()).map_err(|_| "invalid path")?;
+    let ret = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
+    if ret != 0 { return Err(format!("chown: {}", std::io::Error::last_os_error())); }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. MULTIPLE WINDOWS
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn open_new_window(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let label = format!("ff-{}", uuid_v4().replace('-', "").chars().take(12).collect::<String>());
+    let folder_name = Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App("index.html".into()))
+        .title(format!("FrostFinder — {folder_name}"))
+        .inner_size(1100.0, 720.0).min_inner_size(640.0, 400.0)
+        .initialization_script(format!("window.__initialPath = {:?};", path))
+        .build().map_err(|e| format!("window: {e}"))?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. DISK USAGE
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct DirSizeEntry { pub path: String, pub size: u64 }
+
+#[tauri::command]
+fn scan_dir_sizes(path: String) -> Result<Vec<DirSizeEntry>, String> {
+    fn rec(p: &Path, visited: &mut std::collections::HashSet<u64>) -> u64 {
+        // p9: skip symlinks entirely — they break size accounting and can loop
+        if let Ok(sym) = std::fs::symlink_metadata(p) {
+            if sym.file_type().is_symlink() { return 0; }
+            // p9: inode-cycle guard
+            #[cfg(unix)] {
+                use std::os::unix::fs::MetadataExt;
+                if !visited.insert(sym.ino()) { return 0; }
+            }
+            if sym.is_file() { return sym.len(); }
+        }
+        std::fs::read_dir(p).map(|rd| rd.flatten().map(|e| rec(&e.path(), visited)).sum()).unwrap_or(0)
+    }
+    let mut entries: Vec<DirSizeEntry> = std::fs::read_dir(Path::new(&path)).map_err(|e| e.to_string())?
+        .flatten().take(256).map(|e| { let p=e.path(); let mut vis=std::collections::HashSet::new(); DirSizeEntry { path: p.to_string_lossy().to_string(), size: rec(&p, &mut vis) } })
+        .filter(|e| e.size>0).collect();
+    entries.sort_by(|a,b| b.size.cmp(&a.size));
+    Ok(entries)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. ADVANCED SEARCH
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, Clone)]
+pub struct SearchResultV2 { pub path: String, pub name: String, pub is_dir: bool, pub size: u64, pub modified: u64, pub snippet: Option<String> }
+
+#[tauri::command]
+fn search_advanced(query: String, root_path: String, recursive: bool, use_regex: bool, search_contents: bool, include_hidden: bool) -> Result<Vec<SearchResultV2>, String> {
+    let pattern: Box<dyn Fn(&str)->bool+Send> = if use_regex {
+        let re = regex::Regex::new(&query).map_err(|e| format!("regex: {e}"))?;
+        Box::new(move |s: &str| re.is_match(s))
+    } else {
+        let lower = query.to_lowercase();
+        Box::new(move |s: &str| s.to_lowercase().contains(&lower))
+    };
+    fn walk(dir: &Path, rec: bool, hidden: bool, contents: bool, pat: &dyn Fn(&str)->bool, q: &str, out: &mut Vec<SearchResultV2>, depth: u32, visited: &mut std::collections::HashSet<u64>) {
+        if out.len()>=500||depth>20 { return; }
+        // p9: inode-cycle guard — skip directories whose inode we have already visited
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(m) = std::fs::symlink_metadata(dir) {
+                if !visited.insert(m.ino()) { return; }
+            }
+        }
+        let rd = match std::fs::read_dir(dir) { Ok(r)=>r, Err(_)=>return };
+        for entry in rd.flatten() {
+            if out.len()>=500 { break; }
+            let path=entry.path();
+            let name=path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if !hidden && name.starts_with('.') { continue; }
+            // p9: skip symlinks to avoid traversing loops
+            let sym_meta = match std::fs::symlink_metadata(&path) { Ok(m)=>m, Err(_)=>continue };
+            if sym_meta.file_type().is_symlink() { continue; }
+            let meta=match std::fs::metadata(&path){Ok(m)=>m,Err(_)=>continue};
+            let is_dir=meta.is_dir(); let size=meta.len();
+            let modified=meta.modified().ok().and_then(|t|t.duration_since(UNIX_EPOCH).ok()).map(|d|d.as_secs()).unwrap_or(0);
+            let snippet=if contents&&!is_dir&&size<10*1024*1024 {
+                std::fs::read_to_string(&path).ok().and_then(|txt|{ let lq=q.to_lowercase(); txt.lines().find(|l|l.to_lowercase().contains(&lq)).map(|l|if l.len()>120{l[..120].to_string()}else{l.trim().to_string()}) })
+            } else { None };
+            if pat(&name)||snippet.is_some() { out.push(SearchResultV2{path:path.to_string_lossy().to_string(),name,is_dir,size,modified,snippet}); }
+            if rec&&is_dir { walk(&path,rec,hidden,contents,pat,q,out,depth+1,visited); }
+        }
+    }
+    let mut results=Vec::new();
+    let mut visited=std::collections::HashSet::new();
+    walk(Path::new(&root_path),recursive,include_hidden,search_contents,pattern.as_ref(),&query,&mut results,0,&mut visited);
+    results.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(results)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. TAG DB FALLBACK
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn tag_db() -> &'static std::sync::Mutex<rusqlite::Connection> {
+    static TAG_DB: std::sync::OnceLock<std::sync::Mutex<rusqlite::Connection>> = std::sync::OnceLock::new();
+    TAG_DB.get_or_init(|| {
+        let db_path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("frostfinder/tags.db");
+        if let Some(p) = db_path.parent() { let _ = std::fs::create_dir_all(p); }
+
+        // p7: integrity check — rename corrupt DB and start fresh
+        let conn = 'open: {
+            if let Ok(c) = rusqlite::Connection::open(&db_path) {
+                let ok: bool = c.query_row("PRAGMA integrity_check", [], |r| {
+                    Ok(r.get::<_, String>(0).unwrap_or_default() == "ok")
+                }).unwrap_or(false);
+                if ok {
+                    break 'open c;
+                }
+                // Corrupt — rename and emit a recoverable backup
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let backup = db_path.with_extension(format!("db.corrupt.{}", ts));
+                let _ = std::fs::rename(&db_path, &backup);
+                eprintln!("[frostfinder] tags.db corrupt — backed up to {:?}, starting fresh", backup);
+            }
+            // Fresh open after rename (or first run)
+            rusqlite::Connection::open(&db_path).expect("tag db open")
+        };
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS file_tags(path TEXT PRIMARY KEY,tags_json TEXT NOT NULL DEFAULT '[]');             PRAGMA journal_mode=WAL;"
+        ).expect("tag db init");
+
+        // p7: WAL checkpoint counter — written via a static so db_write_tags can trigger it
+        // (rusqlite Connection is not Send, so we use a global write counter)
+        std::sync::Mutex::new(conn)
+    })
+}
+
+// p7: WAL checkpoint — called periodically after writes to prevent unbounded WAL growth
+static TAG_DB_WRITE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn tag_db_maybe_checkpoint() {
+    let n = TAG_DB_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n % 500 == 499 {
+        let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+        let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+}
+
+const XATTR_KEY_R42: &str = "user.frostfinder.tags";
+
+// ── Tag xattr helpers — platform-conditional ──────────────────────────────────
+// Linux/macOS: use xattr crate (extended attributes).
+// Windows: fall through to SQLite-only path (xattr not available; the SQLite
+//          fallback in get_file_tags_v2 / set_file_tags_v2 handles Windows).
+
+#[cfg(not(target_os = "windows"))]
+fn xattr_read_tags(path: &str) -> Option<Vec<String>> {
+    let raw = xattr::get(path, XATTR_KEY_R42).ok()??;
+    serde_json::from_slice::<Vec<String>>(&raw).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn xattr_read_tags(_path: &str) -> Option<Vec<String>> { None }
+
+#[cfg(not(target_os = "windows"))]
+fn xattr_write_tags(path: &str, tags: &[String]) -> bool {
+    let json = serde_json::to_vec(tags).unwrap_or_default();
+    xattr::set(path, XATTR_KEY_R42, &json).is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn xattr_write_tags(_path: &str, _tags: &[String]) -> bool { false }
+
+
+fn db_read_tags(path: &str) -> Vec<String> {
+    let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+    db.query_row(
+        "SELECT tags_json FROM file_tags WHERE path=?1",
+        rusqlite::params![path],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok())
+    .unwrap_or_default()
+}
+
+fn db_write_tags(path: &str, tags: &[String]) {
+    let json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".into());
+    let db = tag_db().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = db.execute(
+        "INSERT OR REPLACE INTO file_tags(path,tags_json) VALUES(?1,?2)",
+        rusqlite::params![path, json],
+    );
+    drop(db); // release lock before checkpoint
+    tag_db_maybe_checkpoint();
+}
+
+#[tauri::command]
+fn get_file_tags_v2(path: String) -> Vec<String> { if let Some(t)=xattr_read_tags(&path){if!t.is_empty(){return t;}} db_read_tags(&path) }
+
+#[tauri::command]
+fn set_file_tags_v2(path: String, tags: Vec<String>) -> Result<(), String> {
+    if xattr_write_tags(&path,&tags) { let db=tag_db().lock().unwrap_or_else(|e| e.into_inner()); let _=db.execute("DELETE FROM file_tags WHERE path=?1",rusqlite::params![path]); }
+    else { db_write_tags(&path,&tags); }
+    Ok(())
+}
+
+#[tauri::command]
+fn migrate_tag_path(old_path: String, new_path: String) -> Result<(), String> {
+    let db=tag_db().lock().unwrap_or_else(|e| e.into_inner());
+    let _=db.execute("UPDATE file_tags SET path=?2 WHERE path=?1",rusqlite::params![old_path,new_path]);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. VIDEO CODEC PROBE
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct VideoCodecInfo { pub codec_name: Option<String>, pub width: Option<u32>, pub height: Option<u32>, pub fps: Option<String>, pub duration_secs: Option<f64>, pub bit_rate_kbps: Option<u64>, pub audio_codec: Option<String>, pub pixel_format: Option<String> }
+
+#[tauri::command]
+fn probe_video_codec(path: String) -> Result<Option<VideoCodecInfo>, String> {
+    let out = std::process::Command::new("ffprobe").args(["-v","quiet","-print_format","json","-show_streams","-show_format",&path]).output().map_err(|e|e.to_string())?;
+    if !out.status.success() { return Ok(None); }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e|e.to_string())?;
+    let streams = json["streams"].as_array();
+    let video = streams.and_then(|s| s.iter().find(|s| s["codec_type"]=="video"));
+    let audio = streams.and_then(|s| s.iter().find(|s| s["codec_type"]=="audio"));
+    let fmt = &json["format"];
+    let fps = video.and_then(|v| v["r_frame_rate"].as_str()).map(|s| {
+        if let Some((n,d))=s.split_once('/') { let nf:f64=n.parse().unwrap_or(0.0); let df:f64=d.parse().unwrap_or(1.0); format!("{:.3}",if df!=0.0{nf/df}else{0.0}) } else { s.to_string() }
+    });
+    Ok(Some(VideoCodecInfo {
+        codec_name: video.and_then(|v|v["codec_name"].as_str()).map(str::to_string),
+        width:  video.and_then(|v|v["width"].as_u64()).map(|n|n as u32),
+        height: video.and_then(|v|v["height"].as_u64()).map(|n|n as u32),
+        fps, duration_secs: fmt["duration"].as_str().and_then(|s|s.parse::<f64>().ok()),
+        bit_rate_kbps: fmt["bit_rate"].as_str().and_then(|s|s.parse::<u64>().ok()).map(|b|b/1000),
+        audio_codec: audio.and_then(|a|a["codec_name"].as_str()).map(str::to_string),
+        pixel_format: video.and_then(|v|v["pix_fmt"].as_str()).map(str::to_string),
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. PLUGINS
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct PluginDef { pub id: String, pub name: String, pub icon: Option<String>, pub r#match: Option<String>, pub command: String, pub multi: Option<bool>, pub confirm: Option<bool>, pub notify: Option<bool>, pub params: Option<Vec<PluginParam>> }
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct PluginParam { pub name: String, pub label: String, pub placeholder: Option<String>, pub default: Option<String> }
+
+#[derive(serde::Serialize)]
+pub struct PluginResult { pub exit_code: i32, pub stdout: String, pub stderr: String }
+
+fn plugins_path() -> PathBuf { dirs::data_local_dir().unwrap_or_else(||PathBuf::from("/tmp")).join("frostfinder/plugins.json") }
+
+#[tauri::command]
+fn load_plugins() -> Vec<PluginDef> { let p=plugins_path(); if !p.exists(){return Vec::new();} std::fs::read_to_string(&p).ok().and_then(|j|serde_json::from_str(&j).ok()).unwrap_or_default() }
+
+#[tauri::command]
+fn save_plugins(plugins: Vec<PluginDef>) -> Result<(), String> {
+    if let Some(p)=plugins_path().parent(){let _=std::fs::create_dir_all(p);}
+    let json=serde_json::to_string_pretty(&plugins).map_err(|e|e.to_string())?;
+    std::fs::write(plugins_path(),json).map_err(|e|e.to_string())
+}
+
+// p9: plugin trust store — keyed by plugin command string, value is djb2 hash
+fn plugin_trust_path() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(||PathBuf::from("/tmp")).join("frostfinder/plugin_trust.json")
+}
+fn plugin_trust_load() -> std::collections::HashMap<String, u64> {
+    let p = plugin_trust_path();
+    std::fs::read_to_string(&p).ok()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+fn plugin_trust_save(map: &std::collections::HashMap<String, u64>) {
+    if let Some(parent) = plugin_trust_path().parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Ok(j) = serde_json::to_string(map) { let _ = std::fs::write(plugin_trust_path(), j); }
+}
+fn djb2(s: &str) -> u64 {
+    s.bytes().fold(5381u64, |h, b| h.wrapping_mul(33).wrapping_add(b as u64))
+}
+
+#[tauri::command]
+fn check_plugin_trust(plugin_id: String, command: String) -> serde_json::Value {
+    // Returns: { "trusted": bool, "changed": bool }
+    // JS should show a confirmation dialog when changed=true before calling run_plugin_command
+    let hash = djb2(&command);
+    let store = plugin_trust_load();
+    match store.get(&plugin_id) {
+        None => serde_json::json!({"trusted": false, "changed": false, "first_run": true}),
+        Some(&stored_hash) if stored_hash != hash => serde_json::json!({"trusted": false, "changed": true, "first_run": false}),
+        _ => serde_json::json!({"trusted": true, "changed": false, "first_run": false}),
+    }
+}
+
+#[tauri::command]
+fn approve_plugin(plugin_id: String, command: String) {
+    let hash = djb2(&command);
+    let mut store = plugin_trust_load();
+    store.insert(plugin_id, hash);
+    plugin_trust_save(&store);
+}
+
+#[tauri::command]
+fn run_plugin_command(window: tauri::Window, command: String, work_dir: String) -> Result<PluginResult, String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    // p9: 30-second execution timeout
+    const TIMEOUT_SECS: u64 = 30;
+    // p9: 1 MB combined stdout+stderr output cap
+    const OUTPUT_CAP: usize = 1024 * 1024;
+
+    let mut child = Command::new("sh")
+        .arg("-c").arg(&command)
+        .current_dir(&work_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+
+    let stdout_pipe = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout_pipe);
+    let mut stdout_lines: Vec<String> = Vec::new();
+    let mut total_bytes: usize = 0;
+    let start = std::time::Instant::now();
+    let mut truncated = false;
+
+    for line in reader.lines().map_while(Result::ok) {
+        // p9: timeout check
+        if start.elapsed().as_secs() >= TIMEOUT_SECS {
+            let _ = child.kill();
+            return Err(format!("Plugin timed out after {TIMEOUT_SECS}s"));
+        }
+        // p9: output cap
+        total_bytes += line.len() + 1;
+        if total_bytes > OUTPUT_CAP {
+            let _ = child.kill();
+            truncated = true;
+            break;
+        }
+        // r176: Stream stdout — parse PROGRESS:n/total lines, emit event; forward rest
+        if let Some(rest) = line.strip_prefix("PROGRESS:") {
+            let parts: Vec<&str> = rest.splitn(2, '/').collect();
+            if parts.len() == 2 {
+                if let (Ok(done), Ok(total)) = (parts[0].trim().parse::<u64>(), parts[1].trim().parse::<u64>()) {
+                    let _ = window.emit("plugin-progress", serde_json::json!({
+                        "done": done, "total": total, "finished": false
+                    }));
+                    continue;
+                }
+            }
+        }
+        stdout_lines.push(line);
+    }
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let exit_code = if truncated { -2 } else { status.code().unwrap_or(-1) };
+    let _ = window.emit("plugin-progress", serde_json::json!({
+        "done": 0, "total": 0, "finished": true, "exit_code": exit_code
+    }));
+
+    let mut stdout = stdout_lines.join("\n");
+    if truncated { stdout.push_str("\n[output truncated at 1 MB]"); }
+
+    let mut stderr_str = String::new();
+    if let Some(se) = child.stderr.as_mut() {
+        std::io::Read::read_to_string(se, &mut stderr_str).ok();
+        if stderr_str.len() > OUTPUT_CAP { stderr_str.truncate(OUTPUT_CAP); stderr_str.push_str("\n[stderr truncated]"); }
+    }
+    Ok(PluginResult { exit_code, stdout, stderr: stderr_str })
+}
+
+
+// ── Persistent settings (replaces localStorage for cross-session durability) ──
+// Settings are stored in ~/.config/frostfinder/settings.json as a flat
+// JSON object. JS reads them once on startup via get_settings() and writes
+// on every change via set_settings(). This survives WebView profile resets
+// and app reinstalls, unlike localStorage.
+
+const SETTINGS_VERSION: u32 = 1;
+
+fn settings_path() -> std::path::PathBuf {
+    dirs::config_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("frostfinder")
+        .join("settings.json")
+}
+
+fn migrate_settings(mut settings: serde_json::Value) -> serde_json::Value {
+    let current_version = settings.get("_v").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    if current_version >= SETTINGS_VERSION {
+        return settings;
+    }
+    // Migration from version 0 to 1
+    if current_version < 1 {
+        // Add any new keys with their defaults here when settings schema changes
+        // For now, just ensure the version is set
+        settings["_v"] = serde_json::json!(SETTINGS_VERSION);
+    }
+    settings
+}
+
+#[tauri::command]
+fn get_settings() -> serde_json::Value {
+    let p = settings_path();
+    if let Ok(data) = std::fs::read_to_string(&p) {
+        match serde_json::from_str::<serde_json::Value>(&data) {
+            Ok(settings) => migrate_settings(settings),
+            Err(e) => {
+                eprintln!("Settings parse error: {}. Backing up and resetting.", e);
+                // Backup the corrupted file so the user can recover it manually
+                let backup_path = format!(
+                    "{}.backup.{}",
+                    p.display(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                );
+                if std::fs::copy(&p, &backup_path).is_ok() {
+                    eprintln!("Corrupted settings backed up to {}", backup_path);
+                }
+                // _reset: true signals the JS layer to show a one-time warning toast
+                serde_json::json!({ "_v": SETTINGS_VERSION, "_reset": true })
+            }
+        }
+    } else {
+        // First launch — no file yet, no toast needed
+        serde_json::json!({ "_v": SETTINGS_VERSION })
+    }
+}
+
+#[tauri::command]
+fn set_settings(settings: serde_json::Value) -> Result<(), String> {
+    let p = settings_path();
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&p, json).map_err(|e| e.to_string())
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// Unit tests
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn tmp() -> TempDir {
+        tempfile::TempDir::new().expect("failed to create TempDir")
+    }
+
+    fn make_file(dir: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, content).expect("write failed");
+        p
+    }
+
+    // ── DirCache ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dir_cache_insert_and_get() {
+        let mut cache = DirCache::new();
+        let entries = vec![FileEntryFast {
+            name: "foo.txt".into(), path: "/tmp/foo.txt".into(),
+            is_dir: false, extension: Some("txt".into()),
+            is_hidden: false, is_symlink: false,
+        }];
+        cache.insert("/tmp".into(), entries.clone());
+        let got = cache.get("/tmp").expect("cache miss after insert");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "foo.txt");
+    }
+
+    #[test]
+    fn dir_cache_evicts_lru_at_capacity() {
+        let mut cache = DirCache::new();
+        let empty: Vec<FileEntryFast> = Vec::new();
+        // Fill to capacity
+        for i in 0..DIR_CACHE_MAX {
+            cache.insert(format!("/p{}", i), empty.clone());
+        }
+        assert!(cache.get("/p0").is_some(), "p0 should still be present before overflow");
+        // One more insertion must evict /p0 (LRU)
+        cache.insert("/overflow".into(), empty.clone());
+        assert!(cache.get("/p0").is_none(), "p0 should be evicted");
+        assert!(cache.get("/overflow").is_some(), "/overflow must be present");
+    }
+
+    #[test]
+    fn dir_cache_evict_removes_entry() {
+        let mut cache = DirCache::new();
+        cache.insert("/a".into(), Vec::new());
+        assert!(cache.get("/a").is_some());
+        cache.evict("/a");
+        assert!(cache.get("/a").is_none());
+    }
+
+    #[test]
+    fn dir_cache_refresh_moves_to_back() {
+        let mut cache = DirCache::new();
+        let empty: Vec<FileEntryFast> = Vec::new();
+        for i in 0..DIR_CACHE_MAX {
+            cache.insert(format!("/p{}", i), empty.clone());
+        }
+        // Re-insert /p0 — now MRU; next overflow should evict /p1 instead
+        cache.insert("/p0".into(), empty.clone());
+        cache.insert("/overflow".into(), empty.clone());
+        assert!(cache.get("/p0").is_some(), "/p0 was re-inserted, must survive");
+        assert!(cache.get("/p1").is_none(), "/p1 should be LRU-evicted");
+    }
+
+    // ── tag DB round-trip ─────────────────────────────────────────────────────
+
+    #[test]
+    fn db_tags_roundtrip() {
+        let d = tmp();
+        let f = make_file(d.path(), "tagged.txt", b"hello");
+        let path = f.to_string_lossy().to_string();
+        let tags = vec!["red".to_string(), "important".to_string()];
+
+        db_write_tags(&path, &tags);
+        let got = db_read_tags(&path);
+        assert_eq!(got, tags);
+    }
+
+    #[test]
+    fn db_tags_overwrite() {
+        let d = tmp();
+        let f = make_file(d.path(), "file.txt", b"x");
+        let path = f.to_string_lossy().to_string();
+
+        db_write_tags(&path, &["green".to_string()]);
+        db_write_tags(&path, &["blue".to_string(), "work".to_string()]);
+        let got = db_read_tags(&path);
+        assert_eq!(got, vec!["blue", "work"]);
+    }
+
+    #[test]
+    fn db_tags_empty_on_missing() {
+        let got = db_read_tags("/nonexistent/path/file.txt");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn db_tags_clear_with_empty_vec() {
+        let d = tmp();
+        let f = make_file(d.path(), "file.txt", b"x");
+        let path = f.to_string_lossy().to_string();
+
+        db_write_tags(&path, &["red".to_string()]);
+        db_write_tags(&path, &[]);
+        let got = db_read_tags(&path);
+        assert!(got.is_empty());
+    }
+
+    // ── SMB registry round-trip ───────────────────────────────────────────────
+
+    #[test]
+    fn smb_registry_roundtrip() {
+        let d = tmp();
+        // Override registry path via env — tests must not touch real user data
+        let p = d.path().join("smb_mounts.json");
+        let mounts = vec![
+            SmbShare {
+                server: "192.168.1.10".into(),
+                share: "media".into(),
+                mount_point: "/tmp/ff-smb-test".into(),
+                username: Some("alice".into()),
+            },
+            SmbShare {
+                server: "nas.local".into(),
+                share: "backup".into(),
+                mount_point: "/tmp/ff-smb-backup".into(),
+                username: None,
+            },
+        ];
+        let json = serde_json::to_string(&mounts).unwrap();
+        fs::write(&p, &json).unwrap();
+        let loaded: Vec<SmbShare> = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].server, "192.168.1.10");
+        assert_eq!(loaded[1].username, None);
+    }
+
+    #[test]
+    fn smb_registry_empty_on_corrupt_json() {
+        let d = tmp();
+        let p = d.path().join("smb_mounts.json");
+        fs::write(&p, b"not valid json {{{{").unwrap();
+        let loaded: Vec<SmbShare> = serde_json::from_str(
+            &fs::read_to_string(&p).unwrap()
+        ).unwrap_or_default();
+        assert!(loaded.is_empty());
+    }
+
+    // ── Cloud (WebDAV) registry round-trip ────────────────────────────────────
+
+    #[test]
+    fn cloud_registry_roundtrip() {
+        let d = tmp();
+        let p = d.path().join("cloud_mounts.json");
+        let mounts = vec![CloudMount {
+            id: "uuid-1".into(),
+            cloud_type: "webdav".into(),
+            name: "Nextcloud".into(),
+            mount_point: "/tmp/ff-cloud-test".into(),
+            url: Some("https://cloud.example.com".into()),
+            bucket: None,
+        }];
+        let json = serde_json::to_string(&mounts).unwrap();
+        fs::write(&p, &json).unwrap();
+        let loaded: Vec<CloudMount> =
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cloud_type, "webdav");
+        assert_eq!(loaded[0].url.as_deref(), Some("https://cloud.example.com"));
+    }
+
+    // ── copy_files helper (filesystem-level) ─────────────────────────────────
+
+    #[test]
+    fn copy_single_file() {
+        let src_dir = tmp();
+        let dst_dir = tmp();
+        let src = make_file(src_dir.path(), "hello.txt", b"hello world");
+        let dst = dst_dir.path().join("hello.txt");
+
+        fs::copy(&src, &dst).expect("copy failed");
+
+        assert!(dst.exists());
+        assert_eq!(fs::read(&dst).unwrap(), b"hello world");
+        // Source must still exist (copy, not move)
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn copy_preserves_content() {
+        let src_dir = tmp();
+        let dst_dir = tmp();
+        let content = b"FrostFinder test content \xf0\x9f\x90\xa7";
+        let src = make_file(src_dir.path(), "data.bin", content);
+        let dst = dst_dir.path().join("data.bin");
+        fs::copy(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst).unwrap().as_slice(), content);
+    }
+
+    #[test]
+    fn move_file_removes_source() {
+        let src_dir = tmp();
+        let dst_dir = tmp();
+        let src = make_file(src_dir.path(), "move_me.txt", b"bye");
+        let dst = dst_dir.path().join("move_me.txt");
+
+        fs::rename(&src, &dst).expect("rename failed");
+
+        assert!(!src.exists(), "source must be gone after move");
+        assert!(dst.exists());
+        assert_eq!(fs::read(&dst).unwrap(), b"bye");
+    }
+
+    // ── FileOpProgress serialisation ─────────────────────────────────────────
+
+    #[test]
+    fn file_op_progress_serialises_without_optional_fields() {
+        let p = FileOpProgress {
+            done: 3, total: 10,
+            name: "archive.zip".into(),
+            error: None, finished: None,
+            bytes_done: None, bytes_total: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"done\":3"));
+        assert!(json.contains("\"total\":10"));
+        // None fields must be skipped (skip_serializing_if)
+        assert!(!json.contains("bytes_done"));
+        assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn file_op_progress_serialises_with_byte_fields() {
+        let p = FileOpProgress {
+            done: 1, total: 5,
+            name: "video.mkv".into(),
+            error: None,
+            finished: Some(false),
+            bytes_done: Some(1_048_576),
+            bytes_total: Some(10_485_760),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"bytes_done\":1048576"));
+        assert!(json.contains("\"bytes_total\":10485760"));
+        assert!(json.contains("\"finished\":false"));
+    }
+
+    // ── FileEntryFast serialisation ───────────────────────────────────────────
+
+    #[test]
+    fn file_entry_fast_roundtrip() {
+        let e = FileEntryFast {
+            name: "document.pdf".into(),
+            path: "/home/user/document.pdf".into(),
+            is_dir: false,
+            extension: Some("pdf".into()),
+            is_hidden: false,
+            is_symlink: false,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let back: FileEntryFast = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, e.name);
+        assert_eq!(back.extension, e.extension);
+        assert!(!back.is_dir);
+    }
+
+    #[test]
+    fn hidden_file_detection() {
+        // Hidden files start with '.' on Linux
+        let names = [(".bashrc", true), ("README.md", false), (".config", true), ("main.rs", false)];
+        for (name, expected) in names {
+            let is_hidden = name.starts_with('.');
+            assert_eq!(is_hidden, expected, "failed for {name}");
+        }
+    }
+
+    // ── SftpMount / FtpMount serialisation ───────────────────────────────────
+
+    #[test]
+    fn sftp_mount_roundtrip() {
+        let m = SftpMount {
+            id: "sftp-1".into(), label: "Work Server".into(),
+            host: "ssh.example.com".into(), port: 22,
+            username: "dev".into(), remote_path: "/home/dev".into(),
+            mount_path: "/tmp/ff-sftp-1".into(),
+            key_path: Some("/home/user/.ssh/id_ed25519".into()),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: SftpMount = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.host, "ssh.example.com");
+        assert_eq!(back.port, 22);
+        assert_eq!(back.key_path.as_deref(), Some("/home/user/.ssh/id_ed25519"));
+    }
+
+    // ── Tag DB integrity ──────────────────────────────────────────────────────
+
+    #[test]
+    fn audit_tag_db_returns_orphans_only() {
+        let d = tmp();
+        let real_file = make_file(d.path(), "real.txt", b"x");
+        let real_path = real_file.to_str().unwrap().to_string();
+        let ghost_path = d.path().join("ghost.txt").to_str().unwrap().to_string();
+
+        db_write_tags(&real_path,  &["red".to_string()]);
+        db_write_tags(&ghost_path, &["blue".to_string()]);
+
+        let orphans = audit_tag_db();
+        assert!(!orphans.contains(&real_path),  "real file must not be orphan");
+        assert!(orphans.contains(&ghost_path),   "ghost file must be orphan");
+    }
+
+    #[test]
+    fn cleanup_tag_db_removes_only_orphans() {
+        let d = tmp();
+        let real_file = make_file(d.path(), "keep.txt", b"x");
+        let real_path = real_file.to_str().unwrap().to_string();
+        let ghost_path = d.path().join("gone.txt").to_str().unwrap().to_string();
+
+        db_write_tags(&real_path,  &["green".to_string()]);
+        db_write_tags(&ghost_path, &["blue".to_string()]);
+
+        let removed = cleanup_tag_db().expect("cleanup failed");
+        assert!(removed >= 1, "at least the ghost row must be removed");
+
+        // real file's tags must still be readable
+        let tags = db_read_tags(&real_path);
+        assert_eq!(tags, vec!["green"]);
+
+        // ghost must now return empty
+        let ghost_tags = db_read_tags(&ghost_path);
+        assert!(ghost_tags.is_empty());
+    }
+
+    #[test]
+    fn cleanup_tag_db_no_op_when_clean() {
+        let d = tmp();
+        let f = make_file(d.path(), "file.txt", b"x");
+        let path = f.to_string_lossy().to_string();
+        db_write_tags(&path, &["tag1".to_string()]);
+
+        let removed = cleanup_tag_db().expect("cleanup failed");
+        // No orphans — may return 0 or more if other test files left DB rows
+        // but the real file's tag must survive
+        let tags = db_read_tags(&path);
+        assert!(!tags.is_empty(), "tags must survive a clean run");
+        let _ = removed; // value not checked — depends on other test ordering
+    }
+
+    #[test]
+    fn ftp_mount_tls_flag() {
+        let plain = FtpMount {
+            id: "ftp-1".into(), label: "FTP".into(),
+            host: "ftp.example.com".into(), port: 21,
+            username: "anon".into(), remote_path: "/pub".into(),
+            mount_path: "/tmp/ff-ftp-1".into(), tls: false,
+        };
+        let tls = FtpMount { tls: true, id: "ftp-2".into(), label: "FTPS".into(), port: 990, ..plain.clone() };
+
+        let j_plain = serde_json::to_string(&plain).unwrap();
+        let j_tls   = serde_json::to_string(&tls).unwrap();
+        assert!(j_plain.contains("\"tls\":false"));
+        assert!(j_tls.contains("\"tls\":true"));
+    }
+
+    // ── read_text_file / write_text_file ─────────────────────────────────────
+
+    #[test]
+    fn test_read_text_file_roundtrip() {
+        let dir = tmp();
+        let p = dir.path().join("hello.txt");
+        fs::write(&p, "Hello, world!\n").unwrap();
+        let result = read_text_file(p.to_string_lossy().to_string());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Hello, world!\n");
+    }
+
+    #[test]
+    fn test_write_text_file_atomic() {
+        let dir = tmp();
+        let p = dir.path().join("out.txt");
+        let result = write_text_file(p.to_string_lossy().to_string(), "Atomic write".to_string());
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "Atomic write");
+        // Temp file should NOT be left behind
+        let tmp_path = dir.path().join(".frostfinder_tmp_out.txt.tmp");
+        assert!(!tmp_path.exists(), "temp file should be cleaned up after rename");
+    }
+
+    #[test]
+    fn test_write_text_file_overwrites() {
+        let dir = tmp();
+        let p = dir.path().join("overwrite.txt");
+        fs::write(&p, "original").unwrap();
+        write_text_file(p.to_string_lossy().to_string(), "updated".to_string()).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "updated");
+    }
+
+    #[test]
+    fn test_read_text_file_missing() {
+        let result = read_text_file("/nonexistent/path/file.txt".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_text_file_too_large() {
+        let dir = tmp();
+        let p = dir.path().join("big.txt");
+        // Write 2 MB + 1 byte — just over the limit
+        let big: Vec<u8> = vec![b'x'; 2 * 1024 * 1024 + 1];
+        fs::write(&p, &big).unwrap();
+        let result = read_text_file(p.to_string_lossy().to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("too large"));
+    }
+
+    // ── search_advanced ───────────────────────────────────────────────────────
+    // Tests the core search function: filename matching, regex, content search,
+    // hidden file toggle, and recursion.
+
+    #[test]
+    fn search_finds_file_by_name_prefix() {
+        let dir = tmp();
+        make_file(dir.path(), "readme.md", b"docs");
+        make_file(dir.path(), "main.rs", b"fn main() {}");
+        make_file(dir.path(), "Cargo.toml", b"[package]");
+        let results = search_advanced(
+            "readme".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "readme.md");
+    }
+
+    #[test]
+    fn search_is_case_insensitive_for_plain_query() {
+        let dir = tmp();
+        make_file(dir.path(), "MyPhoto.JPG", b"");
+        make_file(dir.path(), "other.txt", b"");
+        let results = search_advanced(
+            "myphoto".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "MyPhoto.JPG");
+    }
+
+    #[test]
+    fn search_regex_mode_matches_pattern() {
+        let dir = tmp();
+        make_file(dir.path(), "file001.log", b"");
+        make_file(dir.path(), "file002.log", b"");
+        make_file(dir.path(), "report.pdf", b"");
+        let results = search_advanced(
+            r"file\d+\.log".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, true, false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.name.ends_with(".log")));
+    }
+
+    #[test]
+    fn search_regex_invalid_pattern_returns_error() {
+        let dir = tmp();
+        let result = search_advanced(
+            "[invalid".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, true, false, false,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("regex"));
+    }
+
+    #[test]
+    fn search_excludes_hidden_files_by_default() {
+        let dir = tmp();
+        make_file(dir.path(), ".hidden", b"secret");
+        make_file(dir.path(), "visible.txt", b"public");
+        let results = search_advanced(
+            "".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, false, false,
+        ).unwrap();
+        assert!(results.iter().all(|r| !r.name.starts_with('.')));
+    }
+
+    #[test]
+    fn search_includes_hidden_files_when_flag_set() {
+        let dir = tmp();
+        make_file(dir.path(), ".bashrc", b"alias ll=ls");
+        make_file(dir.path(), "normal.txt", b"");
+        let results = search_advanced(
+            "bashrc".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, false, true,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, ".bashrc");
+    }
+
+    #[test]
+    fn search_contents_finds_text_inside_file() {
+        let dir = tmp();
+        make_file(dir.path(), "notes.txt", b"the quick brown fox");
+        make_file(dir.path(), "other.txt", b"nothing interesting here");
+        let results = search_advanced(
+            "quick brown".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, true, false,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "notes.txt");
+        assert!(results[0].snippet.is_some());
+    }
+
+    #[test]
+    fn search_recursive_finds_files_in_subdirectory() {
+        let dir = tmp();
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        make_file(&sub, "deep.txt", b"");
+        make_file(dir.path(), "shallow.txt", b"");
+        let results = search_advanced(
+            "deep".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            true, false, false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "deep.txt");
+    }
+
+    #[test]
+    fn search_non_recursive_does_not_descend() {
+        let dir = tmp();
+        let sub = dir.path().join("subdir");
+        fs::create_dir(&sub).unwrap();
+        make_file(&sub, "buried.txt", b"");
+        let results = search_advanced(
+            "buried".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, false, false,
+        ).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn search_returns_empty_for_nonexistent_root() {
+        let results = search_advanced(
+            "anything".to_string(),
+            "/nonexistent/path/that/does/not/exist".to_string(),
+            false, false, false, false,
+        ).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_results_are_sorted_by_name_case_insensitive() {
+        let dir = tmp();
+        make_file(dir.path(), "Zebra.txt", b"");
+        make_file(dir.path(), "apple.txt", b"");
+        make_file(dir.path(), "Mango.txt", b"");
+        let results = search_advanced(
+            ".txt".to_string(),
+            dir.path().to_string_lossy().to_string(),
+            false, false, false, false,
+        ).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["apple.txt", "Mango.txt", "Zebra.txt"]);
+    }
+
+    // ── batch_rename ──────────────────────────────────────────────────────────
+    // Tests all 5 rename modes: find_replace, prefix, suffix, number, case.
+
+    fn make_opts(mode: &str) -> BatchRenameOptions {
+        BatchRenameOptions {
+            mode: mode.to_string(),
+            find: None, replace: None,
+            prefix: None, suffix: None,
+            start_num: None, padding: None,
+            case_mode: None,
+        }
+    }
+
+    #[test]
+    fn batch_rename_find_replace_replaces_stem() {
+        let dir = tmp();
+        let p1 = make_file(dir.path(), "report_2025.txt", b"");
+        let p2 = make_file(dir.path(), "report_2024.txt", b"");
+        let opts = BatchRenameOptions {
+            mode: "find_replace".to_string(),
+            find: Some("report".to_string()),
+            replace: Some("summary".to_string()),
+            ..make_opts("find_replace")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p1.to_string_lossy().to_string(), p2.to_string_lossy().to_string()],
+            opts,
+        )).unwrap();
+        assert!(results.iter().all(|r| !r.starts_with("ERROR:")));
+        assert!(results.iter().any(|r| r.contains("summary_2025")));
+        assert!(results.iter().any(|r| r.contains("summary_2024")));
+    }
+
+    #[test]
+    fn batch_rename_prefix_prepends_to_stem() {
+        let dir = tmp();
+        let p = make_file(dir.path(), "photo.jpg", b"");
+        let opts = BatchRenameOptions {
+            mode: "prefix".to_string(),
+            prefix: Some("vacation_".to_string()),
+            ..make_opts("prefix")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p.to_string_lossy().to_string()], opts,
+        )).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].contains("vacation_photo.jpg"));
+    }
+
+    #[test]
+    fn batch_rename_suffix_appends_to_stem() {
+        let dir = tmp();
+        let p = make_file(dir.path(), "image.png", b"");
+        let opts = BatchRenameOptions {
+            mode: "suffix".to_string(),
+            suffix: Some("_final".to_string()),
+            ..make_opts("suffix")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p.to_string_lossy().to_string()], opts,
+        )).unwrap();
+        assert!(results[0].contains("image_final.png"));
+    }
+
+    #[test]
+    fn batch_rename_number_uses_start_num_and_padding() {
+        let dir = tmp();
+        let files: Vec<_> = (0..3).map(|i| make_file(dir.path(), &format!("img{}.jpg", i), b"")).collect();
+        let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let opts = BatchRenameOptions {
+            mode: "number".to_string(),
+            start_num: Some(10),
+            padding: Some(3),
+            prefix: Some("photo_".to_string()),
+            ..make_opts("number")
+        };
+        let results = futures::executor::block_on(batch_rename(paths, opts)).unwrap();
+        assert!(results[0].contains("photo_010.jpg"));
+        assert!(results[1].contains("photo_011.jpg"));
+        assert!(results[2].contains("photo_012.jpg"));
+    }
+
+    #[test]
+    fn batch_rename_case_lower() {
+        let dir = tmp();
+        let p = make_file(dir.path(), "MyFile.txt", b"");
+        let opts = BatchRenameOptions {
+            mode: "case".to_string(),
+            case_mode: Some("lower".to_string()),
+            ..make_opts("case")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p.to_string_lossy().to_string()], opts,
+        )).unwrap();
+        assert!(results[0].contains("myfile.txt"));
+    }
+
+    #[test]
+    fn batch_rename_case_upper() {
+        let dir = tmp();
+        let p = make_file(dir.path(), "myfile.txt", b"");
+        let opts = BatchRenameOptions {
+            mode: "case".to_string(),
+            case_mode: Some("upper".to_string()),
+            ..make_opts("case")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p.to_string_lossy().to_string()], opts,
+        )).unwrap();
+        assert!(results[0].contains("MYFILE.txt"));
+    }
+
+    #[test]
+    fn batch_rename_case_title() {
+        let dir = tmp();
+        let p = make_file(dir.path(), "the quick brown fox.txt", b"");
+        let opts = BatchRenameOptions {
+            mode: "case".to_string(),
+            case_mode: Some("title".to_string()),
+            ..make_opts("case")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p.to_string_lossy().to_string()], opts,
+        )).unwrap();
+        assert!(results[0].contains("The Quick Brown Fox.txt"));
+    }
+
+    #[test]
+    fn batch_rename_errors_when_destination_already_exists() {
+        let dir = tmp();
+        let p = make_file(dir.path(), "original.txt", b"");
+        // Create the conflict file that the rename would produce
+        make_file(dir.path(), "conflict.txt", b"already here");
+        let opts = BatchRenameOptions {
+            mode: "find_replace".to_string(),
+            find: Some("original".to_string()),
+            replace: Some("conflict".to_string()),
+            ..make_opts("find_replace")
+        };
+        let results = futures::executor::block_on(batch_rename(
+            vec![p.to_string_lossy().to_string()], opts,
+        )).unwrap();
+        assert!(results[0].starts_with("ERROR:"));
+        assert!(results[0].contains("conflict.txt"));
+    }
+
+    #[test]
+    fn batch_rename_empty_input_returns_empty_output() {
+        let opts = make_opts("prefix");
+        let results = futures::executor::block_on(batch_rename(vec![], opts)).unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── settings — migrate_settings ───────────────────────────────────────────
+
+    #[test]
+    fn migrate_settings_sets_version_on_empty_object() {
+        let settings = serde_json::json!({});
+        let migrated = migrate_settings(settings);
+        assert_eq!(migrated["_v"], serde_json::json!(SETTINGS_VERSION));
+    }
+
+    #[test]
+    fn migrate_settings_is_idempotent_at_current_version() {
+        let settings = serde_json::json!({ "_v": SETTINGS_VERSION, "ff_theme": "dark" });
+        let migrated = migrate_settings(settings.clone());
+        assert_eq!(migrated["_v"], serde_json::json!(SETTINGS_VERSION));
+        assert_eq!(migrated["ff_theme"], serde_json::json!("dark"));
+    }
+
+    #[test]
+    fn migrate_settings_upgrades_version_0_to_current() {
+        let settings = serde_json::json!({ "ff_viewMode": "list" });
+        let migrated = migrate_settings(settings);
+        assert_eq!(migrated["_v"], serde_json::json!(SETTINGS_VERSION));
+        assert_eq!(migrated["ff_viewMode"], serde_json::json!("list"));
+    }
+
+    #[test]
+    fn migrate_settings_preserves_all_user_keys() {
+        let settings = serde_json::json!({
+            "ff_locale": "fr",
+            "ff_iconSize": "96",
+            "ff_theme": "light",
+        });
+        let migrated = migrate_settings(settings);
+        assert_eq!(migrated["ff_locale"],   serde_json::json!("fr"));
+        assert_eq!(migrated["ff_iconSize"], serde_json::json!("96"));
+        assert_eq!(migrated["ff_theme"],    serde_json::json!("light"));
+    }
+}

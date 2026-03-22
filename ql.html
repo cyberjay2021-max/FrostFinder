@@ -160,7 +160,147 @@
     color: var(--text-primary);
     white-space: pre;
     tab-size: 4;
+    user-select: text;
   }
+  .ql-pre-readonly {
+    width: 100%; height: 100%;
+    overflow: auto;
+    padding: 16px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    tab-size: 4;
+    user-select: text;
+  }
+  .ql-size-note {
+    width: 100%;
+    padding: 5px 14px;
+    font-size: 11px;
+    color: var(--accent-blue);
+    background: rgba(91,141,217,.08);
+    border-bottom: 1px solid rgba(91,141,217,.18);
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
+
+  /* ── Editor toolbar ──────────────────────────────────────────────────────── */
+  #ql-editor-bar {
+    flex-shrink: 0;
+    height: 0;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    background: rgba(255,255,255,.025);
+    border-bottom: 1px solid var(--border);
+    transition: height .18s ease;
+  }
+  #ql-editor-bar.visible { height: 34px; }
+  #ql-editor-mode {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    flex: 1;
+    font-style: italic;
+    user-select: none;
+  }
+  .ql-bar-btn {
+    background: none;
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 5px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 11.5px;
+    font-family: inherit;
+    padding: 3px 9px;
+    transition: background .12s, color .12s;
+    white-space: nowrap;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .ql-bar-btn:hover:not(:disabled) { background: rgba(255,255,255,.1); color: var(--text-primary); }
+  .ql-bar-btn:disabled { opacity: .35; cursor: default; pointer-events: none; }
+  #ql-edit-btn     { color: var(--accent-blue); border-color: rgba(91,141,217,.35); }
+  #ql-edit-btn:hover:not(:disabled) { background: rgba(91,141,217,.12); }
+  #ql-save-btn     { color: #34d399; border-color: rgba(52,211,153,.25); }
+  #ql-save-btn.dirty { border-color: rgba(52,211,153,.6); box-shadow: 0 0 0 1px rgba(52,211,153,.2); }
+  #ql-save-btn:hover:not(:disabled) { background: rgba(52,211,153,.12); }
+  #ql-discard-btn  { color: var(--text-tertiary); }
+  #ql-find-bar-btn { color: var(--text-tertiary); margin-left: auto; }
+
+  /* ── Find bar (non-CM content fallback) ─────────────────────────────────── */
+  #ql-find-bar {
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 0;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
+    background: rgba(22,22,26,.96);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+    transition: height .15s ease;
+    z-index: 100;
+  }
+  #ql-find-bar.visible { height: 36px; }
+  #ql-find-label { font-size: 11px; color: var(--text-tertiary); flex-shrink: 0; user-select: none; }
+  #ql-find-input {
+    flex: 1; max-width: 240px;
+    background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.15);
+    border-radius: 5px;
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+    padding: 3px 8px;
+  }
+  #ql-find-input:focus { border-color: var(--accent-blue); box-shadow: 0 0 0 2px rgba(91,141,217,.15); }
+  #ql-find-count { font-size: 11px; color: var(--text-tertiary); min-width: 72px; white-space: nowrap; }
+  .ql-find-nav-btn {
+    background: none; border: none;
+    color: var(--text-secondary);
+    cursor: pointer; font-size: 14px;
+    padding: 2px 5px; border-radius: 3px; line-height: 1;
+    transition: background .1s;
+  }
+  .ql-find-nav-btn:hover { color: var(--text-primary); background: rgba(255,255,255,.1); }
+  .ql-find-close-btn {
+    background: none; border: none;
+    color: var(--text-tertiary);
+    cursor: pointer; font-size: 12px;
+    margin-left: auto; padding: 2px 5px; border-radius: 3px;
+    transition: background .1s;
+  }
+  .ql-find-close-btn:hover { color: var(--text-primary); background: rgba(255,255,255,.1); }
+  mark.ql-find-match {
+    background: rgba(245,196,68,.3);
+    color: inherit; border-radius: 2px;
+    outline: 1px solid rgba(245,196,68,.45);
+  }
+  mark.ql-find-current {
+    background: rgba(245,196,68,.8);
+    color: #111; border-radius: 2px;
+    outline: 1px solid #f5c444;
+  }
+
+  /* ── CodeMirror host sizing ──────────────────────────────────────────────── */
+  #ql-body .cm-editor {
+    height: 100%;
+    font-size: 12.5px;
+  }
+  #ql-body .cm-scroller { overflow: auto; }
+  /* Override CM search panel position to sit at top of editor */
+  .cm-panels-top { border-bottom: 1px solid var(--border); }
+  .cm-search { background: rgba(22,22,26,.97) !important; }
+  .cm-textfield { background: rgba(255,255,255,.07) !important; color: var(--text-primary) !important; border: 1px solid rgba(255,255,255,.15) !important; border-radius: 4px !important; }
+  .cm-button { background: rgba(255,255,255,.07) !important; color: var(--text-secondary) !important; border: 1px solid rgba(255,255,255,.14) !important; border-radius: 4px !important; cursor: pointer; }
+  .cm-button:hover { background: rgba(255,255,255,.13) !important; }
+
   .ql-audio-wrap {
     display: flex; flex-direction: column;
     align-items: center; gap: 12px;
@@ -237,14 +377,46 @@
     <span class="ql-name" id="ql-name">Loading…</span>
     <span class="ql-meta" id="ql-meta"></span>
     <button class="ql-nav-btn disabled" id="ql-next" title="Next (→)">&#8250;</button>
-    <button class="ql-open-btn" id="ql-open" title="Open externally">
+    <button class="ql-open-btn" id="ql-open" title="Open in default app">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
         <path d="M7 3H3a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V9"/>
         <path d="M10 2h4v4"/><path d="M14 2 8 8"/>
       </svg>
     </button>
+    <button class="ql-open-btn" id="ql-open-with" title="Open With…" style="font-size:10px;padding:0 8px;gap:3px;">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:12px;height:12px"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 2"/></svg>
+      With…
+    </button>
   </div>
-  <div id="ql-body">
+  <!-- ── Editor toolbar (shown only for text/code files) ───────────────── -->
+  <div id="ql-editor-bar">
+    <span id="ql-editor-mode">Read-only</span>
+    <button class="ql-bar-btn" id="ql-edit-btn" title="Edit this file (enables typing)">
+      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" style="width:11px;height:11px"><path d="M9.5 2.5l2 2L4 12H2v-2L9.5 2.5z"/></svg>
+      Edit
+    </button>
+    <button class="ql-bar-btn" id="ql-save-btn" title="Save changes (Ctrl+S)" disabled style="display:none">
+      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" style="width:11px;height:11px"><path d="M2 2h8l2 2v8H2V2z"/><rect x="4" y="8" width="6" height="4" rx="0.5" fill="currentColor" stroke="none"/><rect x="4" y="2" width="5" height="3" rx="0.5" fill="currentColor" stroke="none"/></svg>
+      Save
+    </button>
+    <button class="ql-bar-btn" id="ql-discard-btn" title="Discard unsaved changes" style="display:none">
+      Discard
+    </button>
+    <button class="ql-bar-btn" id="ql-find-bar-btn" title="Find in file (Ctrl+F)" style="margin-left:auto">
+      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" style="width:11px;height:11px"><circle cx="6" cy="6" r="4"/><path d="M9.5 9.5l3 3"/></svg>
+    </button>
+  </div>
+  <!-- ── Content body ──────────────────────────────────────────────────── -->
+  <div id="ql-body" style="position:relative">
+    <!-- Find bar (for non-CM content: pre / archive listing) -->
+    <div id="ql-find-bar">
+      <span class="ql-find-label">Find</span>
+      <input id="ql-find-input" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
+      <span id="ql-find-count"></span>
+      <button class="ql-find-nav-btn" id="ql-find-prev" title="Previous match (Shift+Enter)">&#8743;</button>
+      <button class="ql-find-nav-btn" id="ql-find-next" title="Next match (Enter)">&#8744;</button>
+      <button class="ql-find-close-btn" id="ql-find-close" title="Close (Esc)">✕</button>
+    </div>
     <span class="ql-loading">Loading…</span>
   </div>
 </div>

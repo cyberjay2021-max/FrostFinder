@@ -1,6 +1,6 @@
 [package]
 name = "frostfinder"
-version = "5.0.27"
+version = "6.0.26"
 description = "FrostFinder - A macOS Finder-inspired file manager"
 authors = ["you"]
 license = "GPL-3.0"
@@ -13,7 +13,7 @@ rust-version = "1.77"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
+tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
@@ -27,10 +27,28 @@ rayon = "1.10"
 zip = { version = "2", default-features = false, features = ["deflate", "bzip2", "time"] }
 notify = { version = "6" }
 sha2 = "0.10"
+md-5 = "0.10"
+sha1 = "0.10"
 rand = "0.8"
+regex = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+url = "2"
+lofty = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify = { version = "6", features = ["macos_fsevent"] }
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+xattr = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# winreg: read Windows registry for default apps and drive labels
+winreg = "0.52"
+
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3"
+futures = { version = "0.3", features = ["executor"] }

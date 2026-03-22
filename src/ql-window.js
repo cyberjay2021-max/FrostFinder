@@ -4,12 +4,95 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow as _getAppWindow } from '@tauri-apps/api/window';
 const appWindow = _getAppWindow();
 import { listen, emit } from '@tauri-apps/api/event';
-import { IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, PDF_EXTS, DOC_EXTS, OFFICE_EXTS, BOOK_EXTS, HTML_EXTS, DMG_EXTS, FONT_EXTS, fmtSize, escHtml, fileIcon, fileColor } from './utils.js';
+import { IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, PDF_EXTS, TEXT_EXTS, DOC_EXTS, OFFICE_EXTS, BOOK_EXTS, HTML_EXTS, DMG_EXTS, FONT_EXTS, fmtSize, escHtml, fileIcon, fileColor } from './utils.js';
+
+// ── CodeMirror 6 — lazy imports so non-text previews pay zero cost ────────────
+let _cmModules = null;
+async function getCM() {
+  if (_cmModules) return _cmModules;
+  const [
+    { EditorView, keymap, highlightActiveLine, lineNumbers, highlightActiveLineGutter, drawSelection },
+    { EditorState },
+    { defaultKeymap, history, historyKeymap, undo, redo },
+    { searchKeymap, openSearchPanel, closeSearchPanel, search, SearchCursor },
+    { indentOnInput, syntaxHighlighting, defaultHighlightStyle, bracketMatching },
+    { javascript }    ,
+    { python }        ,
+    { rust }          ,
+    { css }           ,
+    { html }          ,
+    { json }          ,
+    { markdown }      ,
+    { xml }           ,
+    { oneDark }       ,
+    legacyModes
+  ] = await Promise.all([
+    import('@codemirror/view'),
+    import('@codemirror/state'),
+    import('@codemirror/commands'),
+    import('@codemirror/search'),
+    import('@codemirror/language'),
+    import('@codemirror/lang-javascript'),
+    import('@codemirror/lang-python'),
+    import('@codemirror/lang-rust'),
+    import('@codemirror/lang-css'),
+    import('@codemirror/lang-html'),
+    import('@codemirror/lang-json'),
+    import('@codemirror/lang-markdown'),
+    import('@codemirror/lang-xml'),
+    import('@codemirror/theme-one-dark'),
+    import('@codemirror/legacy-modes/mode/toml').catch(() => null),
+  ]);
+  _cmModules = {
+    EditorView, EditorState, keymap, highlightActiveLine, lineNumbers,
+    highlightActiveLineGutter, drawSelection,
+    defaultKeymap, history, historyKeymap, undo, redo,
+    searchKeymap, openSearchPanel, closeSearchPanel, search, SearchCursor,
+    indentOnInput, syntaxHighlighting, defaultHighlightStyle, bracketMatching,
+    javascript, python, rust, css, html, json, markdown, xml, oneDark,
+    toml: legacyModes?.toml ?? null,
+  };
+  return _cmModules;
+}
+
+// Map file extension → CodeMirror language extension factory
+function cmLangFor(ext) {
+  return async () => {
+    const cm = await getCM();
+    switch (ext) {
+      case 'js': case 'jsx': case 'mjs': case 'cjs':
+        return cm.javascript({ jsx: ext === 'jsx' });
+      case 'ts': case 'tsx':
+        return cm.javascript({ typescript: true, jsx: ext === 'tsx' });
+      case 'py': return cm.python();
+      case 'rs': return cm.rust();
+      case 'css': case 'scss': case 'less': return cm.css();
+      case 'html': case 'htm': return cm.html();
+      case 'json': return cm.json();
+      case 'md': return cm.markdown();
+      case 'xml': case 'svg': return cm.xml();
+      case 'toml': {
+        if (cm.toml) {
+          const { StreamLanguage } = await import('@codemirror/language');
+          return StreamLanguage.define(cm.toml);
+        }
+        return null;
+      }
+      default: return null;
+    }
+  };
+}
 
 // ── State ────────────────────────────────────────────────────────────────────
 let _navEntries = [];   // flat list of non-dir entries for prev/next
 let _curIdx     = 0;
 let _mediaPort  = null;
+
+// ── Editor state ──────────────────────────────────────────────────────────────
+let _cmView     = null;   // active CodeMirror EditorView (null when not in text mode)
+let _editorDirty = false; // unsaved changes flag
+let _editMode    = false; // true = editable, false = read-only
+let _currentEntry = null; // entry currently shown (needed by Save)
 
 // ── Audio Visualizer ─────────────────────────────────────────────────────────
 let _vizAnimId = null;
@@ -118,6 +201,325 @@ function getHeicJpegUrl(path) {
   return 'http://127.0.0.1:' + _mediaPort + '/heic-jpeg/' + p;
 }
 
+// ── Text editor helpers ──────────────────────────────────────────────────────
+
+/** Destroy the active CodeMirror instance and hide the editor toolbar. */
+function destroyCM() {
+  if (_cmView) { _cmView.destroy(); _cmView = null; }
+  _editorDirty = false;
+  _editMode = false;
+  document.getElementById('ql-editor-bar')?.classList.remove('visible');
+}
+
+/** Set dirty state and update toolbar save button appearance. */
+function setDirty(dirty) {
+  _editorDirty = dirty;
+  const saveBtn = document.getElementById('ql-save-btn');
+  if (saveBtn) {
+    saveBtn.disabled = !dirty;
+    saveBtn.classList.toggle('dirty', dirty);
+  }
+}
+
+// ── Editor autosave / crash-recovery draft ───────────────────────────────────
+// Writes editor content to localStorage every 5 s while dirty.
+// Key: ff_draft_<djb2 hash of path>  (avoids slashes/special chars in keys).
+
+function _draftKey(path) {
+  // djb2 hash — fast, no crypto API needed
+  let h = 5381;
+  for (let i = 0; i < path.length; i++) h = ((h << 5) + h) ^ path.charCodeAt(i);
+  return 'ff_draft_' + (h >>> 0).toString(36);
+}
+
+let _draftTimer = null;
+
+function _draftSave() {
+  if (!_editorDirty || !_cmView || !_currentEntry) return;
+  try {
+    const key = _draftKey(_currentEntry.path);
+    localStorage.setItem(key, JSON.stringify({
+      path: _currentEntry.path,
+      content: _cmView.state.doc.toString(),
+      ts: Date.now(),
+    }));
+  } catch (_) { /* localStorage full — non-fatal */ }
+}
+
+function _draftClear(path) {
+  try { localStorage.removeItem(_draftKey(path || _currentEntry?.path || '')); } catch (_) {}
+}
+
+function _draftSchedule() {
+  clearTimeout(_draftTimer);
+  _draftTimer = setTimeout(_draftSave, 5000);
+}
+
+/** Called when opening a text file. If a newer draft exists, show a restore banner. */
+function _draftRestore(entry) {
+  try {
+    const raw = localStorage.getItem(_draftKey(entry.path));
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    // Only offer restore if draft is newer than file mtime (entry.modified is seconds-since-epoch)
+    const draftMs = saved.ts || 0;
+    const fileMs  = (entry.modified || 0) * 1000;
+    if (draftMs <= fileMs) { _draftClear(entry.path); return; }
+    // Show banner
+    const banner = document.createElement('div');
+    banner.id = 'ql-draft-banner';
+    banner.style.cssText = [
+      'position:absolute;top:0;left:0;right:0;z-index:200',
+      'background:#1e3a5f;border-bottom:1px solid #2d5a8e',
+      'color:#93c5fd;font-size:12px;padding:6px 12px',
+      'display:flex;align-items:center;gap:10px',
+    ].join(';');
+    const age = Math.round((Date.now() - draftMs) / 60000);
+    const ageStr = age < 1 ? 'just now' : age === 1 ? '1 minute ago' : age + ' minutes ago';
+    banner.innerHTML = `<span>📄 Unsaved draft found (${ageStr})</span>
+      <button id="ql-draft-restore" style="padding:2px 10px;border-radius:5px;background:#2563eb;color:#fff;border:none;cursor:pointer;font-size:11px">Restore</button>
+      <button id="ql-draft-dismiss" style="padding:2px 10px;border-radius:5px;background:#374151;color:#d1d5db;border:none;cursor:pointer;font-size:11px">Dismiss</button>`;
+    qlBody.style.position = 'relative';
+    qlBody.prepend(banner);
+    banner.querySelector('#ql-draft-restore').addEventListener('click', () => {
+      if (_cmView) {
+        _cmView.dispatch({ changes: { from: 0, to: _cmView.state.doc.length, insert: saved.content } });
+        _editMode = true;
+        setEditorReadOnly(false);
+        updateEditorBarMode();
+        setDirty(true);
+      }
+      banner.remove();
+    });
+    banner.querySelector('#ql-draft-dismiss').addEventListener('click', () => {
+      _draftClear(entry.path);
+      banner.remove();
+    });
+  } catch (_) {}
+}
+
+/** Evict drafts older than 7 days. Called once at startup. */
+function _draftGC() {
+  try {
+    const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith('ff_draft_')) continue;
+      try {
+        const val = JSON.parse(localStorage.getItem(k));
+        if ((val?.ts || 0) < cutoff) localStorage.removeItem(k);
+      } catch (_) { localStorage.removeItem(k); }
+    }
+  } catch (_) {}
+}
+_draftGC();
+
+
+/**
+ * Render a text or code file using CodeMirror 6.
+ * Loads the appropriate language extension, creates the editor in read-only
+ * mode, and shows the editor toolbar.
+ */
+async function renderTextEditor(entry, rawContent) {
+  destroyCM();
+  _currentEntry = entry;
+
+  const cm = await getCM();
+  const ext = entry.name.includes('.') ? entry.name.split('.').pop().toLowerCase() : '';
+
+  // Resolve language extension (may be null for unknown types)
+  const langFactory = cmLangFor(ext);
+  const langExt = langFactory ? await langFactory() : null;
+
+  // Build extension list
+  const extensions = [
+    cm.oneDark,
+    cm.lineNumbers(),
+    cm.highlightActiveLineGutter(),
+    cm.highlightActiveLine(),
+    cm.drawSelection(),
+    cm.bracketMatching(),
+    cm.indentOnInput(),
+    cm.syntaxHighlighting(cm.defaultHighlightStyle, { fallback: true }),
+    cm.history(),
+    cm.keymap.of([
+      ...cm.defaultKeymap,
+      ...cm.historyKeymap,
+      ...cm.searchKeymap,
+    ]),
+    cm.search({ top: false }),
+    cm.EditorView.lineWrapping,
+    cm.EditorView.theme({
+      '&': { height: '100%', fontSize: '12.5px', fontFamily: "'JetBrains Mono','Fira Code','Cascadia Code',monospace" },
+      '.cm-scroller': { overflow: 'auto', lineHeight: '1.6' },
+      '.cm-content': { padding: '12px 0' },
+      '.cm-line': { paddingLeft: '4px' },
+    }),
+    cm.EditorState.readOnly.of(true),   // start read-only; toggled by Edit button
+    cm.EditorView.updateListener.of(update => {
+      if (update.docChanged && _editMode) {
+        setDirty(true);
+        _draftSchedule();
+      }
+    }),
+  ];
+
+  if (langExt) extensions.push(langExt);
+
+  const state = cm.EditorState.create({ doc: rawContent, extensions });
+  const host = document.createElement('div');
+  host.style.cssText = 'width:100%;height:100%;overflow:hidden;';
+  qlBody.innerHTML = '';
+  qlBody.appendChild(host);
+
+  _cmView = new cm.EditorView({ state, parent: host });
+
+  // Show editor toolbar
+  const bar = document.getElementById('ql-editor-bar');
+  if (bar) bar.classList.add('visible');
+
+  updateEditorBarMode();
+  // Offer draft restore if a newer crash-recovery draft exists
+  _draftRestore(entry);
+}
+
+/** Sync the Edit/Save/Discard button states to current mode. */
+function updateEditorBarMode() {
+  const editBtn    = document.getElementById('ql-edit-btn');
+  const saveBtn    = document.getElementById('ql-save-btn');
+  const discardBtn = document.getElementById('ql-discard-btn');
+  const modeLabel  = document.getElementById('ql-editor-mode');
+  if (!editBtn) return;
+
+  if (_editMode) {
+    editBtn.style.display    = 'none';
+    saveBtn.style.display    = '';
+    discardBtn.style.display = '';
+    if (modeLabel) modeLabel.textContent = 'Editing';
+  } else {
+    editBtn.style.display    = '';
+    saveBtn.style.display    = 'none';
+    discardBtn.style.display = 'none';
+    if (modeLabel) modeLabel.textContent = 'Read-only';
+  }
+  setDirty(_editorDirty);
+}
+
+/** Switch the active CodeMirror view between read-only and editable. */
+function setEditorReadOnly(readOnly) {
+  if (!_cmView) return;
+  const cm = _cmModules;
+  if (!cm) return;
+  _cmView.dispatch({
+    effects: cm.EditorState.readOnly.reconfigure(readOnly),
+  });
+}
+
+// ── Find bar helpers ──────────────────────────────────────────────────────────
+
+let _findBarVisible = false;
+
+function showFindBar() {
+  // For CodeMirror text files, delegate to CM's built-in search panel
+  if (_cmView && _cmModules) {
+    cm_openSearch();
+    return;
+  }
+  // For other content (pre-rendered docs, archive listings)
+  const bar = document.getElementById('ql-find-bar');
+  if (!bar || _findBarVisible) return;
+  _findBarVisible = true;
+  bar.classList.add('visible');
+  const inp = document.getElementById('ql-find-input');
+  if (inp) { inp.value = ''; inp.focus(); }
+  document.getElementById('ql-find-count').textContent = '';
+  _findHighlights = [];
+  _findIdx = -1;
+}
+
+function hideFindBar() {
+  if (_cmView && _cmModules) {
+    _cmModules.closeSearchPanel(_cmView);
+    return;
+  }
+  _findBarVisible = false;
+  const bar = document.getElementById('ql-find-bar');
+  bar?.classList.remove('visible');
+  clearFindHighlights();
+}
+
+function cm_openSearch() {
+  if (_cmView && _cmModules) {
+    _cmModules.openSearchPanel(_cmView);
+    // Focus the CM search input (it's inside the editor DOM)
+    setTimeout(() => {
+      _cmView.dom.querySelector('.cm-search input[name=search]')?.focus();
+    }, 30);
+  }
+}
+
+// Simple DOM text search for non-CM content (pre / archive views)
+let _findHighlights = [];
+let _findIdx = -1;
+
+function clearFindHighlights() {
+  _findHighlights.forEach(m => {
+    if (m.parentNode) m.outerHTML = m.dataset.orig ?? m.textContent;
+  });
+  _findHighlights = [];
+  _findIdx = -1;
+}
+
+function runFindInPre(query) {
+  clearFindHighlights();
+  if (!query) { document.getElementById('ql-find-count').textContent = ''; return; }
+  const pre = qlBody.querySelector('pre');
+  if (!pre) return;
+
+  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(escaped, 'gi');
+  // Collect text node matches
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+
+  let count = 0;
+  for (const node of nodes) {
+    const text = node.textContent;
+    if (!re.test(text)) continue;
+    re.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0, m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+      const mark = document.createElement('mark');
+      mark.className = 'ql-find-match';
+      mark.dataset.orig = m[0];
+      mark.textContent = m[0];
+      frag.appendChild(mark);
+      _findHighlights.push(mark);
+      count++;
+      last = re.lastIndex;
+    }
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.replaceWith(frag);
+  }
+
+  const countEl = document.getElementById('ql-find-count');
+  if (countEl) countEl.textContent = count ? `${count} match${count === 1 ? '' : 'es'}` : 'No matches';
+  if (_findHighlights.length) scrollToMatch(0);
+}
+
+function scrollToMatch(idx) {
+  if (!_findHighlights.length) return;
+  _findIdx = ((idx % _findHighlights.length) + _findHighlights.length) % _findHighlights.length;
+  _findHighlights.forEach((m, i) => m.classList.toggle('ql-find-current', i === _findIdx));
+  _findHighlights[_findIdx]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const countEl = document.getElementById('ql-find-count');
+  if (countEl) countEl.textContent = `${_findIdx + 1} / ${_findHighlights.length}`;
+}
+
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const qlName  = document.getElementById('ql-name');
 const qlMeta  = document.getElementById('ql-meta');
@@ -149,6 +551,35 @@ async function renderEntry(entry) {
   // Wire open-externally button
   qlOpen.onclick = () => invoke('open_file', { path: entry.path }).catch(() => {});
 
+  // Open With… button — lists installed apps, picks one, opens
+  const qlOpenWith = document.getElementById('ql-open-with');
+  if(qlOpenWith){
+    qlOpenWith.onclick = async () => {
+      try{
+        const apps = await invoke('list_apps_for_file', {path: entry.path});
+        if(!apps || !apps.length){ alert('No applications found for this file type.'); return; }
+        // Build a quick picker overlay
+        const ow = document.createElement('div');
+        ow.style.cssText='position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);';
+        ow.innerHTML='<div style="background:#1e1e21;border:1px solid rgba(255,255,255,.13);border-radius:12px;padding:16px;min-width:280px;max-width:360px;max-height:60vh;display:flex;flex-direction:column;gap:8px;box-shadow:0 16px 48px rgba(0,0,0,.75);">' +
+          '<div style="font-size:13px;font-weight:600;color:#f1f5f9;margin-bottom:4px;">Open With</div>' +
+          apps.slice(0,15).map(a=>'<div class="ql-ow-row" data-exec="'+a.exec.replace(/"/g,'&quot;')+'" style="padding:7px 10px;border-radius:7px;cursor:pointer;font-size:12px;color:#e2e8f0;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);">'+a.name+'</div>').join('') +
+          '</div>';
+        document.body.appendChild(ow);
+        ow.querySelectorAll('.ql-ow-row').forEach(row=>{
+          row.addEventListener('mouseenter',()=>row.style.background='rgba(91,141,217,.18)');
+          row.addEventListener('mouseleave',()=>row.style.background='rgba(255,255,255,.03)');
+          row.addEventListener('click',async()=>{
+            ow.remove();
+            try{ await invoke('open_with_app',{path:entry.path, exec:row.dataset.exec}); }
+            catch(e){ console.error('Open with failed:',e); }
+          });
+        });
+        ow.addEventListener('click',ev=>{ if(ev.target===ow) ow.remove(); });
+      }catch(e){ console.error('list_apps_for_file failed:',e); }
+    };
+  }
+
   // Build body content
   const ext = entry.name.includes('.')
     ? entry.name.split('.').pop().toLowerCase()
@@ -160,7 +591,8 @@ async function renderEntry(entry) {
   const isPdf  = PDF_EXTS.includes(ext);
   const isHtml = HTML_EXTS.includes(ext);
   const isFont = FONT_EXTS.includes(ext);
-  const isDoc  = DOC_EXTS.includes(ext) || OFFICE_EXTS.includes(ext) || BOOK_EXTS.includes(ext);
+  const isText  = TEXT_EXTS.includes(ext);
+  const isDoc   = DOC_EXTS.includes(ext) || OFFICE_EXTS.includes(ext) || BOOK_EXTS.includes(ext);
 
   // Ensure media port is loaded before rendering media
   if ((isImg || isVid || isAud || isPdf || isHtml || isFont) && _mediaPort === null) {
@@ -173,6 +605,7 @@ async function renderEntry(entry) {
   // keeps playing detached audio/video elements. Calling stopAllMedia() first ensures
   // the old decoder is flushed before we clear the DOM.
   stopAllMedia();
+  destroyCM();
   qlBody.innerHTML = '';
 
   if (isImg) {
@@ -412,12 +845,40 @@ async function renderEntry(entry) {
       <div style="font-size:12px;color:#636368;margin-top:6px">${fmtSize(entry.size)}</div>`;
     qlBody.appendChild(wrap);
 
-  } else if (isDoc) {
+  } else if (TEXT_EXTS.includes(ext) || entry.name.toLowerCase() === 'makefile' || entry.name.toLowerCase() === 'dockerfile' || entry.name.startsWith('.')) {
+    // ── Inline editor for text / code files ──────────────────────────────
+    qlBody.innerHTML = '<span class="ql-loading">Loading…</span>';
+    invoke('read_text_file', { path: entry.path })
+      .then(rawContent => renderTextEditor(entry, rawContent))
+      .catch(err => {
+        // Oversized file or binary — fall back to get_file_preview text extract
+        invoke('get_file_preview', { path: entry.path }).then(pd => {
+          qlBody.innerHTML = '';
+          destroyCM();
+          if (pd?.content != null) {
+            const pre = document.createElement('pre');
+            pre.className = 'ql-pre-readonly';
+            pre.textContent = pd.content;
+            const note = document.createElement('div');
+            note.className = 'ql-size-note';
+            note.textContent = String(err);
+            qlBody.prepend(note);
+            qlBody.appendChild(pre);
+          } else {
+            renderUnknown(entry);
+          }
+        }).catch(() => renderUnknown(entry));
+      });
+
+  } else if (DOC_EXTS.includes(ext) && !TEXT_EXTS.includes(ext)) {
+    // ── Office/book document — text extraction via Rust ───────────────────
     qlBody.innerHTML = '<span class="ql-loading">Loading…</span>';
     invoke('get_file_preview', { path: entry.path }).then(pd => {
       qlBody.innerHTML = '';
+      destroyCM();
       if (pd?.content != null) {
         const pre = document.createElement('pre');
+        pre.className = 'ql-pre-readonly';
         pre.textContent = pd.content;
         qlBody.appendChild(pre);
       } else {
@@ -476,17 +937,64 @@ function launchMpvFullscreen(path) {
     });
 }
 
+// ── Editor bar button wiring ─────────────────────────────────────────────────
+
+document.getElementById('ql-edit-btn')?.addEventListener('click', () => {
+  if (!_cmView) return;
+  _editMode = true;
+  setEditorReadOnly(false);
+  updateEditorBarMode();
+  _cmView.focus();
+});
+
+document.getElementById('ql-save-btn')?.addEventListener('click', async () => {
+  if (!_cmView || !_currentEntry || !_editorDirty) return;
+  const content = _cmView.state.doc.toString();
+  const saveBtn = document.getElementById('ql-save-btn');
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+  try {
+    await invoke('write_text_file', { path: _currentEntry.path, content });
+    // Push undo entry to the main window so Ctrl+Z can revert the save
+    emit('ql-file-saved', { path: _currentEntry.path }).catch(() => {});
+    _draftClear(_currentEntry.path);
+    clearTimeout(_draftTimer);
+    setDirty(false);
+    const modeLabel = document.getElementById('ql-editor-mode');
+    if (modeLabel) { modeLabel.textContent = 'Saved ✓'; setTimeout(() => { if (modeLabel) modeLabel.textContent = 'Editing'; }, 1500); }
+  } catch (err) {
+    alert('Save failed: ' + err);
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+  }
+});
+
+document.getElementById('ql-discard-btn')?.addEventListener('click', () => {
+  if (!_currentEntry) return;
+  if (_editorDirty && !confirm('Discard unsaved changes?')) return;
+  _draftClear(_currentEntry.path);
+  clearTimeout(_draftTimer);
+  _editMode = false;
+  // Reload original content from disk
+  invoke('read_text_file', { path: _currentEntry.path })
+    .then(raw => renderTextEditor(_currentEntry, raw))
+    .catch(() => {});
+});
+
 // ── Navigation ────────────────────────────────────────────────────────────────
+function guardDirty() {
+  if (_editorDirty) return confirm('You have unsaved changes. Leave anyway?');
+  return true;
+}
+
 qlPrev.addEventListener('click', () => {
-  if (_curIdx > 0) {
+  if (_curIdx > 0 && guardDirty()) {
     _curIdx--;
     renderEntry(_navEntries[_curIdx]);
-    // Notify main window so its selection syncs
     emit('ql-nav', { idx: _curIdx }).catch(() => {});
   }
 });
 qlNext.addEventListener('click', () => {
-  if (_curIdx < _navEntries.length - 1) {
+  if (_curIdx < _navEntries.length - 1 && guardDirty()) {
     _curIdx++;
     renderEntry(_navEntries[_curIdx]);
     emit('ql-nav', { idx: _curIdx }).catch(() => {});
@@ -511,15 +1019,59 @@ function stopAllMedia() {
 
 // ── Close ─────────────────────────────────────────────────────────────────────
 function closeWindow() {
-  stopAllMedia();                    // ← stop audio before hiding — fixes ghost audio in hidden window
+  if (_editorDirty && !confirm('You have unsaved changes. Close anyway?')) return;
+  if (_currentEntry) { _draftClear(_currentEntry.path); clearTimeout(_draftTimer); }
+  stopAllMedia();
+  destroyCM();
   emit('ql-closed', {}).catch(() => {});
   appWindow.hide().catch(() => {});  // hide, not close — keep process warm for next Space press
 }
 qlClose.addEventListener('click', closeWindow);
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { e.preventDefault(); closeWindow(); return; }
+  // While the editor is in edit mode, let CodeMirror handle most keys naturally.
+  // Only intercept Escape (to exit edit mode or close) and Ctrl+F (find).
+  const inEditor = _editMode && _cmView;
+
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    if (_findBarVisible) { hideFindBar(); return; }
+    // If CM search panel is open, close it instead of the window
+    if (_cmView && _cmModules) {
+      const panel = _cmView.dom.querySelector('.cm-search');
+      if (panel) { _cmModules.closeSearchPanel(_cmView); return; }
+    }
+    if (_editMode) {
+      // Exit edit mode (prompt if dirty)
+      if (_editorDirty && !confirm('Discard unsaved changes?')) return;
+      _editMode = false;
+      setEditorReadOnly(true);
+      setDirty(false);
+      updateEditorBarMode();
+      return;
+    }
+    closeWindow();
+    return;
+  }
+
+  // Ctrl+F / Cmd+F — open find bar or CM search
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+    e.preventDefault();
+    showFindBar();
+    return;
+  }
+
+  // Ctrl+S — save from anywhere while in edit mode
+  if ((e.ctrlKey || e.metaKey) && e.key === 's' && _editMode) {
+    e.preventDefault();
+    document.getElementById('ql-save-btn')?.click();
+    return;
+  }
+
+  // Block Space and arrows from navigating while editor is focused
+  if (inEditor) return;
+
   if (e.key === ' ') {
-    // Space always dismisses the QL window (stopAllMedia inside closeWindow handles pausing).
+    // Space dismisses the QL window (stopAllMedia inside closeWindow handles pausing).
     e.preventDefault();
     closeWindow();
     return;
@@ -532,6 +1084,22 @@ document.addEventListener('keydown', e => {
     if (entry && VIDEO_EXTS.includes(ext)) launchMpvFullscreen(entry.path);
   }
 });
+
+// ── Find bar (for non-CM content) DOM event wiring ───────────────────────────
+document.getElementById('ql-find-input')?.addEventListener('input', e => {
+  runFindInPre(e.target.value.trim());
+});
+document.getElementById('ql-find-input')?.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    scrollToMatch(e.shiftKey ? _findIdx - 1 : _findIdx + 1);
+  }
+  if (e.key === 'Escape') { e.preventDefault(); hideFindBar(); }
+});
+document.getElementById('ql-find-bar-btn')?.addEventListener('click', () => showFindBar());
+document.getElementById('ql-find-prev')?.addEventListener('click', () => scrollToMatch(_findIdx - 1));
+document.getElementById('ql-find-next')?.addEventListener('click', () => scrollToMatch(_findIdx + 1));
+document.getElementById('ql-find-close')?.addEventListener('click', hideFindBar);
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 // Initial data is loaded by calling get_ql_payload() — the main window stored

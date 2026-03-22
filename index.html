@@ -4,8 +4,10 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>FrostFinder</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<!-- Inter loaded async — does not block JS startup -->
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap"></noscript>
 <link rel="stylesheet" href="/src/style.css">
 </head>
 <body>
@@ -21,21 +23,18 @@
   <div class="tab-bar" id="tab-bar"></div>
   <div class="window-body">
     <aside class="sidebar" id="sidebar"></aside>
-    <div id="sb-ops-progress" class="sb-ops-progress" style="display:none">
-      <div class="sb-ops-row">
-        <span class="sb-ops-label" id="sb-ops-label">Working…</span>
-        <span class="sb-ops-pct" id="sb-ops-pct">0%</span>
-      </div>
-      <div class="sb-ops-track">
-        <div class="sb-ops-bar" id="sb-ops-bar"></div>
-      </div>
-    </div>
+    <!-- r103: job queue container — children rendered dynamically by _sbProgress -->
+    <div id="sb-ops-progress" class="sb-ops-progress" style="display:none"></div>
     <div class="sb-resize-handle" id="sb-resize"></div>
     <div class="content">
       <div class="toolbar" id="toolbar"></div>
       <div class="trash-banner" id="trash-banner" style="display:none"></div>
       <div class="main-pane">
-        <div class="view-host" id="view-host"></div>
+        <div class="split-wrap" id="split-wrap">
+          <div class="view-host" id="view-host"></div>
+          <div class="split-divider" id="split-divider" style="display:none"></div>
+          <div class="view-host split-pane-b" id="pane-b" style="display:none"></div>
+        </div>
         <div class="preview-panel" id="preview-panel">
           <div class="preview-empty">Select a file to preview</div>
         </div>

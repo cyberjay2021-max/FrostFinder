@@ -53,13 +53,17 @@ export const I = {
   burn:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2c0 6-8 7-8 13a8 8 0 0 0 16 0c0-6-8-7-8-13z"/><path d="M12 12c0 3-3 4-3 6a3 3 0 0 0 6 0c0-2-3-3-3-6z" fill="currentColor" opacity=".35" stroke="none"/></svg>`,
   star:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
   starFilled:`<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+  server:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>`,
+  cloud:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>`,
 };
 
 // ── File type constants ───────────────────────────────────────────────────────
 export const IMAGE_EXTS  = ['png','jpg','jpeg','gif','webp','bmp','svg','ico','tiff','tif','heic','heif','xcf'];
-export const VIDEO_EXTS  = ['mp4','mkv','webm','avi','mov','ogv','m4v'];
+export const VIDEO_EXTS  = ['mp4','mkv','webm','avi','mov','ogv','m4v','flv','wmv','3gp'];
 export const AUDIO_EXTS  = ['mp3','flac','ogg','wav','aac','m4a','opus','weba'];
-export const DOC_EXTS    = ['md','txt','rs','js','ts','py','go','c','cpp','h','toml','json','yaml','yml','xml','css','sh','log','csv','rtf'];
+// TEXT_EXTS: files the inline editor can open (read_text_file + CodeMirror)
+export const TEXT_EXTS   = ['txt','md','rs','js','ts','jsx','tsx','py','go','c','cpp','h','hpp','cs','java','rb','php','swift','kt','toml','json','yaml','yml','xml','css','scss','less','sh','bash','zsh','fish','env','conf','cfg','ini','log','csv','lock','gitignore','dockerfile','svg','sql','lua','r','vim','el','html','htm'];
+export const DOC_EXTS    = [...TEXT_EXTS, 'rtf'];
 export const OFFICE_EXTS = ['doc','docx','xls','xlsx'];  // Office Open XML — text extracted in Rust
 export const BOOK_EXTS   = ['epub','mobi','azw','azw3']; // E-books — text extracted in Rust
 export const HTML_EXTS   = ['html','htm'];
@@ -77,7 +81,36 @@ export const TAG_COLORS = {
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 export const fmtSize = b => !b?'--':b<1024?b+'B':b<1048576?(b/1024).toFixed(1)+'KB':b<1073741824?(b/1048576).toFixed(1)+'MB':(b/1073741824).toFixed(1)+'GB';
-export const fmtDate = ts => !ts?'--':new Date(ts*1000).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'});
+// Date locale is set by initI18n() via setDateLocale() after the language is resolved.
+let _dateLocale = 'en-US';
+export function setDateLocale(lang) { _dateLocale = lang || 'en-US'; }
+// p8: smart relative timestamps
+// Today → "Today, 2:34 PM" | This week → "Tuesday" | This year → "Mar 21"
+// Older → "Mar 21, 2025" | hover title always shows full absolute time
+export function fmtDate(ts) {
+  if (!ts) return '--';
+  const d   = new Date(ts * 1000);
+  const now = new Date();
+  const diffMs  = now - d;
+  const diffMin = Math.floor(diffMs / 60000);
+  const diffH   = Math.floor(diffMs / 3600000);
+  const isToday = d.toDateString() === now.toDateString();
+  const isThisWeek = diffMs < 7 * 86400000 && d <= now;
+  const isThisYear = d.getFullYear() === now.getFullYear();
+  if (diffMin < 1)     return 'Just now';
+  if (diffMin < 60)    return diffMin + ' min ago';
+  if (isToday)         return 'Today, ' + d.toLocaleTimeString(_dateLocale, {hour:'2-digit', minute:'2-digit'});
+  if (isThisWeek)      return d.toLocaleDateString(_dateLocale, {weekday:'long'});
+  if (isThisYear)      return d.toLocaleDateString(_dateLocale, {month:'short', day:'numeric'});
+  return d.toLocaleDateString(_dateLocale, {month:'short', day:'numeric', year:'numeric'});
+}
+// Absolute timestamp for tooltip use
+export function fmtDateAbsolute(ts) {
+  if (!ts) return '--';
+  return new Date(ts * 1000).toLocaleString(_dateLocale, {
+    month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit'
+  });
+}
 export const escHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
 export function fileColor(e) {
@@ -130,34 +163,103 @@ export function fmtDriveSpace(d){
 // to the cold-start parse budget. Only the built-in SVG set is synchronous.
 // The theme-picker UI still exists so users aren't confused; it simply shows
 // "Built-in" as the only option until additional themes are added via disk load.
-const ICON_THEMES = {
-  builtin: {name:'Built-in', path:null},
-};
+// ── Icon Theme System ─────────────────────────────────────────────────────────
+// Supports the built-in SVG set plus user-supplied disk themes.
+// A disk theme is a folder of .svg files whose basenames match icon keys
+// (e.g. folder.svg, file.svg, img.svg …). Any unrecognised keys fall back
+// to the built-in set so partial themes work out of the box.
+//
+// Stored state:
+//   ff_iconTheme   — 'builtin' | 'disk:<folderPath>'
+//   ff_diskThemeSvgs — JSON: { [key]: <svg …/> }  (cached from last load)
 
-// ── localStorage migration: reset any stored theme key that is no longer valid
+const _BUILTIN_THEME_KEY = 'builtin';
 const _REMOVED_BUNDLED_THEMES = new Set(['kora','whitesur','whitesur_dark','whitesur_light','newaita']);
 
+// In-memory SVG override map for disk themes  { key → svg string }
+let _diskIcons = {};
 
-let _iconTheme = localStorage.getItem('ff_iconTheme')||'builtin';
-// Migrate any stored bundled-theme key that no longer exists back to builtin.
-if (_REMOVED_BUNDLED_THEMES.has(_iconTheme) || !ICON_THEMES[_iconTheme]) {
-  _iconTheme = 'builtin';
-  localStorage.setItem('ff_iconTheme','builtin');
+let _iconTheme = localStorage.getItem('ff_iconTheme') || _BUILTIN_THEME_KEY;
+if (_REMOVED_BUNDLED_THEMES.has(_iconTheme)) {
+  _iconTheme = _BUILTIN_THEME_KEY;
+  localStorage.setItem('ff_iconTheme', _BUILTIN_THEME_KEY);
+}
+
+// Restore cached disk theme SVGs from localStorage so icons load synchronously
+// without waiting for the Rust IPC scan on every launch.
+if (_iconTheme.startsWith('disk:')) {
+  try {
+    const cached = localStorage.getItem('ff_diskThemeSvgs');
+    if (cached) _diskIcons = JSON.parse(cached);
+  } catch (_) { _diskIcons = {}; }
 }
 
 let _renderCallback = null;
 export function setRenderCallback(fn){ _renderCallback=fn; }
 
-export function setIconTheme(themeKey){
-  if (!ICON_THEMES[themeKey]) themeKey = 'builtin';
+/**
+ * Switch to a named theme.
+ * themeKey: 'builtin' | 'disk:<absoluteFolderPath>'
+ * svgMap (optional): pre-loaded { key→svg } map for disk themes.
+ */
+export function setIconTheme(themeKey, svgMap = null) {
+  if (!themeKey || (_REMOVED_BUNDLED_THEMES.has(themeKey))) themeKey = _BUILTIN_THEME_KEY;
   _iconTheme = themeKey;
   localStorage.setItem('ff_iconTheme', themeKey);
+  if (themeKey === _BUILTIN_THEME_KEY) {
+    _diskIcons = {};
+    localStorage.removeItem('ff_diskThemeSvgs');
+  } else if (svgMap) {
+    _diskIcons = svgMap;
+    localStorage.setItem('ff_diskThemeSvgs', JSON.stringify(svgMap));
+  }
   _renderCallback?.();
 }
 
 export function getIcon(key){
-  // builtin — always synchronous, zero IPC, zero parse cost
-  return I[key]||I.file;
+  // Disk theme overrides first; fall back to built-in set
+  if (_diskIcons[key]) return _diskIcons[key];
+  return I[key] || I.file;
+}
+
+/**
+ * Load a disk theme from folderPath.
+ * Reads the cached SVG list from localStorage if available,
+ * then triggers a fresh scan via Tauri IPC and updates if anything changed.
+ * Returns { loaded: number, skipped: number } for UI feedback.
+ */
+export async function loadDiskTheme(folderPath) {
+  if (typeof window === 'undefined') return { loaded: 0, skipped: 0 };
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // scan_icon_folder returns [{ key, svg }] for matched icons
+    const hits = await invoke('scan_icon_folder', { folderPath });
+    if (!hits || !hits.length) return { loaded: 0, skipped: 0 };
+    const svgMap = {};
+    for (const { key, svg } of hits) { svgMap[key] = svg; }
+    setIconTheme('disk:' + folderPath, svgMap);
+    return { loaded: hits.length, skipped: 0 };
+  } catch (err) {
+    console.warn('loadDiskTheme error:', err);
+    return { loaded: 0, skipped: 0, error: String(err) };
+  }
+}
+
+export function getCurrentThemeName() {
+  if (_iconTheme === _BUILTIN_THEME_KEY) return 'Built-in';
+  if (_iconTheme.startsWith('disk:')) {
+    const folder = _iconTheme.slice(5);
+    return folder.split('/').pop() || folder;
+  }
+  return _iconTheme;
+}
+
+export function isUsingDiskTheme() {
+  return _iconTheme.startsWith('disk:');
+}
+
+export function getCurrentThemePath() {
+  return _iconTheme.startsWith('disk:') ? _iconTheme.slice(5) : null;
 }
 
 export function fileIcon(e){
@@ -226,15 +328,92 @@ export function showIconThemePicker(){
   if(existing){existing.remove();return;}
   const d=document.createElement('div');
   d.id='icon-theme-dialog';
-  d.style.cssText='position:fixed;top:90px;right:16px;z-index:5000;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:14px;min-width:220px;box-shadow:0 8px 32px rgba(0,0,0,.6);';
-  const themes=Object.entries(ICON_THEMES).map(([key,t])=>({key,name:t.name}));
-  d.innerHTML='<div style="font-size:11px;font-weight:600;color:#98989f;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Icon Theme</div>'
-    +themes.map(t=>`<div class="icon-theme-opt${t.key===_iconTheme?' active':''}" data-key="${t.key}" style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:7px;cursor:pointer;margin-bottom:2px;${t.key===_iconTheme?'background:var(--accent-blue);color:#fff;':'color:var(--text-primary);'}"><span style="font-size:13px">${t.name}</span>${t.key===_iconTheme?'<span style="margin-left:auto;font-size:11px">✓</span>':''}</div>`).join('');
+  d.style.cssText='position:fixed;top:90px;right:16px;z-index:5000;background:#2a2a2d;border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:14px;min-width:240px;box-shadow:0 8px 32px rgba(0,0,0,.6);';
+
+  const usingDisk = isUsingDiskTheme();
+  const diskName  = usingDisk ? getCurrentThemeName() : null;
+  const diskPath  = usingDisk ? getCurrentThemePath() : null;
+  const diskCount = usingDisk ? Object.keys(_diskIcons).length : 0;
+
+  d.innerHTML =
+    '<div style="font-size:11px;font-weight:600;color:#98989f;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Icon Theme</div>' +
+    // Built-in option
+    `<div class="icon-theme-opt${!usingDisk?' active':''}" id="itt-builtin" style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:7px;cursor:pointer;margin-bottom:2px;${!usingDisk?'background:var(--accent-blue);color:#fff;':'color:var(--text-primary);'}">` +
+      '<span style="font-size:13px">Built-in</span>' +
+      (!usingDisk?'<span style="margin-left:auto;font-size:11px">✓</span>':'') +
+    '</div>' +
+    // Current disk theme (if loaded) — with remove button
+    (usingDisk ? `<div style="display:flex;align-items:center;gap:4px;margin-bottom:2px;">` +
+      `<div class="icon-theme-opt active" id="itt-disk" style="display:flex;align-items:center;gap:8px;flex:1;padding:7px 10px;border-radius:7px;cursor:default;background:var(--accent-blue,#5b8dd9);color:#fff;">` +
+        `<span style="font-size:13px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${diskPath}">${diskName}</span>` +
+        `<span style="font-size:10px;opacity:.75">${diskCount} icons</span>` +
+        '<span style="margin-left:4px;font-size:11px">✓</span>' +
+      '</div>' +
+      `<button id="itt-remove" title="Remove this theme" style="flex-shrink:0;width:28px;height:28px;display:flex;align-items:center;justify-content:center;background:rgba(248,113,113,.12);color:#f87171;border:1px solid rgba(248,113,113,.25);border-radius:7px;cursor:pointer;font-size:13px;transition:background .12s;">✕</button>` +
+    '</div>' : '') +
+    // Separator + load button
+    '<div style="border-top:1px solid rgba(255,255,255,.07);margin:8px 0 6px"></div>' +
+    '<button id="itt-load" style="width:100%;padding:7px 10px;background:rgba(91,141,217,.12);color:#5b8dd9;border:1px solid rgba(91,141,217,.25);border-radius:7px;font-size:12px;cursor:pointer;text-align:left">📂 Load from folder…</button>' +
+    (usingDisk ? '<button id="itt-reload" style="width:100%;margin-top:4px;padding:6px 10px;background:rgba(255,255,255,.04);color:var(--text-secondary,#94a3b8);border:1px solid rgba(255,255,255,.08);border-radius:7px;font-size:11px;cursor:pointer;text-align:left">↻ Reload current theme</button>' : '') +
+    '<div id="itt-status" style="font-size:11px;color:#94a3b8;margin-top:6px;min-height:16px"></div>';
+
   document.body.appendChild(d);
-  d.querySelectorAll('.icon-theme-opt').forEach(el=>{
-    el.addEventListener('click',()=>{d.remove();setIconTheme(el.dataset.key);});
+
+  const status = d.querySelector('#itt-status');
+
+  // Built-in option click
+  d.querySelector('#itt-builtin')?.addEventListener('click', () => {
+    setIconTheme('builtin');
+    d.remove();
   });
-  setTimeout(()=>document.addEventListener('mousedown',function h(e){if(!e.target.closest('#icon-theme-dialog')){d.remove();document.removeEventListener('mousedown',h);}}),0);
+
+  // Load from folder button
+  d.querySelector('#itt-load')?.addEventListener('click', async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const folder = await open({ directory: true, title: 'Choose icon theme folder' });
+      if (!folder) return;
+      if (status) status.textContent = 'Scanning…';
+      const result = await loadDiskTheme(folder);
+      if (result.error) {
+        if (status) status.textContent = 'Error: ' + result.error;
+        return;
+      }
+      if (result.loaded === 0) {
+        if (status) { status.style.color='#f87171'; status.textContent = 'No matching icons found in that folder.'; }
+        return;
+      }
+      if (status) { status.style.color='#34d399'; status.textContent = `Loaded ${result.loaded} icons.`; }
+      setTimeout(() => d.remove(), 900);
+    } catch (err) {
+      if (status) { status.style.color='#f87171'; status.textContent = String(err); }
+    }
+  });
+
+  // Reload current disk theme
+  d.querySelector('#itt-reload')?.addEventListener('click', async () => {
+    const path = getCurrentThemePath();
+    if (!path) return;
+    if (status) status.textContent = 'Reloading…';
+    const result = await loadDiskTheme(path);
+    if (result.loaded > 0) {
+      if (status) { status.style.color='#34d399'; status.textContent = `Reloaded ${result.loaded} icons.`; }
+      setTimeout(() => d.remove(), 700);
+    } else {
+      if (status) { status.style.color='#f87171'; status.textContent = result.error || 'Reload failed.'; }
+    }
+  });
+
+  // Remove / unload current disk theme → switch back to Built-in
+  d.querySelector('#itt-remove')?.addEventListener('click', () => {
+    setIconTheme('builtin');
+    d.remove();
+  });
+
+  // Close on outside click
+  setTimeout(()=>document.addEventListener('mousedown',function h(e){
+    if(!e.target.closest('#icon-theme-dialog')){d.remove();document.removeEventListener('mousedown',h);}
+  }),0);
 }
 
 // ── Bookmarks System ────────────────────────────────────────────────────────────

@@ -1,100 +1,105 @@
-# Maintainer: FrostFinder <your@email.com>
-# AUR package for FrostFinder — build from source
-#
-# HOW TO USE:
-#   Install build deps once: sudo pacman -S rust nodejs npm webkit2gtk-4.1 gtk3 \
-#                                          base-devel libayatana-appindicator
-#   Then: makepkg -si
-#
-# Tauri v2 note: requires webkit2gtk-4.1 (replaces webkit2gtk / webkit2gtk-4.0).
-# Requires Rust >= 1.77 and Node.js >= 18.
-#
-# The build runs "npm run tauri build" which produces:
-#   .deb      → src-tauri/target/release/bundle/deb/
-#   .rpm      → src-tauri/target/release/bundle/rpm/
-#   .AppImage → src-tauri/target/release/bundle/appimage/
-#   The plain binary → src-tauri/target/release/frostfinder
-
+# Maintainer: FrostFinder contributors <https://github.com/frostfinder/frostfinder>
 pkgname=frostfinder
-pkgver=5.0.27
+pkgver=6.0.26
 pkgrel=1
-pkgdesc="A fast, modern column-based file manager inspired by macOS Finder"
+pkgdesc="A fast, modern file manager for Linux inspired by macOS Finder"
 arch=('x86_64')
 url="https://github.com/frostfinder/frostfinder"
 license=('GPL3')
-
-# Runtime dependencies (Tauri v2 — webkit2gtk-4.1)
 depends=(
     'webkit2gtk-4.1'
     'gtk3'
     'libayatana-appindicator'
+    'librsvg'
     'udisks2'
-    'hicolor-icon-theme'
 )
-
-# Build-time dependencies
 makedepends=(
     'rust'
     'cargo'
     'nodejs'
     'npm'
+    'patchelf'
+    'openssl'
     'base-devel'
-    'webkit2gtk-4.1'
 )
-
-# Optional runtime extras (not required, but improve functionality)
 optdepends=(
-    'ffmpeg: video transcoding + HEIC image support via heif-convert'
-    'libheif: HEIC/HEIF image preview (heif-convert command)'
+    'ffmpeg: video transcoding fallback for HEVC/H.265 and HEIC preview'
+    'libheif: better HEIC colour accuracy (primary decoder)'
     'mpv: external fullscreen video player'
-    'udisks2: one-click mount/unmount of ISO, DMG, USB drives'
-    'fuse2: required to run the .AppImage bundle'
+    'sshfs: SFTP remote filesystem support (Ctrl+Shift+F)'
+    'curlftpfs: FTP/FTPS remote filesystem support (Ctrl+Shift+P)'
+    'cifs-utils: SMB/CIFS network share support (Ctrl+Shift+S)'
+    'fuse2: required to run the .AppImage bundle directly'
+    'gocryptfs: encrypted vault support'
+    'rclone: Google Drive, Dropbox, OneDrive cloud storage (Ctrl+Shift+G)'
 )
-
-# ── Source ──────────────────────────────────────────────────────────────────
-# Replace the source line with a real tarball URL or git clone once published.
-# For local development, comment out source/sha256sums and uncomment the
-# local path variant below.
-source=("$pkgname-$pkgver.tar.gz::https://github.com/yourusername/frostfinder/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
-
-# ── Local development variant ────────────────────────────────────────────────
-# Uncomment these and comment out source/sha256sums above to build from
-# the directory containing this PKGBUILD (useful during development):
-#
-# source=()
-# sha256sums=()
-# prepare() { cp -r "$startdir/." "$srcdir/$pkgname-$pkgver/" 2>/dev/null || true; }
+source=("$pkgname-$pkgver.tar.gz::https://github.com/frostfinder/frostfinder/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')   # TODO before publishing: replace with output of: sha256sum frostfinder-5.0.77.tar.gz
 
 prepare() {
-    cd "$srcdir/$pkgname-$pkgver"
-    # Install JS dependencies (runs offline if node_modules already exists)
-    npm install --prefer-offline 2>/dev/null || npm install
+    cd "$pkgname-$pkgver"
+
+    export CARGO_HOME="$srcdir/cargo-home"
+    export npm_config_cache="$srcdir/npm-cache"
+
+    npm ci
+    cargo fetch --locked --manifest-path src-tauri/Cargo.toml
 }
 
 build() {
-    cd "$srcdir/$pkgname-$pkgver"
-    npm run tauri build
+    cd "$pkgname-$pkgver"
+
+    export CARGO_HOME="$srcdir/cargo-home"
+    export npm_config_cache="$srcdir/npm-cache"
+
+    # Suppress AppImage FUSE and eu-strip errors on Arch/CachyOS
+    export APPIMAGE_EXTRACT_AND_RUN=1
+    export NO_STRIP=1
+
+    npm run tauri build -- --bundles none
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+
+    export CARGO_HOME="$srcdir/cargo-home"
+
+    # Rust unit tests
+    cargo test --locked \
+        --manifest-path src-tauri/Cargo.toml \
+        -- --test-threads=4
+
+    # JS tests (requires the frontend build from build())
+    export npm_config_cache="$srcdir/npm-cache"
+    npm test
 }
 
 package() {
-    cd "$srcdir/$pkgname-$pkgver"
+    cd "$pkgname-$pkgver"
 
-    # ── Binary ────────────────────────────────────────────────────────────────
-    install -Dm755 "src-tauri/target/release/frostfinder" \
-        "$pkgdir/usr/bin/frostfinder"
+    # Binary
+    install -Dm755 "src-tauri/target/release/$pkgname" \
+        "$pkgdir/usr/bin/$pkgname"
 
-    # ── Desktop entry ─────────────────────────────────────────────────────────
+    # Desktop entry
     install -Dm644 "packaging/frostfinder.desktop" \
         "$pkgdir/usr/share/applications/frostfinder.desktop"
 
-    # ── Icons (hicolor theme sizes) ───────────────────────────────────────────
+    # AppStream metainfo
+    install -Dm644 "packaging/com.frostfinder.desktop.metainfo.xml" \
+        "$pkgdir/usr/share/metainfo/com.frostfinder.desktop.metainfo.xml"
+
+    # Icons — all hicolor sizes
     for size in 16 32 48 64 128 256 512; do
         install -Dm644 "src-tauri/icons/${size}x${size}.png" \
             "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/frostfinder.png"
     done
 
-    # ── License ───────────────────────────────────────────────────────────────
-    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE" \
-        2>/dev/null || true
+    # Scalable SVG icon
+    install -Dm644 "src-tauri/icons/icon.svg" \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/frostfinder.svg"
+
+    # Licence
+    install -Dm644 LICENSE \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

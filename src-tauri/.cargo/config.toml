@@ -1,22 +1,6 @@
-[build]
-rustflags = []
-
+# rustc segfaults (SIGSEGV) during macro expansion when given a very large
+# single file + a long tauri::generate_handler! list, because the default
+# stack is too small for the recursive AST traversal.
+# 16 MB stack is sufficient for this codebase.
 [env]
 RUST_MIN_STACK = "16777216"
-
-# ── AppImage bundling fixes for Arch / CachyOS ────────────────────────────────
-#
-# APPIMAGE_EXTRACT_AND_RUN=1
-#   appimagetool and linuxdeploy are themselves AppImages. On some Arch setups
-#   they fail to self-mount via FUSE even when libfuse2 is installed (socket path
-#   issues, mount namespace restrictions in systemd scope, etc.). This flag tells
-#   them to extract their squashfs to a temp dir and run directly — no FUSE mount
-#   needed. Safe on all systems; slightly slower first run.
-#
-# NO_STRIP=1
-#   Prevents linuxdeploy from calling eu-strip on bundled .so files. On Arch,
-#   eu-strip from elfutils errors on libraries built with newer GCC -ffile-prefix-map
-#   DWARF flags, killing appimage.sh with a non-zero exit. Skipping strip is safe —
-#   the binary is already stripped by cargo's release profile.
-APPIMAGE_EXTRACT_AND_RUN = "1"
-NO_STRIP = "1"
