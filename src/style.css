@@ -14,6 +14,7 @@
   --text-tertiary:#636368;
   --accent-blue:#5b8dd9;
   --preview-w:240px;
+  --preview-hidden:0;
   --font:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
   --icon-size:44px;
   --font-size-ui:13px;
