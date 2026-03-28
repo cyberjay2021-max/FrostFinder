@@ -50,10 +50,13 @@ if (typeof document !== 'undefined') {
       const ext = (entry.extension || '').toLowerCase();
       const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'tiff', 'tif', 'webp', 'heic', 'heif', 'gif', 'bmp'];
       const PDF_EXTS = ['pdf'];
+      const AUDIO_EXTS = ['mp3', 'flac', 'ogg', 'wav', 'aac', 'm4a', 'opus', 'weba'];
       if (IMAGE_EXTS.includes(ext)) {
         _showExifEditor(entry, null);
       } else if (PDF_EXTS.includes(ext)) {
         _showPdfMetaEditor(entry, null);
+      } else if (AUDIO_EXTS.includes(ext)) {
+        _showAudioTagEditor(entry, null);
       } else {
         d().showToast('No metadata editor for .' + ext + ' files', 'info');
       }
