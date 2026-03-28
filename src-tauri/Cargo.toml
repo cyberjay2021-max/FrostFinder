@@ -1,6 +1,6 @@
 [package]
 name = "frostfinder"
-version = "1.0.1-rc2"
+version = "1.0.1-rc3"
 description = "FrostFinder - A macOS Finder-inspired file manager"
 authors = ["you"]
 license = "GPL-3.0"
