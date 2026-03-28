@@ -30,8 +30,8 @@ const d = () => _deps;
 // ── Keyboard shortcuts for new features ────────────────────────────────────────
 if (typeof document !== 'undefined') {
   document.addEventListener('keydown', async (e) => {
-    // Ctrl+I: Properties (Edit EXIF/PDF metadata)
-    if (e.ctrlKey && e.key === 'I') {
+    // Ctrl+I: Properties (Edit EXIF/PDF/audio metadata)
+    if (e.ctrlKey && (e.key === 'i' || e.key === 'I')) {
       e.preventDefault();
       const { sel, state, getVisibleEntries } = d();
       const entries = getVisibleEntries();
