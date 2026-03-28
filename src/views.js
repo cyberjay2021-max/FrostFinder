@@ -24,12 +24,88 @@ function _fuzzyMatch(name, query) {
 
 // Injected by main.js
 let _deps = {};
-export function injectDeps(deps){ _deps = deps; appWindow = deps.appWindow || _getAppWindow(); }
+export function injectDeps(deps){ 
+  _deps = deps; 
+  appWindow = deps.appWindow || _getAppWindow(); 
+  _initPreviewPanel();
+}
 const d = () => _deps;
+
+// ── Preview Panel: Resize & Collapse ───────────────────────────────────────────
+function _initPreviewPanel() {
+  const panel = document.getElementById('preview-panel');
+  if (!panel) return;
+  
+  // Restore collapsed state
+  try {
+    const collapsed = localStorage.getItem('ff_preview_hidden') === '1';
+    if (collapsed) panel.style.display = 'none';
+  } catch {}
+  
+  // Add resize handle
+  let resizeHandle = document.getElementById('preview-resize-handle');
+  if (!resizeHandle) {
+    resizeHandle = document.createElement('div');
+    resizeHandle.id = 'preview-resize-handle';
+    panel.appendChild(resizeHandle);
+  }
+  
+  // Restore width
+  try {
+    const savedWidth = localStorage.getItem('ff_preview_width');
+    if (savedWidth) {
+      document.documentElement.style.setProperty('--preview-w', savedWidth + 'px');
+    }
+  } catch {}
+  
+  let isDragging = false;
+  let startX = 0;
+  let startWidth = 0;
+  
+  resizeHandle.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    startX = e.clientX;
+    startWidth = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--preview-w')) || 240;
+    resizeHandle.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    e.preventDefault();
+  });
+  
+  document.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - startX;
+    const newWidth = Math.max(180, Math.min(800, startWidth + dx));
+    document.documentElement.style.setProperty('--preview-w', newWidth + 'px');
+  });
+  
+  document.addEventListener('mouseup', () => {
+    if (!isDragging) return;
+    isDragging = false;
+    resizeHandle.classList.remove('dragging');
+    document.body.style.cursor = '';
+    // Save width
+    const w = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--preview-w')) || 240;
+    try { localStorage.setItem('ff_preview_width', w); } catch {}
+  });
+}
 
 // ── Keyboard shortcuts for new features ────────────────────────────────────────
 if (typeof document !== 'undefined') {
   document.addEventListener('keydown', async (e) => {
+    // Ctrl+P: Toggle Preview Panel
+    if (e.ctrlKey && (e.key === 'p' || e.key === 'P')) {
+      e.preventDefault();
+      const panel = document.getElementById('preview-panel');
+      if (panel) {
+        const isVisible = panel.style.display !== 'none';
+        panel.style.display = isVisible ? 'none' : '';
+        document.documentElement.style.setProperty('--preview-hidden', isVisible ? '1' : '0');
+        try { localStorage.setItem('ff_preview_hidden', isVisible ? '1' : '0'); } catch {}
+        d().render?.();
+      }
+      return;
+    }
+
     // Ctrl+I: Properties (Edit EXIF/PDF/audio metadata)
     if (e.ctrlKey && (e.key === 'i' || e.key === 'I')) {
       e.preventDefault();
