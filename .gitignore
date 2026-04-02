@@ -1,25 +1,6 @@
-# Dependencies
 node_modules/
-
-# Build output
 dist/
 src-tauri/target/
-src-tauri/gen/
-
-# IDE
-.vscode/
-.idea/
-
-# OS
+*.log
 .DS_Store
 Thumbs.db
-
-# Cache
-.vite/
-*.log
-
-# Backup
-BACKUP/
-
-# Git
-.git/

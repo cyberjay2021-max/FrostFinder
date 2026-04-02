@@ -58,12 +58,6 @@ struct DirWatcher {
 static ACTIVE_WATCHER: Mutex<Option<DirWatcher>> = Mutex::new(None);
 
 static MEDIA_PORT: AtomicU16 = AtomicU16::new(0);
-// Limit concurrent media-server handler threads to prevent OOM when the browser
-// fires rapid range requests (audio buffering / visualizer / seek probes).
-// 32 slots: enough for several simultaneous files + cover-art fetches + seeks.
-static MEDIA_ACTIVE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-const MEDIA_MAX_THREADS: usize = 32;
 static EXTRACT_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5162,28 +5156,7 @@ fn start_media_server() -> u16 {
             // GStreamer makes many small range requests during MKV demux and seek
             // probing; Nagle's algorithm can stall those for up to 200ms each.
             let _ = s.set_nodelay(true);
-            // Hard timeout: 30 s read, 30 s write.  Prevents hung connections
-            // from holding a thread indefinitely (e.g. client disconnects mid-seek).
-            let timeout = Some(std::time::Duration::from_secs(30));
-            let _ = s.set_read_timeout(timeout);
-            let _ = s.set_write_timeout(timeout);
-            // Drop the connection if we are already at the thread cap.
-            // The browser will retry immediately; 32 concurrent slots are more
-            // than enough for all range requests a single audio/video file plus
-            // cover-art fetches will ever need simultaneously.
-            if MEDIA_ACTIVE.load(Ordering::Relaxed) >= MEDIA_MAX_THREADS {
-                continue; // drop stream -> browser retries
-            }
-            MEDIA_ACTIVE.fetch_add(1, Ordering::Relaxed);
-            // 512 KB stack — the handler only needs a read buffer; the default
-            // 8 MB Linux thread stack is wasteful when hundreds of range requests
-            // arrive in rapid succession.
-            let _ = std::thread::Builder::new()
-                .stack_size(512 * 1024)
-                .spawn(move || {
-                    handle_media_request(&mut s);
-                    MEDIA_ACTIVE.fetch_sub(1, Ordering::Relaxed);
-                });
+            std::thread::spawn(move || handle_media_request(&mut s));
         }
     });
     port
@@ -8367,13 +8340,11 @@ fn main() {
         pub track: Option<String>,
         pub genre: Option<String>,
         pub comment: Option<String>,
-        #[serde(default)]
-        pub cover_url: Option<String>,
     }
 
     #[tauri::command]
     fn get_audio_tags(path: String) -> Result<AudioTags, String> {
-        use lofty::prelude::{Accessor as _, TaggedFileExt};
+        use lofty::prelude::{Accessor, TaggedFileExt};
         use lofty::probe::Probe;
 
         let tagged = Probe::open(&path)
@@ -8399,41 +8370,11 @@ fn main() {
             comment: tag
                 .get_string(&lofty::prelude::ItemKey::Comment)
                 .map(|s| s.to_owned()),
-            cover_url: None,
         })
     }
 
     #[tauri::command]
-    fn get_audio_cover(path: String) -> Result<Option<String>, String> {
-        use lofty::prelude::{Accessor, TaggedFileExt};
-        use lofty::probe::Probe;
-
-        let tagged = Probe::open(&path)
-            .map_err(|e| format!("Cannot open file: {e}"))?
-            .guess_file_type()
-            .map_err(|e| format!("Cannot guess type: {}", e))?
-            .read()
-            .map_err(|e| format!("Cannot read tags: {e}"))?;
-
-        let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-
-        // Find first picture (cover art)
-        let pictures = tag.pictures();
-        if let Some(pic) = pictures.first() {
-            let data = pic.data();
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-            return Ok(Some(format!("data:image/jpeg;base64,{}", b64)));
-        }
-
-        Ok(None)
-    }
-
-    #[tauri::command]
-    async fn write_audio_tags(path: String, tags: AudioTags) -> Result<(), String> {
+    fn write_audio_tags(path: String, tags: AudioTags) -> Result<(), String> {
         use lofty::prelude::{Accessor, AudioFile, TaggedFileExt};
         use lofty::probe::Probe;
 
@@ -8486,175 +8427,10 @@ fn main() {
             tag.insert_text(lofty::prelude::ItemKey::Comment, v.clone());
         }
 
-        // Download and embed cover art if URL provided
-        if let Some(cover_url) = &tags.cover_url {
-            if !cover_url.is_empty() {
-                match download_cover_art(cover_url).await {
-                    Ok(picture_data) => {
-                        let picture = lofty::picture::Picture::new_unchecked(
-                            lofty::picture::PictureType::CoverFront,
-                            None,
-                            None,
-                            picture_data,
-                        );
-                        tag.push_picture(picture);
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to download cover art: {}", e);
-                    }
-                }
-            }
-        }
-
         tagged
             .save_to_path(&path, lofty::config::WriteOptions::default())
             .map_err(|e| format!("Failed to write tags: {e}"))?;
         Ok(())
-    }
-
-    async fn download_cover_art(url: &str) -> Result<Vec<u8>, String> {
-        let client = reqwest::Client::new();
-        let response = client
-            .get(url)
-            .header("User-Agent", "FrostFinder/1.0")
-            .send()
-            .await
-            .map_err(|e| format!("Download failed: {}", e))?;
-        
-        if !response.status().is_success() {
-            return Err(format!("HTTP error: {}", response.status()));
-        }
-        
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| format!("Read bytes failed: {}", e))?;
-        
-        Ok(bytes.to_vec())
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════════
-    // Audio metadata lookup from MusicBrainz / Cover Art Archive
-    // ═══════════════════════════════════════════════════════════════════════════════
-
-    #[derive(Serialize, Deserialize)]
-    pub struct MusicSearchResult {
-        pub id: String,
-        pub title: String,
-        pub artist: String,
-        pub album: Option<String>,
-        pub year: Option<String>,
-        pub cover_url: Option<String>,
-    }
-
-    #[tauri::command]
-    async fn search_music_metadata(query: String) -> Result<Vec<MusicSearchResult>, String> {
-        let client = reqwest::Client::new();
-        
-        // Search MusicBrainz
-        let url = format!(
-            "https://musicbrainz.org/ws/2/recording?query={}&fmt=json&limit=10",
-            urlencoding::encode(&query)
-        );
-        
-        let response = client
-            .get(&url)
-            .header("User-Agent", "FrostFinder/1.0 (contact@example.com)")
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {e}"))?;
-        
-        let data: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {e}"))?;
-        
-        let recordings = data.get("recordings")
-            .and_then(|v| v.as_array())
-            .ok_or("No results found")?;
-        
-        let mut results = Vec::new();
-        
-        for rec in recordings.iter().take(10) {
-            let id = rec.get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            
-            let title = rec.get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            
-            let artist = rec.get("artist-credit")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Unknown Artist")
-                .to_string();
-            
-            let album = rec.get("releases")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.get("title"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            
-            let year = rec.get("releases")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.get("date"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.get(0..4))
-                .map(|s| s.to_string());
-            
-            // Cover Art Archive URL
-            let cover_url = if !id.is_empty() {
-                Some(format!("https://coverartarchive.org/release/{}/front-250", id))
-            } else {
-                None
-            };
-            
-            results.push(MusicSearchResult {
-                id,
-                title,
-                artist,
-                album,
-                year,
-                cover_url,
-            });
-        }
-        
-        Ok(results)
-    }
-
-    #[tauri::command]
-    async fn fetch_album_art(musicbrainz_id: String) -> Result<String, String> {
-        if musicbrainz_id.is_empty() {
-            return Err("No release ID".to_string());
-        }
-        
-        let client = reqwest::Client::new();
-        
-        // Try Cover Art Archive
-        let url = format!("https://coverartarchive.org/release/{}/front-250", musicbrainz_id);
-        
-        let response = client
-            .get(&url)
-            .header("User-Agent", "FrostFinder/1.0 (contact@example.com)")
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {e}"))?;
-        
-        if response.status().is_success() {
-            // Return the URL - frontend will use it directly
-            return Ok(url);
-        }
-        
-        // Try placeholder
-        Err("No cover art found".to_string())
     }
 
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -8671,10 +8447,6 @@ fn main() {
         pub gps_latitude: Option<f64>,
         pub gps_longitude: Option<f64>,
         pub gps_altitude: Option<f64>,
-        #[serde(rename = "ImageWidth")]
-        pub image_width: Option<u32>,
-        #[serde(rename = "ImageHeight")]
-        pub image_height: Option<u32>,
     }
 
     #[tauri::command]
@@ -8721,10 +8493,6 @@ fn main() {
             gps_latitude: get_rational(exif::Tag::GPSLatitude),
             gps_longitude: get_rational(exif::Tag::GPSLongitude),
             gps_altitude: get_rational(exif::Tag::GPSAltitude),
-            image_width: get_uint(exif::Tag::PixelXDimension)
-                .or_else(|| get_uint(exif::Tag::ImageWidth)),
-            image_height: get_uint(exif::Tag::PixelYDimension)
-                .or_else(|| get_uint(exif::Tag::ImageLength)),
         })
     }
 
@@ -10334,10 +10102,7 @@ fn main() {
             get_file_meta_exif,
             write_file_meta_exif,
             get_audio_tags,
-            get_audio_cover,
             write_audio_tags,
-            search_music_metadata,
-            fetch_album_art,
             get_exif_tags,
             write_exif_tags,
             get_pdf_meta,

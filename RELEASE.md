@@ -1,45 +1,29 @@
-## What's in v1.0.1-RC2-R3 — Native EXIF/PDF metadata + Audio features
+## What's in v1.0.1-RC2-R3 — Native EXIF and PDF metadata (no exiftool)
 
-**Files changed:** Multiple source files
+**Files changed:** `src-tauri/Cargo.toml`, `src-tauri/src/main.rs`, `src/views.js`, `src/types/tauri-commands.d.ts`
 **Rust recompile required:** Yes
-**Date:** 2026-03-29
 
 | Build | Status | Version | Revision | Date |
 |-------|--------|---------|----------|------|
-| FrostFinder-v1_0_1-RC2-R3-2026-03-29 | rc2 | 1.0.1-RC2 | R3 | 2026-03-29 |
+| FrostFinder-v1_0_1-RC2-R3-2026-03-28 | rc2 | 1.0.1-RC2 | R3 | 2026-03-28 |
 
 ### Fix — Native EXIF metadata (no exiftool dependency)
 
-**Problem:** EXIF image metadata and PDF metadata editors required `exiftool` as an external system dependency.
+**Problem:** EXIF image metadata and PDF metadata editors required `exiftool` as an external system dependency. Users without exiftool installed saw error messages and could not edit metadata.
 
-**Fix:** Added native Rust implementations:
+**Fix:** Added native Rust implementations using pure-Rust crates:
 - `kamadak-exif` for EXIF reading (JPEG/PNG)
 - `lopdf` for PDF metadata read/write
-- `reqwest` + `urlencoding` for HTTP requests
-- `base64` for cover art encoding
-- New commands: `get_exif_tags`, `write_exif_tags`, `get_pdf_meta`, `write_pdf_meta`, `search_music_metadata`, `fetch_album_art`, `get_audio_cover`
+- New Tauri commands: `get_exif_tags`, `write_exif_tags`, `get_pdf_meta`, `write_pdf_meta`
 
-### Feature — Collapsible/Resizable Preview Panel
+**Fields supported:**
+- EXIF: DateTimeOriginal, Make, Model, Orientation, GPS (lat/lon/alt)
+- PDF: Title, Author, Subject, Keywords
 
-- **Ctrl+P** toggles preview panel
-- Drag resize handle on left edge (180px-800px)
-- Width and state saved to localStorage
-
-### Feature — Audio Metadata Search
-
-- Search MusicBrainz database from audio tag editor
-- Shows album cover thumbnails
-- Auto-fills: title, artist, album, year
-
-### Feature — Album Cover Embedding
-
-- Downloads cover from Cover Art Archive
-- Embeds into audio file (MP3/FLAC/etc.)
-- Displays cover in Gallery View instead of music icon
-
-### Feature — Ctrl+i Shortcut
-
-- Opens metadata editor for selected file (images, audio, PDF)
+**Changes:**
+- Updated JS (`views.js`) to call new native commands instead of `get_file_meta_exif`/`write_file_meta_exif`
+- Error messages updated — no longer mention exiftool
+- Removed Orientation dropdown from EXIF editor (not supported by kamadak-exif for writing)
 
 ---
 
@@ -9797,82 +9781,3 @@ frostfinder/
 └── index.html
 ```
 
-## v1.0.1-RC2-R4 — 2026-04-02
-
-### Bug fixes
-- **JS syntax: `#adv-save` async handler** — `click` listener in the advanced-search save
-  flow was missing `async`, causing a runtime "await outside async function" error that
-  crashed the Vite dev build entirely.
-- **JS syntax: `#btn-restore-trash` listener** — a bad edit left the restore-selected
-  listener wired as `});?.addEventListener(...)` (the `document.getElementById(...)` call
-  was dropped), producing an invalid-token parse error.
-- **JS syntax: missing `});` in `renderTrashBanner`** — the empty-trash `click` handler
-  inside the `.then()` block was never closed before the restore listener began, and the
-  `.catch()` block was missing its own closing `});`, leaving two unclosed call-expression
-  arguments.
-- **JS syntax: missing `}` closing `showContextMenu`** — the `showContextMenu` function
-  body was never closed before `closeContextMenu` was declared, making every subsequent
-  function declaration nested one level deep and causing an "Unexpected end of input" error
-  at the module EOF. All four errors were pre-existing and prevented the Vite frontend from
-  loading.
-
-## v1.0.1-RC2-R5 — 2026-04-02
-
-### Bug fixes
-- **Media server OOM crash (system-level)** — the media HTTP server spawned one
-  unbounded OS thread per TCP connection with no cap and no socket timeout.
-  Audio playback drives a burst of range requests (initial probe, buffer chunks,
-  seek probes, Web Audio API intercepts); rapid seeking could create hundreds of
-  threads within seconds, exhausting virtual memory and crashing the system via
-  the OOM killer.  Fixed with three changes in `start_media_server()`:
-  - **Thread cap**: `MEDIA_ACTIVE` atomic counter + `MEDIA_MAX_THREADS = 32`;
-    connections are dropped (browser retries) when the cap is reached.
-  - **Socket timeouts**: 30 s read + write timeout on every connection so hung
-    clients (disconnected mid-seek) release their thread promptly.
-  - **512 KB stack**: `thread::Builder::stack_size(512 * 1024)` replaces the
-    8 MB Linux default, reducing per-thread virtual memory by 16x.
-
-  **Requires Rust recompile.**
-## v1.0.1-RC2-R6 — 2026-04-02
-
-### Improvements
-- **Office file previews wired** — DOCX, XLSX, PPTX, ODT, ODS, ODP files now
-  attempt a LibreOffice → PDF conversion via `get_office_preview`. If LibreOffice
-  is installed the preview panel (and gallery) upgrades from raw extracted text to
-  a full-fidelity PDF iframe. Without LibreOffice the text-extraction fallback is
-  still shown, now with a labelled banner ("Word Document — text preview") and an
-  "Install LibreOffice for full preview" hint.
-- **Image dimensions no longer depend on `exiftool`** — `loadPreview` now calls
-  `get_exif_tags` (native `kamadak-exif`) instead of `get_file_meta_exif`
-  (exiftool subprocess) to read `ImageWidth`/`ImageHeight` for the preview panel.
-  `ExifData` extended with `image_width` / `image_height` from EXIF tags
-  `PixelXDimension` / `PixelYDimension` (with `ImageWidth` / `ImageLength` fallback).
-- **Suppressed `unused import: Accessor` build warning** in `get_audio_tags`; renamed
-  to `Accessor as _` to keep the trait in scope without the lint.
-
-### Requires Rust recompile
-`src-tauri/src/main.rs` — `ExifData` struct and `get_exif_tags` extended.
-## v1.0.1-RC2-R7 — 2026-04-02
-
-### Bug fixes
-- **Drag-and-drop column update lag** — both source and destination columns now
-  update immediately on drop, without waiting for the full file operation to
-  finish. Previously both columns stayed stale until the entire move/copy
-  completed (could be seconds for large files).
-
-  Two-part fix in `setupDropTarget`'s drop handler (`src/main.js`):
-
-  - **Optimistic source remove (move only)**: the dragged entries are
-    immediately spliced out of `state.columns` (and pane B if it is showing
-    the same directory) and `render()` is called before `invoke()` fires.
-    If the op is cancelled or errors, `refreshColumns()` at the end restores
-    the correct state.
-  - **Optimistic destination refresh**: a `list_directory_fast` IPC call for
-    the destination path is fired concurrently with the Rust file op (not
-    awaited), updating the dest column (and pane B) as soon as the OS flush
-    is visible — typically within one round-trip (~5–20 ms), well before
-    `ddDone` resolves. `refreshColumns()` after completion reconciles any
-    ordering or metadata differences.
-
-  No-op if the destination column is not currently open. Covers both
-  main-pane columns and split-pane (pane B). No Rust changes required.

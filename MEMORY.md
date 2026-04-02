@@ -95,9 +95,6 @@ npm run test:watch
 - Gallery slideshow progress bar
 - Column view sort indicator (click cycles Name/Date/Size/Kind)
 - Preview panel drag-to-resize (5px handle, saves ff_preview_w)
-- Preview panel toggle (Ctrl+P), resize via drag handle (180-800px), state saved to localStorage
-- Metadata editor (Ctrl+i) — Edit EXIF for images, audio tags, PDF metadata
-- Audio metadata search (in metadata editor) — Search MusicBrainz database, fetch album covers
 - Multi-window title disambiguation (BroadcastChannel numbering)
 - Undo (Ctrl+Z) + Undo History Panel (Ctrl+Shift+Z)
 - Tabs (Ctrl+T) — multiple tabs with independent state
@@ -172,9 +169,6 @@ Orphan management targets the SQLite store (most tags are written there via v2 A
 |---|---|
 | `get_audio_tags(path)` | Returns `{title,artist,album,year,track,genre,comment}` via lofty — no exiftool |
 | `write_audio_tags(path, tags)` | Writes changed audio tags natively; creates tag block if absent |
-| `get_audio_cover(path)` | Returns base64-encoded cover art or null |
-| `search_music_metadata(query)` | Searches MusicBrainz API, returns title/artist/album/year/cover_url |
-| `fetch_album_art(musicbrainz_id)` | Fetches cover image URL from Cover Art Archive |
 | `get_exif_tags(path)` | Returns `{DateTimeOriginal,Make,Model,Orientation,GPSLatitude,GPSLongitude,GPSAltitude}` via kamadak-exif — no exiftool |
 | `write_exif_tags(path, fields)` | Writes EXIF to JPEG/PNG natively; supports DateTimeOriginal, Make, Model, GPS |
 | `get_pdf_meta(path)` | Returns `{Title,Author,Subject,Keywords}` via lopdf — no exiftool |
@@ -300,8 +294,6 @@ Total: 196 test cases across 38 suites.
 
 
 ## Last Audit
-- Date: 2026-03-29 (v1.0.1-RC2-R3) — Audio metadata search + album covers + preview panel improvements
-- R3 (RC2): (1) Added MusicBrainz search in audio tag editor - search for songs online and auto-fill metadata; (2) Album cover embedding - downloads cover from Cover Art Archive and embeds into audio file; (3) Album cover display - Gallery View shows embedded cover instead of music icon; (4) Added Ctrl+P to toggle preview panel; (5) Preview panel resize with drag handle (180-800px); (6) Added reqwest, urlencoding, base64 to Cargo.toml; (7) Updated AGENTS.md backup command to include build.rs, capabilities, gen, icons
 - Date: 2026-03-28 (v1.0.1-RC2-R3) — Native EXIF and PDF metadata (no exiftool)
 - R3 (RC2): EXIF and PDF metadata editors now use native Rust — kamadak-exif for EXIF reading, lopdf for PDF read/write; new commands: get_exif_tags, write_exif_tags, get_pdf_meta, write_pdf_meta; JS updated to call new commands; error messages no longer mention exiftool; kamadak-exif and lopdf added to Cargo.toml
 - Date: 2026-03-28 (v1.0.1-RC2-R2) — Add missing build.rs

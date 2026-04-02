@@ -523,7 +523,6 @@ function makeTabState(path=''){
 }
 const tabs=[{id:1,label:'New Tab',state:makeTabState()}];
 let activeTabId=1,_tabIdCounter=1;
-const _closedTabs = []; // stack of {label, path} for reopen
 function getActiveTab(){return tabs.find(t=>t.id===activeTabId)||tabs[0];}
 
 function newTab(path=''){
@@ -533,17 +532,8 @@ function newTab(path=''){
   if(path)navigate(path,0,true).catch(()=>{});
   else invoke('get_home_dir').then(h=>navigate(h,0,true)).catch(()=>{});
 }
-function reopenLastTab(){
-  if(!_closedTabs.length){showToast('No recently closed tabs','info');return;}
-  const {path}=_closedTabs.pop();
-  newTab(path||'');
-}
 function closeTab(id){
   const idx=tabs.findIndex(t=>t.id===id);if(idx<0)return;
-  // Save to recently-closed stack (keep last 10)
-  const closing=tabs[idx];
-  _closedTabs.push({label:closing.label,path:closing.state?.currentPath||''});
-  if(_closedTabs.length>10)_closedTabs.shift();
   if(tabs.length===1){
     const newId=(_tabIdCounter+1);
     _tabIdCounter++;
@@ -675,20 +665,14 @@ function renderTabs(){
   bar.innerHTML='';
   const _tabDragState = { srcIdx: -1, dragging: false };
   tabs.forEach((tab,idx)=>{
-    const el=document.createElement('div');el.className='tab'+(tab.id===activeTabId?' active':'');el.dataset.id=tab.id;el.draggable=true;
-    // Fix 5: full path tooltip on hover
-    el.title=tab.path||tab.label||'New Tab';
-    el.ondragstart=()=>{_tabDragState.srcIdx=idx;_tabDragState.dragging=true;};el.ondragend=()=>{_tabDragState.dragging=false;_tabDragState.srcIdx=-1;};
+    const el=document.createElement('div');el.className='tab'+(tab.id===activeTabId?' active':'');el.dataset.id=tab.id;el.draggable=true;el.ondragstart=()=>{_tabDragState.srcIdx=idx;_tabDragState.dragging=true;};el.ondragend=()=>{_tabDragState.dragging=false;_tabDragState.srcIdx=-1;};
     const lbl=document.createElement('span');lbl.className='tab-label';lbl.textContent=tab.label||'New Tab';
     const cls=document.createElement('button');cls.className='tab-close';cls.innerHTML='<svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg>';
     cls.addEventListener('click',ev=>{ev.stopPropagation();closeTab(tab.id);});
     el.appendChild(lbl);el.appendChild(cls);
     el.addEventListener('click',e=>{if(_tabDragState.dragging)return;if(activeTabId!==tab.id)switchTab(tab.id);});
-    // Fix 1: middle-click closes tab
-    el.addEventListener('auxclick',e=>{if(e.button===1){e.preventDefault();e.stopPropagation();closeTab(tab.id);}});
-    el.ondragover=e=>{e.preventDefault();e.dataTransfer.dropEffect='move';el.classList.add('tab-drag-over');};
-    el.addEventListener('dragleave',()=>el.classList.remove('tab-drag-over'));
-    el.ondrop=e=>{e.preventDefault();e.stopPropagation();el.classList.remove('tab-drag-over');const srcIdx=_tabDragState.srcIdx;if(srcIdx===-1||srcIdx===idx)return;const[moved]=tabs.splice(srcIdx,1);tabs.splice(idx,0,moved);syncState();renderTabs();};
+    el.ondragover=e=>{e.preventDefault();e.dataTransfer.dropEffect='move';};
+    el.ondrop=e=>{e.preventDefault();e.stopPropagation();const srcIdx=_tabDragState.srcIdx;if(srcIdx===-1||srcIdx===idx)return;const[moved]=tabs.splice(srcIdx,1);tabs.splice(idx,0,moved);syncState();renderTabs();};
     bar.appendChild(el);
   });
   const addBtn=document.createElement('button');addBtn.className='tab-new-btn';addBtn.title='New tab (Ctrl+T)';
@@ -1008,28 +992,9 @@ async function navigate(path, colIdx=0, addHistory=true){
   // Warn if cut files will be lost — cut entries only survive a single paste
   if(state.clipboard.op==='cut'&&state.clipboard.entries.length>0&&path!==state.currentPath){
     const n=state.clipboard.entries.length;
-    // Use a Promise so the async navigate() can await the user's choice
-    const confirmed = await new Promise(resolve => {
-      _showDangerModal({
-        title: 'Clear Clipboard?',
-        message: `You have ${n} cut file${n>1?'s':''} pending. Navigating away will clear the clipboard.`,
-        icon: '✂️',
-        confirmLabel: 'Continue',
-        onConfirm: () => resolve(true),
-      });
-      // Cancel resolves false — patch the modal's cancel btn
-      requestAnimationFrame(() => {
-        const cancelBtn = document.querySelector('#ff-danger-modal #ff-dm-cancel');
-        if (cancelBtn) { const orig = cancelBtn.onclick; cancelBtn.onclick = () => { orig?.call(cancelBtn); resolve(false); }; }
-        // Also resolve false on backdrop click / Escape
-        const modal = document.getElementById('ff-danger-modal');
-        if (modal) {
-          const origMd = modal.onmousedown;
-          modal.onmousedown = (e) => { if(e.target===modal){resolve(false);}origMd?.call(modal,e); };
-        }
-      });
-    });
-    if(!confirmed) return;
+    if(!confirm(`You have ${n} cut file${n>1?'s':''} pending. Navigating away will clear the clipboard.\n\nContinue?`)){
+      return;
+    }
     state.clipboard={entries:[],op:'copy'};
   }
   const mySeq=++_navSeq;
@@ -1310,7 +1275,6 @@ function getVisibleEntries(){
       if(state.currentPath&&state.currentPath.includes('/.local/share/Trash'))
         e=e.filter(x=>!x.name.endsWith('.trashinfo'));
       if(state.search){const q=state.search.toLowerCase();e=e.filter(x=>x.name.toLowerCase().includes(q));}
-      if(state._localFilter){const q=state._localFilter;e=e.filter(x=>x.name.toLowerCase().includes(q));}
       const s=sortEntries(e);sel._e=s;return s;
     }
   }
@@ -1578,33 +1542,6 @@ function showContextMenu(x,y,items){
   menu.style.left=clampedLeft+'px';
   menu.style.top=clampedTop+'px';
   setTimeout(()=>document.addEventListener('mousedown',closeContextMenuOutside),0);
-  // Keyboard navigation: arrows move focus, Enter activates, Escape closes
-  const _items = [...menu.querySelectorAll('.ctx-item:not(.disabled)')];
-  let _focusIdx = -1;
-  const _focusItem = (idx) => {
-    _items.forEach((el,i)=>{
-      el.classList.toggle('ctx-kb-focus', i===idx);
-      if(i===idx) el.scrollIntoView({block:'nearest'});
-    });
-    _focusIdx = idx;
-  };
-  const _kbHandler = (e) => {
-    if(!document.getElementById('ctx-menu')) return;
-    if(e.key==='ArrowDown'){e.preventDefault();e.stopPropagation();_focusItem(Math.min(_focusIdx+1,_items.length-1)<0?0:Math.min(_focusIdx+1,_items.length-1));return;}
-    if(e.key==='ArrowUp'){e.preventDefault();e.stopPropagation();_focusItem(Math.max(_focusIdx-1,0));return;}
-    if(e.key==='Enter'&&_focusIdx>=0){e.preventDefault();e.stopPropagation();_items[_focusIdx]?.click();return;}
-    if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeContextMenu();return;}
-  };
-  document.addEventListener('keydown',_kbHandler,{capture:true});
-  // Clean up kb handler when menu closes
-  const _origClose = closeContextMenu;
-  menu.dataset.kbWired='1';
-  const _cleanKb = ()=>document.removeEventListener('keydown',_kbHandler,{capture:true});
-  menu.addEventListener('remove',_cleanKb);
-  // Patch: also clean up when closeContextMenu removes the element
-  const _closeObs = new MutationObserver(()=>{ if(!document.getElementById('ctx-menu'))_cleanKb(); });
-  _closeObs.observe(document.body,{childList:true});
-  setTimeout(()=>_closeObs.disconnect(),30000);
 }
 function closeContextMenu(){document.getElementById('ctx-menu')?.remove();document.removeEventListener('mousedown',closeContextMenuOutside);}
 function closeContextMenuOutside(e){if(!e.target.closest('#ctx-menu'))closeContextMenu();}
@@ -1619,11 +1556,6 @@ async function ctxAction(action){
   }
   switch(action){
     case 'open':{const e=getSelectedEntry();if(e){if(e.is_dir)navigate(e.path,0);else invoke('open_file',{path:e.path}).catch(()=>{});}break;}
-    case '_bg-select-all': {
-      const _bgE=getVisibleEntries();
-      sel._paths.clear(); _bgE.forEach(en=>sel._paths.add(en.path));
-      sel.last=_bgE.length-1; state.selIdx=_bgE.length-1; render(); break;
-    }
     case 'open-new-tab':{const e=getSelectedEntry();if(e&&e.is_dir)newTab(e.path);break;}
     case 'copy':{const es=getSelectedEntries();if(es.length)clipboardCopy(es);break;}
     case 'cut':{const es=getSelectedEntries();if(es.length)clipboardCut(es);break;}
@@ -1640,49 +1572,7 @@ async function ctxAction(action){
     case 'new-rs':promptCreateDoc('rust','.rs');break;
     case 'new-py':promptCreateDoc('python','.py');break;
     case 'new-sh':promptCreateDoc('shell','.sh');break;
-    case '_sb-new-window': {
-      const p = window._sbCtxPath;
-      if(p) openNewWindow(p);
-      break;
-    }
-    case '_sb-terminal': {
-      const p = window._sbCtxPath || state.currentPath;
-      invoke('open_terminal',{path:p}).catch(err=>showToast(t('error.terminal',{err}),'error'));
-      break;
-    }
-    case '_sb-new-tab': {
-      const p = window._sbCtxPath;
-      if(p) newTab(p);
-      break;
-    }
-    case '_sb-copy-path': {
-      const p = window._sbCtxPath;
-      if(p) navigator.clipboard.writeText(p).then(()=>showToast('Path copied','info')).catch(()=>{});
-      break;
-    }
     case 'copy-path':{const e=getSelectedEntry();if(e)navigator.clipboard.writeText(e.path).then(()=>showToast(t('toast.path_copied'),'info')).catch(()=>showToast(e.path,'info'));break;}
-    case 'copy-paths-multi':{
-      const paths=getSelectedEntries().map(e=>e.path).join('\n');
-      navigator.clipboard.writeText(paths).then(()=>showToast(`${getSelectedEntries().length} paths copied`,'info')).catch(()=>{});
-      break;
-    }
-    case 'copy-path-uri':{const e=getSelectedEntry();if(e)navigator.clipboard.writeText('file://'+e.path).then(()=>showToast('URI copied','info')).catch(()=>{});break;}
-    case 'copy-path-home-rel':{
-      const e=getSelectedEntry();
-      if(e){
-        const home=state.sidebarData?.favorites?.find(f=>f.icon==='home')?.path||'';
-        const rel=home&&e.path.startsWith(home)?'~'+e.path.slice(home.length):e.path;
-        navigator.clipboard.writeText(rel).then(()=>showToast('Relative path copied','info')).catch(()=>{});
-      }
-      break;
-    }
-    case 'copy-filename':{const e=getSelectedEntry();if(e)navigator.clipboard.writeText(e.name).then(()=>showToast('Filename copied','info')).catch(()=>{});break;}
-    case 'invert-selection':{
-      const _allE=getVisibleEntries();
-      const _newPaths=new Set(_allE.filter(e=>!sel._paths.has(e.path)).map(e=>e.path));
-      sel._paths=_newPaths; sel.last=_allE.findIndex(e=>_newPaths.has(e.path));
-      state.selIdx=sel.last; render(); break;
-    }
     case 'add-sidebar':{const e=getSelectedEntry();if(e&&e.is_dir)addSidebarFav(e.path,e.name);break;}
     case 'open-terminal':{const e=getSelectedEntry();const p=e?.is_dir?e.path:state.currentPath;invoke('open_terminal',{path:p}).catch(err=>showToast(t('error.terminal',{err}),'error'));break;}
     case 'open-editor':{const e=getSelectedEntry();if(e&&!e.is_dir)invoke('open_in_editor',{path:e.path}).catch(err=>showToast(t('error.editor',{err}),'error'));break;}
@@ -1728,7 +1618,7 @@ async function ctxAction(action){
     case 'secure-delete':{
       const e=getSelectedEntry();
       if(e&&!e.is_dir){
-        if(!await new Promise(resolve=>{ _showDangerModal({title:'Secure Delete',message:'This file will be permanently overwritten and cannot be recovered!\n\nFile: '+e.name,icon:'⚠️',confirmLabel:'Securely Delete',onConfirm:()=>resolve(true)}); requestAnimationFrame(()=>{document.querySelector('#ff-danger-modal #ff-dm-cancel')?.addEventListener('click',()=>resolve(false),{once:true});}); }))break;
+        if(!confirm('SECURE DELETE: This file will be permanently overwritten and cannot be recovered!\n\nFile: '+e.name+'\n\nAre you sure?'))break;
         const passes=3;
         _sbProgress.start('Securely deleting '+e.name+'…', passes);
         let sdUnlisten;
@@ -1805,13 +1695,8 @@ async function ctxAction(action){
       break;
     }
     case 'empty-trash':{
-      _showDangerModal({
-        title: 'Empty Trash',
-        message: 'Permanently delete all items in Trash? This action cannot be undone.',
-        icon: '🗑️',
-        confirmLabel: 'Empty Trash',
-        onConfirm: () => _emptyTrashWithProgress().catch(err=>showToast(t('toast.trash_empty_failed',{err}),'error'))
-      });
+      if(!confirm('Permanently delete all items in Trash? This cannot be undone.'))break;
+      _emptyTrashWithProgress().catch(err=>showToast(t('toast.trash_empty_failed',{err}),'error'));
       break;
     }
   }
@@ -1888,7 +1773,7 @@ function _showDuplicatesPanel(dups, dirName) {
   list.querySelectorAll('.ff-dup-del-btn').forEach(btn => {
     btn.addEventListener('click', async () => {
       const path = btn.dataset.path;
-      if (!await new Promise(resolve => { _showDangerModal({title:'Delete Duplicate',message:'Delete:\n'+path+'\n\nThis cannot be undone.',icon:'🗑️',confirmLabel:'Delete',onConfirm:()=>resolve(true)}); requestAnimationFrame(()=>{document.querySelector('#ff-danger-modal #ff-dm-cancel')?.addEventListener('click',()=>resolve(false),{once:true});}); })) return;
+      if (!confirm('Delete duplicate:\n'+path+'\n\nThis cannot be undone.')) return;
       try {
         await invoke('delete_items', {paths: [path]});
         btn.closest('div[style*="border-top"]').remove();
@@ -2068,62 +1953,6 @@ function _runSavedSearch(s) {
     .finally(()=>{state.loading=false;render();});
 }
 
-// ── Local per-folder filter bar ───────────────────────────────────────────────
-// Ctrl+F shows a transient filter bar that narrows the current folder view
-// without triggering a full global search. Escape or blur dismisses it.
-function _showLocalFilter(){
-  // Remove existing filter bar if already open
-  const existing = document.getElementById('ff-local-filter');
-  if(existing){ existing.querySelector('#ff-lf-input')?.focus(); return; }
-
-  const bar = document.createElement('div');
-  bar.id = 'ff-local-filter';
-  bar.className = 'ff-lf-bar';
-  bar.innerHTML = `
-    <span class="ff-lf-icon">≡</span>
-    <input id="ff-lf-input" class="ff-lf-input" placeholder="Filter in this folder…" autocomplete="off" spellcheck="false">
-    <span id="ff-lf-count" class="ff-lf-count"></span>
-    <button id="ff-lf-close" class="ff-lf-close" title="Clear filter (Esc)">✕</button>`;
-
-  // Insert below toolbar, above view host
-  const viewHost = document.getElementById('view-host');
-  const main = viewHost?.parentElement;
-  if(main) main.insertBefore(bar, viewHost);
-  else document.body.appendChild(bar);
-
-  const input = bar.querySelector('#ff-lf-input');
-  const countEl = bar.querySelector('#ff-lf-count');
-  const closeBtn = bar.querySelector('#ff-lf-close');
-
-  let _prevFilter = state._localFilter || '';
-  requestAnimationFrame(() => input?.focus());
-
-  const apply = (q) => {
-    state._localFilter = q.toLowerCase().trim();
-    render();
-    // Count matches
-    const entries = getVisibleEntries();
-    const n = q ? entries.filter(e=>e.name.toLowerCase().includes(q.toLowerCase())).length : entries.length;
-    if(countEl) countEl.textContent = q ? `${n} match${n!==1?'es':''}` : '';
-  };
-
-  input.value = _prevFilter;
-  if(_prevFilter) apply(_prevFilter);
-
-  input.addEventListener('input', () => apply(input.value));
-  input.addEventListener('keydown', e => {
-    if(e.key==='Escape'){ e.preventDefault(); dismiss(); }
-    e.stopPropagation(); // prevent view keydowns while typing
-  });
-  closeBtn.addEventListener('click', dismiss);
-
-  function dismiss(){
-    state._localFilter = '';
-    bar.remove();
-    render();
-  }
-}
-
 function _showAdvancedSearch() {
   document.getElementById('ff-advsearch')?.remove();
   const dlg = document.createElement('div');
@@ -2191,13 +2020,10 @@ function _showAdvancedSearch() {
   document.body.appendChild(dlg);
   const close = () => dlg.remove();
   dlg.querySelector('#adv-cancel').addEventListener('click', close);
-  dlg.querySelector('#adv-save').addEventListener('click', async () => {
+  dlg.querySelector('#adv-save').addEventListener('click', () => {
     const query = dlg.querySelector('#adv-query').value.trim();
     if(!query){ dlg.querySelector('#adv-err').textContent='Enter a query to save'; return; }
-    const name = await new Promise(resolve => {
-      _showCreateModal({title:'Save Search',placeholder:'search name',defaultValue:query,icon:'🔍',onConfirm:val=>resolve(val)});
-      requestAnimationFrame(()=>{document.querySelector('#ff-create-modal #ff-cm-cancel')?.addEventListener('click',()=>resolve(null),{once:true});});
-    });
+    const name = prompt('Save search as:', query);
     if(!name) return;
     const arr = _getSavedSearches();
     arr.push({
@@ -2936,7 +2762,7 @@ function _renderPaneB() {
             navigator.clipboard.writeText(entry.path).then(()=>showToast(t('toast.path_copied'),'success')).catch(()=>{});
             break;
           case 'pb-delete':
-            if(!await new Promise(resolve=>{ _showDangerModal({title:'Move to Trash',message:'Move "'+entry.name+'" to Trash?',icon:'🗑️',confirmLabel:'Move to Trash',onConfirm:()=>resolve(true)}); requestAnimationFrame(()=>document.querySelector('#ff-danger-modal #ff-dm-cancel')?.addEventListener('click',()=>resolve(false),{once:true})); })) break;
+            if(!confirm('Move to Trash: '+entry.name+'?')) break;
             try{
               await invoke('delete_items',{paths:[entry.path]});
               showToast(entry.name+' moved to Trash','success');
@@ -2980,12 +2806,11 @@ function _showSettings() {
     { id:'advanced', label:'Advanced', icon:'🛠' },
   ];
 
-  let activeSection = localStorage.getItem('ff_settings_section') || 'general';
+  let activeSection = 'general';
 
   const renderContent = () => {
     const c = overlay.querySelector('#settings-content');
     if(!c) return;
-    const prevScroll = c.scrollTop;
     switch(activeSection) {
       case 'general': c.innerHTML = `
         <div class="stg-group">
@@ -3211,7 +3036,7 @@ function _showSettings() {
 
         // Wire: reset all
         c.querySelector('#kb-reset-all')?.addEventListener('click', () => {
-          _showDangerModal({title:'Reset All Shortcuts',message:'Reset all keyboard shortcuts to their defaults? Your customizations will be lost.',icon:'⌨️',confirmLabel:'Reset All',onConfirm:()=>{ _resetAllKeybindings(); renderContent(); showToast(t('toast.shortcuts_all_reset'),'success'); }});
+          if(confirm('Reset all keyboard shortcuts to defaults?')){ _resetAllKeybindings(); renderContent(); showToast(t('toast.shortcuts_all_reset'),'success'); }
         });
         break;
       }
@@ -3351,8 +3176,6 @@ function _showSettings() {
     c.querySelector('#stg-clear-thumbs')?.addEventListener('click', () => {
       invoke('gc_thumbnail_cache').then(n => showToast(t('toast.thumbnails_cleared',{n}),'success')).catch(e => showToast(t('error.generic',{err:e}),'error'));
     });
-    // Restore scroll position after innerHTML rebuild
-    requestAnimationFrame(() => { if(c.isConnected) c.scrollTop = prevScroll; });
   };
 
   overlay.innerHTML = `<div class="stg-dialog">
@@ -3374,10 +3197,10 @@ function _showSettings() {
   overlay.querySelectorAll('.stg-nav-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       activeSection = btn.dataset.sec;
-      localStorage.setItem('ff_settings_section', activeSection);
       overlay.querySelectorAll('.stg-nav-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.sec === activeSection);
       });
+      // Update header title
       overlay.querySelector('.stg-header-title').textContent = sections.find(s=>s.id===activeSection)?.label||'';
       renderContent();
     });
@@ -3565,12 +3388,6 @@ function buildFileCtxMenu(entry){
   items.push('-',{label:'Open in Terminal',action:'open-terminal',icon:I.terminal});
   if(!entry.is_dir&&!multi)items.push({label:'Open in Editor',action:'open-editor',icon:I.edit});
   items.push('-',{label:'Copy Path',action:'copy-path',icon:I.copy});
-  if(multi) items.push({label:`Copy ${sel.size} Paths`,action:'copy-paths-multi',icon:I.copy});
-  if(!multi){
-    items.push({label:'Copy Filename',action:'copy-filename',icon:I.copy});
-    items.push({label:'Copy as URI',action:'copy-path-uri',icon:I.copy});
-    items.push({label:'Copy ~/relative path',action:'copy-path-home-rel',icon:I.copy});
-  }
   if(entry.is_dir&&!multi)items.push({label:'Add to Sidebar',action:'add-sidebar',icon:'+'});
   // New: Bookmarks
   if(entry.is_dir&&!multi){
@@ -3603,33 +3420,13 @@ function buildBgCtxMenu(){
   // Show "Empty Trash" when viewing the Trash folder
   const isTrash=state.currentPath.includes('/.local/share/Trash');
   if(isTrash)items.push('-',{label:'Empty Trash',action:'empty-trash',icon:I.trash});
-  items.push('-',
-    {label:'Select All',action:'_bg-select-all',icon:null,shortcut:'Ctrl+A'},
-    {label:'Invert Selection',action:'invert-selection',icon:null,shortcut:'Ctrl+⇧A'}
-  );
   return items;
 }
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 async function deleteEntries(entries){
   // r84: honour ff_confirm_delete preference (default on)
-  if(localStorage.getItem('ff_confirm_delete')!=='0'){
-    const confirmed = await new Promise(resolve => {
-      _showDangerModal({
-        title: entries.length===1 ? `Move "${entries[0].name}" to Trash?` : `Move ${entries.length} items to Trash?`,
-        message: 'Items can be restored from Trash.',
-        icon: '🗑️',
-        confirmLabel: 'Move to Trash',
-        onConfirm: () => resolve(true),
-      });
-      requestAnimationFrame(() => {
-        const m = document.getElementById('ff-danger-modal');
-        if(m){ m.addEventListener('keydown', e=>{ if(e.key==='Escape') resolve(false); },{once:true}); }
-        document.querySelector('#ff-danger-modal #ff-dm-cancel')?.addEventListener('click',()=>resolve(false),{once:true});
-      });
-    });
-    if(!confirmed) return;
-  }
+  if(localStorage.getItem('ff_confirm_delete')!=='0'&&!confirm(`Move ${entries.length} item${entries.length>1?'s':''} to Trash?`))return;
   const total=entries.length;
   const paths=entries.map(e=>e.path);
   const errors=[];
@@ -3678,125 +3475,48 @@ async function deleteEntries(entries){
 }
 
 function promptCreate(type){
-  _showCreateModal({
-    title: type==='folder' ? 'New Folder' : 'New File',
-    placeholder: type==='folder' ? 'folder name' : 'file name',
-    defaultValue: type==='folder' ? 'New Folder' : 'untitled.txt',
-    icon: type==='folder' ? '📁' : '📄',
-    onConfirm: name => {
-      if(!name.trim()) return;
-      const cmd=type==='folder'?'create_directory':'create_file_cmd';
-      const destPath=state.currentPath+'/'+name;
-      invoke(cmd,{path:state.currentPath,name}).then(()=>{
-        showToast(t('toast.created',{name}),'success');
-        pushUndo({op:'create',items:[{dst:destPath,srcDir:state.currentPath,newName:name,isDir:type==='folder'}]});
-        refreshColumns();
-      }).catch(e=>showToast(t('error.unknown',{err:e}),'error'));
-    }
-  });
+  const name=prompt(type==='folder'?'New folder name:':'New file name:',type==='folder'?'New Folder':'untitled.txt');
+  if(!name)return;
+  const cmd=type==='folder'?'create_directory':'create_file_cmd';
+  const destPath=state.currentPath+'/'+name;
+  invoke(cmd,{path:state.currentPath,name}).then(()=>{
+    showToast(t('toast.created',{name}),'success');
+    pushUndo({op:'create',items:[{dst:destPath,
+      srcDir:state.currentPath, newName:name, isDir: type==='folder'}]});
+    refreshColumns();
+  }).catch(e=>showToast(t('error.unknown',{err:e}),'error'));
 }
 function promptCreateDoc(docType,ext){
-  _showCreateModal({
-    title: `New ${docType.charAt(0).toUpperCase()+docType.slice(1)} File`,
-    placeholder: `file name (${ext})`,
-    defaultValue: 'untitled'+ext,
-    icon: '📝',
-    onConfirm: name => {
-      if(!name.trim()) return;
-      const finalName=name.endsWith(ext)?name:name+ext;
-      const destPath=state.currentPath+'/'+finalName;
-      invoke('create_new_document',{path:state.currentPath,name:finalName,docType}).then(()=>{
-        showToast(t('toast.created',{name:finalName}),'success');
-        pushUndo({op:'create',items:[{dst:destPath,srcDir:state.currentPath,newName:finalName}]});
-        refreshColumns();
-      }).catch(e=>showToast(t('error.unknown',{err:e}),'error'));
-    }
-  });
-}
-function _showCreateModal({title,placeholder,defaultValue,icon,onConfirm}){
-  document.getElementById('ff-create-modal')?.remove();
-  const ov=document.createElement('div');
-  ov.id='ff-create-modal';
-  ov.style.cssText='position:fixed;inset:0;z-index:9400;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);';
-  ov.innerHTML=`
-    <div class="ff-cm-box" role="dialog" aria-modal="true" aria-label="${title}">
-      <div class="ff-cm-header">
-        <span class="ff-cm-icon">${icon}</span>
-        <span class="ff-cm-title">${title}</span>
-      </div>
-      <div class="ff-cm-body">
-        <div class="ff-cm-dir-hint" id="ff-cm-dir-hint"></div>
-        <input class="ff-cm-input" id="ff-cm-input" type="text" spellcheck="false" autocomplete="off" placeholder="${placeholder}">
-        <div class="ff-cm-err" id="ff-cm-err"></div>
-      </div>
-      <div class="ff-cm-footer">
-        <button class="ff-cm-cancel" id="ff-cm-cancel">Cancel</button>
-        <button class="ff-cm-ok" id="ff-cm-ok">Create</button>
-      </div>
-    </div>`;
-  document.body.appendChild(ov);
-  const dirHint=ov.querySelector('#ff-cm-dir-hint');
-  const input=ov.querySelector('#ff-cm-input');
-  const errEl=ov.querySelector('#ff-cm-err');
-  const okBtn=ov.querySelector('#ff-cm-ok');
-  // Show current directory
-  const dirParts=state.currentPath.split('/').filter(Boolean);
-  dirHint.textContent='In: /'+dirParts.slice(-2).join('/');
-  // Pre-fill and select (without extension for files)
-  input.value=defaultValue;
-  const dotIdx=defaultValue.lastIndexOf('.');
-  requestAnimationFrame(()=>{
-    input.focus();
-    input.setSelectionRange(0, dotIdx>0?dotIdx:defaultValue.length);
-  });
-  const validate=(v)=>{
-    if(!v.trim()){errEl.textContent='Name cannot be empty.';return false;}
-    if(v.includes('/')||v==='..'||v==='.'){errEl.textContent='Name contains invalid characters.';return false;}
-    errEl.textContent='';return true;
-  };
-  const submit=()=>{ const v=input.value.trim(); if(validate(v)){ov.remove();onConfirm(v);} };
-  const close=()=>ov.remove();
-  input.addEventListener('input',()=>validate(input.value));
-  input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();submit();}if(e.key==='Escape'){e.preventDefault();close();}});
-  okBtn.addEventListener('click',submit);
-  ov.querySelector('#ff-cm-cancel').addEventListener('click',close);
-  ov.addEventListener('mousedown',e=>{if(e.target===ov)close();});
+  const name=prompt(`New ${docType} file:`,'untitled'+ext);
+  if(!name)return;
+  const finalName=name.endsWith(ext)?name:name+ext;
+  const destPath=state.currentPath+'/'+finalName;
+  invoke('create_new_document',{path:state.currentPath,name:finalName,docType}).then(()=>{
+    showToast(t('toast.created',{name:finalName}),'success');
+    pushUndo({op:'create',items:[{dst:destPath,
+      srcDir:state.currentPath, newName:finalName}]});
+    refreshColumns();
+  }).catch(e=>showToast(t('error.unknown',{err:e}),'error'));
 }
 
 function startRename(entry){
+  const selector=`.frow[data-path="${CSS.escape(entry.path)}"] .fname, .list-row[data-path="${CSS.escape(entry.path)}"] .cell-name-text, .icon-item[data-path="${CSS.escape(entry.path)}"] .ico-lbl`;
   const el=document.querySelector(selector);
   if(!el){
-    // Element not in DOM (scrolled out) — use glass modal instead of prompt()
-    _showCreateModal({
-      title: 'Rename',
-      placeholder: 'new name',
-      defaultValue: entry.name,
-      icon: '✏️',
-      onConfirm: name => {
-        if(!name || name === entry.name) return;
-        const dst=entry.path.substring(0,entry.path.lastIndexOf('/'))+'/'+name;
-        invoke('rename_file',{oldPath:entry.path,newName:name}).then(()=>{
-          pushUndo({op:'rename',items:[{src:entry.path,dst,oldName:entry.name,newName:name}]});
-          refreshColumns();
-        }).catch(e=>showToast(t('error.rename',{err:e}),'error'));
-      }
-    });
+    const name=prompt('Rename to:',entry.name);
+    if(name&&name!==entry.name){
+      const dst=entry.path.substring(0,entry.path.lastIndexOf('/'))+'/'+name;
+      invoke('rename_file',{oldPath:entry.path,newName:name}).then(()=>{
+        pushUndo({op:'rename',items:[{src:entry.path,dst,oldName:entry.name,newName:name}]});
+        refreshColumns();
+      }).catch(e=>showToast(t('error.rename',{err:e}),'error'));
+    }
     return;
   }
   const oldText=el.textContent;el.contentEditable='true';el.spellcheck=false;
   el.style.cssText='outline:1px solid var(--accent-blue);border-radius:3px;padding:1px 3px;background:var(--bg-window);color:var(--text-primary);min-width:60px;';
   el.focus();
-  // Select only the stem (without extension) like macOS Finder
-  const range=document.createRange();
-  const textNode=el.firstChild;
-  if(textNode&&textNode.nodeType===Node.TEXT_NODE){
-    const stem=entry.is_dir?entry.name.length:Math.max(0,entry.name.lastIndexOf('.'));
-    range.setStart(textNode,0);
-    range.setEnd(textNode,stem>0?stem:entry.name.length);
-  } else {
-    range.selectNodeContents(el);
-  }
-  const s=window.getSelection();s.removeAllRanges();s.addRange(range);
+  const range=document.createRange();range.selectNodeContents(el);const s=window.getSelection();s.removeAllRanges();s.addRange(range);
   const finish=async(save)=>{
     el.contentEditable='false';el.style.cssText='';
     if(save){const newName=el.textContent.trim();if(newName&&newName!==entry.name){try{
@@ -3808,35 +3528,6 @@ function startRename(entry){
   };
   el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();finish(true);}if(e.key==='Escape'){e.preventDefault();finish(false);}e.stopPropagation();});
   el.addEventListener('blur',()=>finish(true),{once:true});
-}
-
-// ── Danger confirmation modal ─────────────────────────────────────────────────
-function _showDangerModal({title, message, icon='⚠️', confirmLabel='Confirm', onConfirm}){
-  document.getElementById('ff-danger-modal')?.remove();
-  const ov=document.createElement('div');
-  ov.id='ff-danger-modal';
-  ov.style.cssText='position:fixed;inset:0;z-index:9400;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);';
-  ov.innerHTML=`
-    <div class="ff-cm-box" role="dialog" style="min-width:320px;max-width:400px;">
-      <div class="ff-cm-header">
-        <span class="ff-cm-icon">${icon}</span>
-        <span class="ff-cm-title">${title}</span>
-      </div>
-      <div class="ff-cm-body">
-        <p style="font-size:12px;color:var(--text-secondary);margin:0;line-height:1.6;">${message}</p>
-      </div>
-      <div class="ff-cm-footer">
-        <button class="ff-cm-cancel" id="ff-dm-cancel">Cancel</button>
-        <button id="ff-dm-ok" style="padding:8px 20px;background:#dc2626;border:none;border-radius:9px;color:#fff;font-size:12px;font-weight:600;font-family:var(--font);cursor:pointer;transition:background .1s;">${confirmLabel}</button>
-      </div>
-    </div>`;
-  document.body.appendChild(ov);
-  const close=()=>ov.remove();
-  ov.querySelector('#ff-dm-cancel').addEventListener('click',close);
-  ov.querySelector('#ff-dm-ok').addEventListener('click',()=>{close();onConfirm();});
-  ov.addEventListener('mousedown',e=>{if(e.target===ov)close();});
-  ov.addEventListener('keydown',e=>{if(e.key==='Escape')close();if(e.key==='Enter'&&document.activeElement?.id==='ff-dm-ok'){close();onConfirm();}});
-  requestAnimationFrame(()=>ov.querySelector('#ff-dm-ok')?.focus());
 }
 
 // ── Compression / Extraction ──────────────────────────────────────────────────
@@ -3961,20 +3652,8 @@ async function extractArchive(entry){
       if(l.endsWith(c))return n.slice(0,-c.length);
     const d=n.lastIndexOf('.');return d>0?n.slice(0,d):n;
   };
-  const destDefault = state.currentPath+'/'+stripExts(entry.name);
-  const destDir = await new Promise(resolve => {
-    _showCreateModal({
-      title: 'Extract Archive',
-      placeholder: 'destination folder',
-      defaultValue: destDefault,
-      icon: '📦',
-      onConfirm: val => resolve(val),
-    });
-    requestAnimationFrame(() => {
-      document.querySelector('#ff-create-modal #ff-cm-cancel')?.addEventListener('click',()=>resolve(null),{once:true});
-    });
-  });
-  if(!destDir) return;
+  const destDir=prompt('Extract to directory:',state.currentPath+'/'+stripExts(entry.name));
+  if(!destDir)return;
   let unlisten;
   try{
     _sbProgress.start('Extracting \u2026', 0);
@@ -4060,24 +3739,7 @@ function setupDragDrop(el,entry,entries){
     _dragBadge.style.left = (e.clientX + 14) + 'px';
     _dragBadge.style.top  = (e.clientY + 14) + 'px';
     document.body.appendChild(_dragBadge);
-    if(dragging.length>1){
-      const g=document.createElement('div');
-      g.className='drag-ghost';
-      g.style.cssText='display:flex;align-items:center;gap:7px;padding:6px 12px;background:rgba(30,30,38,.92);border:1px solid rgba(255,255,255,.15);border-radius:10px;font-size:12px;color:#e2e8f0;box-shadow:0 4px 16px rgba(0,0,0,.5);backdrop-filter:blur(8px);pointer-events:none;';
-      g.innerHTML=`<span style="background:var(--accent-blue);color:#fff;font-size:10px;font-weight:700;padding:1px 6px;border-radius:8px;">${dragging.length}</span><span style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">items</span>`;
-      document.body.appendChild(g);
-      e.dataTransfer.setDragImage(g,0,0);
-      requestAnimationFrame(()=>g.remove());
-    } else {
-      // Single item ghost with filename
-      const g=document.createElement('div');
-      g.style.cssText='display:flex;align-items:center;gap:7px;padding:6px 12px;background:rgba(30,30,38,.92);border:1px solid rgba(255,255,255,.15);border-radius:10px;font-size:12px;color:#e2e8f0;box-shadow:0 4px 16px rgba(0,0,0,.5);backdrop-filter:blur(8px);pointer-events:none;max-width:260px;';
-      const nm=entry.name.length>32?entry.name.slice(0,29)+'…':entry.name;
-      g.innerHTML=`<span style="opacity:.7;font-size:14px;">📄</span><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${nm}</span>`;
-      document.body.appendChild(g);
-      e.dataTransfer.setDragImage(g,-8,-8);
-      requestAnimationFrame(()=>g.remove());
-    }
+    if(dragging.length>1){const g=document.createElement('div');g.className='drag-ghost';g.textContent=`${dragging.length} items`;document.body.appendChild(g);e.dataTransfer.setDragImage(g,0,0);requestAnimationFrame(()=>g.remove());}
   });
   el.addEventListener('dragend',()=>{
     el.classList.remove('dragging');
@@ -4169,25 +3831,6 @@ function setupDropTarget(el,destPath){
       }
     }
     const cmd = op === 'copy' ? 'copy_files_batch' : 'move_files_batch';
-
-    // ── Optimistic update — remove moved entries from source column immediately ──
-    // This gives instant visual feedback without waiting for the Rust op to finish.
-    // refreshColumns() at the end reconciles any discrepancies.
-    if (op === 'move') {
-      const srcSet = new Set(srcs);
-      // Remove from main-pane source column
-      const srcCol = state.columns.find(c => c.path === srcPath);
-      if (srcCol) {
-        srcCol.entries = (srcCol.entries || []).filter(e => !srcSet.has(e.path));
-        render();
-      }
-      // Remove from pane B if it's showing the source directory
-      if (typeof _paneB !== 'undefined' && _paneB.active && _paneB.path === srcPath) {
-        _paneB.entries = (_paneB.entries || []).filter(e => !srcSet.has(e.path));
-        _renderPaneB?.();
-      }
-    }
-
     // p7: pass cancelFn so the status-bar ✕ button calls cancel_file_op
     const jobId = _sbProgress.addJob(
       (op === 'copy' ? 'Copying' : 'Moving') + ' 0 / ' + total, total,
@@ -4219,25 +3862,6 @@ function setupDropTarget(el,destPath){
       if (finished) _ddResolve();
     });
     invoke(cmd, { srcs, destDir: destPath }).catch(err => { showToast(t('error.drop_failed',{err}),'error'); _ddResolve(); });
-
-    // ── Optimistic destination refresh — fire immediately after invoke, don't wait ──
-    // For moves, also optimistically inject the moved entries into the dest column
-    // so both columns update at the same time (instant feel).
-    // refreshColumns() after ddDone will correct any ordering/metadata differences.
-    (async () => {
-      try {
-        const r = await invoke('list_directory_fast', { path: destPath });
-        if (!r?.entries) return;
-        // Update main-pane column if open
-        const destCol = state.columns.find(c => c.path === destPath);
-        if (destCol) { destCol.entries = r.entries; render(); }
-        // Update pane B if it's showing destPath
-        if (typeof _paneB !== 'undefined' && _paneB.active && _paneB.path === destPath) {
-          _paneB.entries = r.entries; _renderPaneB?.();
-        }
-      } catch (_) {}
-    })();
-
     await ddDone;
     ddUnlisten();
     _sbProgress.finishJob(jobId, ddErrors === 0, ddErrors > 0 ? ddErrors + ' error(s)' : (op === 'copy' ? 'Copy' : 'Move') + ' complete');
@@ -4259,8 +3883,7 @@ function _updateSearchLabel(query, searching){
   const rail=document.getElementById('bc-rail');
   if(rail){
     const cnt=state.searchResults.length;
-    const rootLabel = (state.columns[0]?.path||state.currentPath||'').split('/').filter(Boolean).pop() || '/';
-    rail.innerHTML='<span class="bc-search-label">Results for "<strong>'+escHtml(query)+'</strong>" in '+escHtml(rootLabel)+''+(searching?' <span class="search-deep-badge">searching…</span>':'— '+cnt+' item'+(cnt!==1?'s':''))+'</span><div class="bc-deadspace" id="bc-deadspace"></div>';
+    rail.innerHTML='<span class="bc-search-label">Results for "<strong>'+escHtml(query)+'</strong>"'+(searching?' <span class="search-deep-badge">searching…</span>':'— '+cnt+' item'+(cnt!==1?'s':''))+'</span><div class="bc-deadspace" id="bc-deadspace"></div>';
     document.getElementById('bc-deadspace')?.addEventListener('click',e=>{e.stopPropagation();enterBcEditMode();});
   }
   const spinner=document.querySelector('.tb-spinner');
@@ -4268,21 +3891,6 @@ function _updateSearchLabel(query, searching){
     const wrap=document.querySelector('.tb-actions');
     if(wrap){const s=document.createElement('span');s.className='tb-spinner';s.innerHTML='<div class="spinner" style="width:14px;height:14px;border-width:1.5px"></div>';wrap.prepend(s);}
   }else if(!searching&&spinner){spinner.remove();}
-  // Show/update result count badge inside the search input wrapper
-  let badge = document.getElementById('search-count-badge');
-  if (!searching && state.searchMode) {
-    const cnt = state.searchResults.length;
-    const wrap = document.querySelector('.search-wrap');
-    if (!badge && wrap) {
-      badge = document.createElement('span');
-      badge.id = 'search-count-badge';
-      badge.className = 'search-count-badge';
-      wrap.appendChild(badge);
-    }
-    if (badge) badge.textContent = cnt + ' result' + (cnt !== 1 ? 's' : '');
-  } else {
-    badge?.remove();
-  }
 }
 
 let _searchGen=0;
@@ -4351,40 +3959,9 @@ async function loadPreview(entry){
   const isMedia=VIDEO_EXTS.includes(ext2)||AUDIO_EXTS.includes(ext2)||PDF_EXTS.includes(ext2);
   const isImg=IMAGE_EXTS.includes(ext2);
   // Images and media: skip IPC entirely — renderPreview uses HTTP media server URL directly
-  if(isMedia||isImg){state.previewEntry=entry;state.previewData=null;state.previewLoading=false;renderPreview();
-    // Async: fetch image dimensions and inject into preview metadata
-    if(isImg){
-      // Native EXIF read — no exiftool dependency
-      invoke('get_exif_tags',{path:entry.path}).then(meta=>{
-        if(!meta||state.previewEntry?.path!==entry.path)return;
-        const w=meta.ImageWidth;
-        const h=meta.ImageHeight;
-        if(!w||!h)return;
-        const row=document.getElementById('pv-img-dimensions');
-        if(row){row.querySelector('span:last-child').textContent=`${w} × ${h} px`;return;}
-        const meta2=document.querySelector('.preview-meta');
-        if(meta2){
-          const d=document.createElement('div');d.className='preview-row';d.id='pv-img-dimensions';
-          d.innerHTML=`<span>Dimensions</span><span>${w} × ${h} px</span>`;
-          meta2.insertAdjacentElement('afterbegin',d);
-        }
-      }).catch(()=>{});
-    }
-    return;
-  }
+  if(isMedia||isImg){state.previewEntry=entry;state.previewData=null;state.previewLoading=false;renderPreview();return;}
   state.previewEntry=entry;state.previewLoading=true;renderPreview();
   try{state.previewData=await invoke('get_file_preview',{path:entry.path});}catch(e){state.previewData=null;}
-  // For office files, try LibreOffice PDF conversion async — upgrades preview from
-  // raw extracted text to a full-fidelity PDF iframe if LibreOffice is installed.
-  if(OFFICE_EXTS.includes(ext2)&&state.previewEntry===entry){
-    invoke('get_office_preview',{path:entry.path}).then(res=>{
-      if(state.previewEntry?.path!==entry.path)return;
-      if(res?.mode==='pdf'&&res?.pdf_path){
-        state.previewData={...state.previewData,_office_pdf:res.pdf_path};
-        renderPreview();
-      }
-    }).catch(()=>{});
-  }
   state.previewLoading=false;renderPreview();
 }
 
@@ -4488,12 +4065,11 @@ function renderSidebar(){
   ].filter(f=>{if(seen.has(f.path))return false;seen.add(f.path);return true;});
 
   // ── Recent Locations section ──────────────────────────────────────────────
-  const _sbCol = _getSbCollapsed();
   const recentPaths = _getPathHistory().slice(0, 8);
   const recentSectionHtml = recentPaths.length ? `
     <div class="sb-section">
-      <div class="sb-title sb-collapsible" data-section="recent">${_sbCol.has('recent')?'▶':'▾'} Recent</div>
-      ${_sbCol.has('recent')?'':recentPaths.map(p => {
+      <div class="sb-title">Recent</div>
+      ${recentPaths.map(p => {
         const label = p.split('/').filter(Boolean).pop() || '/';
         const active = state.currentPath === p;
         return `<div class="sb-item ${active?'active':''}" data-path="${p.replace(/"/g,'&quot;')}" title="${p.replace(/"/g,'&quot;')}">
@@ -4507,8 +4083,8 @@ function renderSidebar(){
   const tagsWithColors = (state._allTags||[]).map(t=>({name:t,color:state._tagColors?.[t]||'#60a5fa'}));
   const tagsSectionHtml = tagsWithColors.length ? `
     <div class="sb-section">
-      <div class="sb-title sb-collapsible" data-section="tags">${_sbCol.has('tags')?'▶':'▾'} Tags</div>
-      ${_sbCol.has('tags')?'':tagsWithColors.map(t=>`
+      <div class="sb-title">Tags</div>
+      ${tagsWithColors.map(t=>`
         <div class="sb-item sb-tag-item ${state.activeTag===t.name?'active':''}" data-tag="${t.name}">
           <span class="sb-tag-dot" style="background:${t.color};"></span>
           <span class="sb-lbl">${t.name}</span>
@@ -4519,8 +4095,8 @@ function renderSidebar(){
   const savedSearches = _getSavedSearches();
   const savedSearchesSectionHtml = savedSearches.length ? `
     <div class="sb-section">
-      <div class="sb-title sb-collapsible" data-section="saved-searches">${_sbCol.has('saved-searches')?'▶':'▾'} Saved Searches</div>
-      ${_sbCol.has('saved-searches')?'':savedSearches.map((s,i)=>`
+      <div class="sb-title">Saved Searches</div>
+      ${savedSearches.map((s,i)=>`
         <div class="sb-item sb-saved-search" data-ss-idx="${i}" title="${s.rootPath||''}">
           <span class="sb-ico" style="color:#a78bfa"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:13px;height:13px"><circle cx="6.5" cy="6.5" r="4"/><path d="M10 10l3 3"/></svg></span>
           <span class="sb-lbl">${s.name}</span>
@@ -4876,36 +4452,6 @@ function renderSidebar(){
     navigate(path,0);renderSidebar();
   };
   el.addEventListener('click', el._sbNavHandler);
-
-  // Collapsible section titles
-  el.querySelectorAll('.sb-collapsible').forEach(title => {
-    title.style.cursor = 'pointer';
-    title.addEventListener('click', e => {
-      e.stopPropagation();
-      _toggleSbSection(title.dataset.section);
-    });
-  });
-
-  // Right-click sidebar items → Open Terminal Here
-  el._sbCtxHandler && el.removeEventListener('contextmenu', el._sbCtxHandler);
-  el._sbCtxHandler = (ev) => {
-    const item = ev.target.closest('.sb-item:not(.sb-tag-item)');
-    if (!item || !item.dataset.path || item.dataset.mounted === 'false') return;
-    ev.preventDefault();
-    const path = item.dataset.path;
-    showContextMenu(ev.clientX, ev.clientY, [
-      {label: 'Open Terminal Here', action: '_sb-terminal', icon: I.terminal},
-      {label: 'Open in New Tab', action: '_sb-new-tab', icon: I.folder},
-      {label: 'Open in New Window', action: '_sb-new-window', icon: I.folder},
-      '-',
-      {label: 'Copy Path', action: '_sb-copy-path', icon: I.copy},
-    ]);
-    // Temporarily override ctxAction for these sidebar-specific actions
-    window._sbCtxPath = path;
-    const _sbCleanup = () => { window._sbCtxPath = null; };
-    setTimeout(_sbCleanup, 5000);
-  };
-  el.addEventListener('contextmenu', el._sbCtxHandler);
 
   // ── Favorites drag-to-reorder ─────────────────────────────────────────────
   let _dragFavIdx = -1;
@@ -5568,34 +5114,11 @@ function _initPreviewResize(){
 }
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
-const _toastQueue = [];
-let _toastActive = 0;
-const _TOAST_MAX_VISIBLE = 3;
-function _origShowToast(msg, type='info'){
-  // Deduplicate: drop if same message already visible or queued
-  if(_toastQueue.some(t=>t.msg===msg)) return;
-  if(document.querySelector(`.toast[data-msg="${CSS.escape(msg)}"]`)) return;
-  _toastQueue.push({msg, type});
-  _flushToastQueue();
-}
-function _flushToastQueue(){
-  if(!_toastQueue.length || _toastActive >= _TOAST_MAX_VISIBLE) return;
-  const {msg, type} = _toastQueue.shift();
-  _toastActive++;
-  const t=document.createElement('div');
-  t.className=`toast toast-${type}`;
-  t.textContent=msg;
-  t.dataset.msg=msg;
+function _origShowToast(msg,type='info'){
+  const t=document.createElement('div');t.className=`toast toast-${type}`;t.textContent=msg;
   document.getElementById('toast-container')?.appendChild(t);
   setTimeout(()=>t.classList.add('show'),10);
-  setTimeout(()=>{
-    t.classList.remove('show');
-    setTimeout(()=>{
-      t.remove();
-      _toastActive--;
-      _flushToastQueue(); // show next queued toast
-    },300);
-  },3200);
+  setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},3500);
 }
 
 // ── Window controls ───────────────────────────────────────────────────────────
@@ -5632,18 +5155,14 @@ const _KB_DEFAULTS = [
   { id:'clipboard-history',label:'Clipboard history',       category:'Files',      keys:{ctrl:true,shift:true,key:'V'}, noInputBlock:true },
   { id:'delete',          label:'Move to Trash',           category:'Files',      keys:{key:'Delete'} },
   { id:'select-all',      label:'Select all',              category:'Files',      keys:{ctrl:true,key:'a'} },
-  { id:'invert-selection',label:'Invert selection',         category:'Files',      keys:{ctrl:true,shift:true,key:'A'} },
-  { id:'size-increase',   label:'Increase icon size',        category:'View',       keys:{ctrl:true,shift:true,key:'='} },
-  { id:'size-decrease',   label:'Decrease icon size',        category:'View',       keys:{ctrl:true,shift:true,key:'-'} },
   { id:'quick-look',      label:'Quick Look',              category:'Files',      keys:{key:' '} },
   { id:'permissions',     label:'File permissions',        category:'Files',      keys:{ctrl:true,key:'i'} },
   { id:'refresh',         label:'Refresh',                 category:'Files',      keys:{key:'F5'} },
   // ── View ────────────────────────────────────────────────────────────────────
   { id:'new-tab',         label:'New tab',                 category:'View',       keys:{ctrl:true,key:'t'},         noInputBlock:true },
-  { id:'reopen-tab',      label:'Reopen closed tab',       category:'View',       keys:{ctrl:true,shift:true,key:'T'}, noInputBlock:true },
   { id:'close-tab',       label:'Close tab',               category:'View',       keys:{ctrl:true,key:'w'},         noInputBlock:true },
-  { id:'search-focus',   label:'Local filter (current folder)', category:'View', keys:{ctrl:true,key:'f'}, noInputBlock:true },
-  { id:'adv-search',     label:'Global search',               category:'View',       keys:{ctrl:true,shift:true,key:'F'}, noInputBlock:true },
+  { id:'search-focus',    label:'Search',                  category:'View',       keys:{ctrl:true,key:'f'},         noInputBlock:true },
+  { id:'adv-search',      label:'Advanced search',         category:'View',       keys:{ctrl:true,shift:true,key:'F'}, noInputBlock:true },
   { id:'settings',        label:'Settings',                category:'View',       keys:{ctrl:true,key:','} },
   { id:'cheatsheet',      label:'Keyboard shortcuts',      category:'View',       keys:{ctrl:true,key:'/'},       noInputBlock:true },
   // ── Edit ────────────────────────────────────────────────────────────────────
@@ -5904,33 +5423,12 @@ function setupKeyboard(){
       return;
     }
     // Vim: l or Enter to open
-    if(e.key==='Enter'||(e.key==='l'&&!isInput)){e.preventDefault();const entry=curIdx>=0?entries[curIdx]:null;if(entry){if(e.ctrlKey||e.metaKey){if(entry.is_dir)newTab(entry.path);else{newTab(state.currentPath);invoke('open_file',{path:entry.path}).catch(()=>{});}}else if(entry.is_dir)await navigate(entry.path,0);else invoke('open_file',{path:entry.path}).catch(()=>{});}return;}
+    if(e.key==='Enter'||(e.key==='l'&&!isInput)){e.preventDefault();const entry=curIdx>=0?entries[curIdx]:null;if(entry){if(e.ctrlKey||e.metaKey){if(entry.is_dir)newTab(entry.path);}else if(entry.is_dir)await navigate(entry.path,0);else invoke('open_file',{path:entry.path}).catch(()=>{});}return;}
     // Vim: h to go back
     if(e.key==='h'&&!isInput&&state.viewMode==='column'){e.preventDefault();if(state.columns.length>1){state.columns.pop();const parent=state.columns[state.columns.length-1];state.currentPath=parent.path;if(parent.selIdx>=0){state.selIdx=parent.selIdx;sel._e=sortEntries(parent.entries.filter(x=>state.showHidden||!x.is_hidden));sel.set(parent.selIdx);}render();requestAnimationFrame(()=>{document.querySelector('.frow.sel')?.scrollIntoView({block:'nearest'});});}return;}
     // Vim: g = top, G = bottom
     if(e.key==='g'&&!isInput){e.preventDefault();sel.set(0);state.selIdx=0;render();return;}
     if(e.key==='G'&&!isInput){e.preventDefault();sel.set(entries.length-1);state.selIdx=entries.length-1;render();return;}
-    // V: cycle visualizer mode — only when selected file is audio
-    if(e.key==='v'&&!isInput&&state.viewMode==='gallery'){
-      const _gE=getCurrentEntries();
-      const _gSel=_gE[state.gallerySelIdx>=0?state.gallerySelIdx:0];
-      const _gExt=(_gSel?.extension||'').toLowerCase();
-      const AUDIO_EXTS_V=['mp3','flac','ogg','wav','aac','m4a','opus','weba'];
-      if(!AUDIO_EXTS_V.includes(_gExt)) return; // not audio — let type-to-select handle 'v'
-      e.preventDefault();
-      const {setVizMode,getVizMode,startAudioVisualizer}=await import('./views.js');
-      const modes=['bars','wave','mirror','ring'];
-      const cur=modes.indexOf(getVizMode());
-      const next=modes[(cur+1)%modes.length];
-      setVizMode(next);
-      const host=document.getElementById('view-host');
-      if(host){ const bar=host.querySelector('.gallery-bar'); if(bar){const {renderGalleryView}=await import('./views.js');await renderGalleryView(host);} }
-      const audioEl=document.getElementById('gallery-audio-el');
-      const canvas=document.getElementById('gallery-viz-canvas');
-      if(audioEl&&canvas) startAudioVisualizer(audioEl,canvas);
-      showToast(`Visualizer: ${next.charAt(0).toUpperCase()+next.slice(1)}`,'info');
-      return;
-    }
     // Vim: / = search
     if(e.key==='/'&&!isInput){e.preventDefault();document.getElementById('search-in')?.focus();return;}
     if(e.key===' '){
@@ -6001,9 +5499,7 @@ async function _dispatchKbAction(e, kb, noInputOnly, ctx) {
     switch(id) {
       // ── noInputBlock actions ────────────────────────────────────────────────
       case 'new-tab':        newTab(e.shiftKey?'':state.currentPath); break;
-      case 'reopen-tab':     reopenLastTab(); break;
       case 'close-tab':      closeTab(activeTabId); break;
-      case 'search-focus':   _showLocalFilter(); break;
       case 'search-focus':   document.getElementById('search-in')?.focus(); break;
       case 'adv-search':     _showAdvancedSearch(); break;
       case 'plugin-manager': _showPluginManager(); break;
@@ -6022,37 +5518,6 @@ async function _dispatchKbAction(e, kb, noInputOnly, ctx) {
       case 'select-all':
         sel._paths.clear(); entries.forEach(en=>sel._paths.add(en.path));
         sel.last=entries.length-1; state.selIdx=entries.length-1; render(); break;
-      case 'invert-selection': {
-        const _allE=entries;
-        const _newP=new Set(_allE.filter(en=>!sel._paths.has(en.path)).map(en=>en.path));
-        sel._paths=_newP; sel.last=_allE.findIndex(en=>_newP.has(en.path));
-        state.selIdx=sel.last; render(); break;
-      }
-      case 'toggle-preview': {
-        const pvPanel=document.getElementById('preview-panel');
-        if(pvPanel){
-          const hidden=pvPanel.style.display==='none'||pvPanel.classList.contains('hidden');
-          pvPanel.style.display=hidden?'':'none';
-          try{localStorage.setItem('ff_preview_hidden',hidden?'0':'1');}catch{}
-        }
-        break;
-      }
-      case 'size-increase': {
-        const sz = Math.min(120, (state.iconSize||80)+8);
-        state.iconSize=sz; state.fontSize=Math.round(10+(sz-28)*(6/52));
-        const sl=document.getElementById('size-slider'); if(sl)sl.value=sz;
-        localStorage.setItem('ff_icon_size',sz);
-        document.documentElement.style.setProperty('--icon-size',sz+'px');
-        render(); break;
-      }
-      case 'size-decrease': {
-        const sz = Math.max(28, (state.iconSize||80)-8);
-        state.iconSize=sz; state.fontSize=Math.round(10+(sz-28)*(6/52));
-        const sl=document.getElementById('size-slider'); if(sl)sl.value=sz;
-        localStorage.setItem('ff_icon_size',sz);
-        document.documentElement.style.setProperty('--icon-size',sz+'px');
-        render(); break;
-      }
       case 'cheatsheet':     showCheatSheet(); break;
       case 'omnibar':        _showOmnibar(); break;
       case 'open-recent':    _showOpenRecent(); break;
@@ -6078,7 +5543,7 @@ async function _dispatchKbAction(e, kb, noInputOnly, ctx) {
         if(_dirs.length!==2){ showToast('Select exactly 2 folders to merge','info'); break; }
         const [src,dst]=[_dirs[0].path,_dirs[1].path];
         const srcName=src.split('/').pop();
-        if(!await new Promise(resolve=>{ _showDangerModal({title:'Merge Folders',message:`Move all files from "${srcName}" into "${dst.split('/').pop()}"?`,icon:'📁',confirmLabel:'Merge',onConfirm:()=>resolve(true)}); requestAnimationFrame(()=>{document.querySelector('#ff-danger-modal #ff-dm-cancel')?.addEventListener('click',()=>resolve(false),{once:true});}); }))break;
+        if(!confirm(`Merge "${srcName}" into "${dst}"? All files from the source folder will be moved into the destination.`))break;
         showToast(`Merging ${srcName}…`,'info');
         try{
           const files=await invoke('list_directory_fast',{path:src});
@@ -6242,7 +5707,8 @@ function renderTrashBanner(){
       '<button class="trash-banner-btn" id="btn-empty-trash">Empty Trash</button>'+
       '</div>';
     document.getElementById('btn-empty-trash')?.addEventListener('click',()=>{
-      _showDangerModal({title:'Empty Trash',message:'Permanently delete all items in Trash? This cannot be undone.',icon:'🗑️',confirmLabel:'Empty Trash',onConfirm:()=>_emptyTrashWithProgress().catch(err=>showToast(t('toast.trash_empty_failed',{err}),'error'))});
+      if(!confirm('Permanently delete all items in Trash? This cannot be undone.'))return;
+      _emptyTrashWithProgress().catch(err=>showToast(t('toast.trash_empty_failed',{err}),'error'));
     });
     document.getElementById('btn-restore-trash')?.addEventListener('click',async()=>{
       const selected = getSelectedEntries();
@@ -6270,7 +5736,8 @@ function renderTrashBanner(){
       '<span class="trash-banner-msg">Items in Trash will be permanently deleted when Trash is emptied.</span>'+
       '<button class="trash-banner-btn" id="btn-empty-trash">Empty Trash</button>';
     document.getElementById('btn-empty-trash')?.addEventListener('click',()=>{
-      _showDangerModal({title:'Empty Trash',message:'Permanently delete all items in Trash? This cannot be undone.',icon:'🗑️',confirmLabel:'Empty Trash',onConfirm:()=>_emptyTrashWithProgress().catch(err=>showToast(t('toast.trash_empty_failed',{err}),'error'))});
+      if(!confirm('Permanently delete all items in Trash? This cannot be undone.'))return;
+      _emptyTrashWithProgress().catch(err=>showToast(t('toast.trash_empty_failed',{err}),'error'));
     });
   });
 }
@@ -7193,22 +6660,16 @@ function _renderWatchIndicator() {
     if (!status) return;
     el = document.createElement('span');
     el.id = 'watch-indicator';
-    el.style.cssText = 'margin-left:8px;font-size:10px;display:inline-flex;align-items:center;gap:3px;';
+    el.style.cssText = 'margin-left:10px;font-size:11px;opacity:0.55;font-family:var(--font-mono,monospace);';
     status.parentNode?.insertBefore(el, status.nextSibling);
   }
-  const configs = {
-    inotify: {dot:'#34d399', label:'live', title:'Local filesystem — changes appear instantly via inotify'},
-    polling: {dot:'#fbbf24', label:'polling', title:'Network/FUSE mount — directory listing refreshes every 3 seconds'},
-    off:     {dot:'', label:'', title:''},
-  };
-  const cfg = configs[_watchMode] || configs.off;
-  if (cfg.label) {
-    el.innerHTML = `<span style="width:6px;height:6px;border-radius:50%;background:${cfg.dot};display:inline-block;flex-shrink:0;box-shadow:0 0 4px ${cfg.dot}80;"></span><span style="color:${cfg.dot};opacity:.8;font-family:var(--font);">${cfg.label}</span>`;
-    el.title = cfg.title;
-  } else {
-    el.innerHTML = '';
-    el.title = '';
-  }
+  const labels = {inotify:'● live', polling:'⏱ polling', off:''};
+  el.textContent = labels[_watchMode] || '';
+  el.title = _watchMode === 'polling'
+    ? 'Network/FUSE mount — directory listing refreshes every 3 seconds'
+    : _watchMode === 'inotify'
+    ? 'Local filesystem — changes appear instantly via inotify'
+    : '';
 }
 
 

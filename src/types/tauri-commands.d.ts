@@ -119,8 +119,6 @@ type TauriCommand =
   | 'write_file_meta_exif'
   | 'get_audio_tags'
   | 'write_audio_tags'
-  | 'search_music_metadata'
-  | 'fetch_album_art'
   | 'get_exif_tags'
   | 'write_exif_tags'
   | 'get_pdf_meta'
@@ -496,15 +494,6 @@ declare function invoke(cmd: 'get_audio_tags', args: { path: string }): Promise<
 
 /** invoke('write_audio_tags') */
 declare function invoke(cmd: 'write_audio_tags', args: { path: string, tags: unknown /* AudioTags */ }): Promise<void>;
-
-/** invoke('get_audio_cover') */
-declare function invoke(cmd: 'get_audio_cover', args: { path: string }): Promise<string | null>;
-
-/** invoke('search_music_metadata') */
-declare function invoke(cmd: 'search_music_metadata', args: { query: string }): Promise<unknown /* MusicSearchResult[] */>;
-
-/** invoke('fetch_album_art') */
-declare function invoke(cmd: 'fetch_album_art', args: { musicbrainz_id: string }): Promise<string>;
 
 /** invoke('get_exif_tags') */
 declare function invoke(cmd: 'get_exif_tags', args: { path: string }): Promise<unknown /* ExifData */>;
