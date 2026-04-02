@@ -1,6 +1,8 @@
 # FrostFinder
 
-A macOS Finder-inspired file manager for Linux, built with Tauri.
+A macOS Finder-inspired file manager for Linux/Windows/macOS, built with Tauri v2.
+
+**Version:** 1.0.1-RC2-R7 | **Status:** Release Candidate
 
 ## What We Want to Achieve
 
@@ -50,12 +52,16 @@ FrostFinder aims to bring the elegant, intuitive file management experience from
 
 ### Organisation
 - **Tags & Colors** — Color-coded file tagging stored in xattr with automatic SQLite fallback for FAT32/exFAT/network filesystems
+- **Audio Metadata Search** — Search MusicBrainz database from audio tag editor; auto-fills title, artist, album, year
+- **Album Cover Embedding** — Download cover from Cover Art Archive and embed into audio file; displays in Gallery View
 - **Compression** — Create and extract ZIP, 7z, tar archives
 - **Archive preview** — See contents of ZIP/tar/7z without extracting
 
 ### System Integration
 - **Terminal** (`Ctrl+Alt+T`) — Opens preferred terminal at current folder; also in right-click menu
 - **File Permissions** (`Ctrl+I`) — Properties dialog with `chmod`/`chown`, rwx checkboxes + octal input
+- **Metadata Editor** (`Ctrl+I`) — Edit EXIF for images, audio tags, and PDF metadata natively (no exiftool needed)
+- **Preview Panel** (`Ctrl+P`) — Collapsible/resizable preview panel (180-800px drag resize)
 - **Disk Usage** (`Ctrl+Shift+U`) — Squarified treemap + bar list; click to navigate
 - **Mount/Unmount** — ISO images, USB drives, DMG files
 - **Video codec badges** — Codec, resolution, fps, duration, bitrate shown in preview panel (requires ffprobe)
@@ -64,6 +70,8 @@ FrostFinder aims to bring the elegant, intuitive file management experience from
 
 ### Customisation
 - **Custom Actions / Plugins** — Define shell commands that appear in the right-click menu; glob-based file matching; `{path}`, `{name}`, `{dir}`, `{ext}` variables
+- **Theme Switcher** — Light/Dark/System theme in Settings → Appearance
+- **Icon Themes** — Load custom SVG icon themes from folder
 - **Localization (i18n)** — String catalogue in `src/locales/{lang}.json`; ships English; auto-detected from system locale; overridable in Settings
 - **Keyboard shortcut cheatsheet** (`Ctrl+?`)
 
@@ -141,6 +149,21 @@ npm run tauri build    # production
 - **UI:** Custom CSS (no framework)
 - **Database:** SQLite (rusqlite, bundled) — tag fallback storage
 
+## Latest Release (v1.0.1-RC2-R7)
+
+### New in R7
+- **Native EXIF metadata** — Read/write EXIF tags for JPEG/PNG without exiftool (kamadak-exif)
+- **Native PDF metadata** — Read/write PDF metadata without exiftool (lopdf)
+- **Audio metadata search** — Search MusicBrainz database from audio tag editor
+- **Album cover embedding** — Download and embed cover art into audio files
+- **Preview panel** — Collapsible/resizable (Ctrl+P toggle, drag handle 180-800px)
+- **Theme switcher** — Light/Dark/System theme options
+
+### Previous Releases
+- v1.0.1-RC2-R3: Native EXIF/PDF metadata (no exiftool dependency)
+- v1.0.1-RC2-R2: Add missing build.rs
+- v1.0.1-RC2-R1: List view sort & selection fixes, context menu edge clamping
+
 ## Keyboard Shortcuts
 
 > The in-app cheatsheet (`Ctrl+?`) is generated from the same `_KB_DEFAULTS` array
@@ -185,6 +208,11 @@ npm run tauri build    # production
 | `Ctrl+Shift+J` | Connect FTP |
 | `Ctrl+Shift+G` | Cloud storage |
 | `Ctrl+Shift+V` | Encrypted vaults |
+| `Ctrl+P` | Toggle preview panel |
+| **Navigation** | |
+| `Ctrl+Tab` | Next tab |
+| `Ctrl+Shift+Tab` | Previous tab |
+
 ## License
 
 GPL-3.0 — See LICENSE file
