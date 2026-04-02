@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.frostfinder.desktop</id>
+  <name>FrostFinder</name>
+  <summary>A fast, modern file manager inspired by macOS Finder</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <description>
+    <p>
+      FrostFinder is a column-based file manager for Linux inspired by macOS Finder.
+      It combines native performance (Rust + Tauri) with a clean, modern interface.
+    </p>
+    <p>Features include:</p>
+    <ul>
+      <li>Column, List, Icon, and Gallery views</li>
+      <li>Quick Look previews with Space bar (images, video, audio, documents, archives)</li>
+      <li>Dual-pane view with drag-and-drop between panes</li>
+      <li>Full-text and regex search across the filesystem</li>
+      <li>Tags and colour labels stored in extended attributes</li>
+      <li>Batch rename with live before/after preview</li>
+      <li>SMB, WebDAV, SFTP, and FTP remote mounts</li>
+      <li>Compression (ZIP, TAR.GZ, TAR.BZ2, TAR.XZ) and archive preview</li>
+      <li>Disk usage treemap, file diff, secure delete, and duplicate finder</li>
+      <li>Localised into English, Spanish, French, German, Chinese, and Japanese</li>
+      <li>Full keyboard navigation and ARIA accessibility</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.frostfinder.desktop.desktop</launchable>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Column view — browse directories in a cascading multi-column layout</caption>
+      <image>https://raw.githubusercontent.com/frostfinder/frostfinder/main/packaging/screenshots/column-view.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Gallery view with Quick Look preview panel</caption>
+      <image>https://raw.githubusercontent.com/frostfinder/frostfinder/main/packaging/screenshots/gallery-view.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Dual-pane view for side-by-side file management</caption>
+      <image>https://raw.githubusercontent.com/frostfinder/frostfinder/main/packaging/screenshots/dual-pane.png</image>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://github.com/frostfinder/frostfinder</url>
+  <url type="bugtracker">https://github.com/frostfinder/frostfinder/issues</url>
+  <url type="vcs-browser">https://github.com/frostfinder/frostfinder</url>
+
+  <developer id="com.frostfinder">
+    <name>FrostFinder Contributors</name>
+  </developer>
+
+  <provides>
+    <binary>frostfinder</binary>
+  </provides>
+
+  <requires>
+    <display_length compare="ge">800</display_length>
+    <internet>offline-only</internet>
+  </requires>
+
+  <recommends>
+    <display_length compare="ge">1100</display_length>
+  </recommends>
+
+  <categories>
+    <category>System</category>
+    <category>FileManager</category>
+    <category>Utility</category>
+  </categories>
+
+  <keywords>
+    <keyword>files</keyword>
+    <keyword>folders</keyword>
+    <keyword>file manager</keyword>
+    <keyword>finder</keyword>
+    <keyword>browser</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="6.0.26" date="2026-03-22">
+      <description>
+        <p>Beta 6, r26 — Compile fix for r25 lofty audio tag integration</p>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.26</url>
+    </release>
+    <release version="6.0.25" date="2026-03-22">
+      <description>
+        <p>Beta 6, r25 — Native audio tag editing (no exiftool required)</p>
+        <ul>
+          <li>Audio tag editor (Edit Tags) now works natively via the lofty Rust crate</li>
+          <li>Supports MP3/ID3v2, FLAC, OGG, Opus, M4A, WAV — no system tools needed</li>
+          <li>Comment field added to audio tag editor</li>
+          <li>Error message no longer suggests installing exiftool for audio files</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.25</url>
+    </release>
+    <release version="6.0.24" date="2026-03-22">
+      <description>
+        <p>Beta 6, r24 — Phase 16: Bug Fixes</p>
+        <ul>
+          <li>Split pane now restores full-width view when closed</li>
+          <li>Icon theme folder scanner is now recursive (finds icons in subdirectories)</li>
+          <li>Settings dialog fully redesigned — readable labels, consistent spacing</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.24</url>
+    </release>
+    <release version="6.0.23" date="2026-03-22">
+      <description>
+        <p>Beta 6, r23 — Phase 15: Bug Fixes</p>
+        <ul>
+          <li>Icon theme "Load from folder" now works — dialog:allow-open permission added</li>
+          <li>Split pane no longer opens blank — navigates to directory on open</li>
+          <li>Split pane toggle button added to toolbar view-switcher</li>
+          <li>Progress bar no longer overlaps Settings/Cheatsheet footer buttons</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.23</url>
+    </release>
+    <release version="6.0.22" date="2026-03-22">
+      <description>
+        <p>Beta 6, r22 — Phase 14: UI/UX Bug Fixes</p>
+        <ul>
+          <li>New windows no longer inherit main window session (blank window fix)</li>
+          <li>Split-pane state is now per-window — Ctrl+\ correctly toggles in each window independently</li>
+          <li>Keyboard shortcuts cheatsheet button added to sidebar footer beside Settings</li>
+          <li>Icon theme picker gains a remove button to unload disk themes</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.22</url>
+    </release>
+    <release version="6.0.20" date="2026-03-22">
+      <description>
+        <p>Beta 6, r20 — Phase 12: Test Coverage Expansion + Bug Fixes</p>
+        <ul>
+          <li>afterEach now correctly imported in utils.test.js and a11y.test.js</li>
+          <li>VIDEO_EXTS extended to include flv, wmv, 3gp — matching Rust backend</li>
+          <li>views.js codec badge set now includes 3gp for full parity with Rust</li>
+          <li>All previously untested utils.js exports now covered (196 JS test cases total)</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.20</url>
+    </release>
+    <release version="6.0.1" date="2026-03-21">
+      <description>
+        <p>Beta 6, Release 1 — critical bug fix:</p>
+        <ul>
+          <li>Fixed renderSidebar() closing brace placed 127 lines too early, causing SFTP, FTP, SMB, and WebDAV/Cloud sidebar sections to run once at startup instead of refreshing on every call</li>
+          <li>Network mount sidebar sections (SFTP, FTP, SMB, Cloud) now correctly update when connecting, disconnecting, or switching directories</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v6.0.1</url>
+    </release>
+    <release version="5.0.82" date="2026-03-21">
+      <description>
+        <p>Phase 5 — macOS and Windows ports:</p>
+        <ul>
+          <li>macOS build: .app bundle and .dmg for Apple Silicon and Intel</li>
+          <li>Windows build: .msi and NSIS installer</li>
+          <li>Cross-platform CI matrix — Rust compile check on macOS and Windows on every tag</li>
+          <li>Platform-conditional xattr, FUSE detection, and drive enumeration</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.82</url>
+    </release>
+    <release version="5.0.81" date="2026-03-21">
+      <description>
+        <p>Phase 4 — Git status badges and encrypted vaults:</p>
+        <ul>
+          <li>6px git status dots on files in Column and List views (modified, staged, untracked, conflict)</li>
+          <li>Branch name pill in the toolbar path bar with dirty indicator</li>
+          <li>Encrypted vault creation and management via gocryptfs (optional runtime dependency)</li>
+          <li>Locked vaults appear in the sidebar with one-click unlock; unlocked vaults navigate like any folder</li>
+          <li>Ctrl+Shift+V opens the Vaults dialog; Ctrl+Shift+G opens Cloud Storage</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.81</url>
+    </release>
+    <release version="5.0.80" date="2026-03-21">
+      <description>
+        <p>Phase 3 — Native cloud storage integration:</p>
+        <ul>
+          <li>Google Drive, Dropbox, and OneDrive support via rclone (optional runtime dependency)</li>
+          <li>OAuth2 browser sign-in flow — credentials managed by rclone, never stored by FrostFinder</li>
+          <li>Mounted cloud drives appear in the sidebar Cloud section with unmount button</li>
+          <li>Cloud mounts restored automatically on startup</li>
+          <li>Ctrl+Shift+G opens the Connect Cloud Storage dialog</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.80</url>
+    </release>
+    <release version="5.0.79" date="2026-03-21">
+      <description>
+        <p>Phase 2 — Inline text editor and find-in-file:</p>
+        <ul>
+          <li>Inline CodeMirror 6 editor for all text and code files in Quick Look</li>
+          <li>Syntax highlighting for JS, TS, Python, Rust, CSS, HTML, JSON, Markdown, XML, TOML</li>
+          <li>Edit / Save (Ctrl+S) / Discard workflow with dirty-state guard</li>
+          <li>Atomic file writes (temp-file + rename, never corrupts original on crash)</li>
+          <li>Ctrl+F find-in-file — CodeMirror search panel for text, DOM highlight search for other content</li>
+          <li>Navigation and close guarded against unsaved changes</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.79</url>
+    </release>
+    <release version="5.0.78" date="2026-03-21">
+      <description>
+        <p>Phase 1 — Distribution and community:</p>
+        <ul>
+          <li>Flatpak and AUR packages now published (Flathub and AUR submissions open)</li>
+          <li>Arabic translation added with full RTL layout support</li>
+          <li>Locale validator script ensures all translations stay in sync</li>
+          <li>TRANSLATION.md guide for contributors</li>
+          <li>Fixed malformed AppStream name tag in metainfo</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.78</url>
+    </release>
+    <release version="5.0.77" date="2026-03-21">
+      <description>
+        <p>Phase 10 — Video thumbnails and bug fixes:</p>
+        <ul>
+          <li>Video thumbnails via ffmpeg (optional) in Icon and Gallery views with play overlay</li>
+          <li>Fixed keyboard shortcut cheatsheet rendering blank</li>
+          <li>Fixed WatchMode::Off dead code warning</li>
+          <li>Various build fixes and stability improvements</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.77</url>
+    </release>
+    <release version="5.0.72" date="2026-03-21">
+      <description>
+        <p>Phase 10 — Video thumbnails:</p>
+        <ul>
+          <li>Video thumbnails generated via ffmpeg with graceful fallback</li>
+          <li>Play indicator overlay on video items in Icon and Gallery views</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.72</url>
+    </release>
+    <release version="5.0.71" date="2026-03-21">
+      <description>
+        <p>Phase 9 — Remaining accessibility gaps closed:</p>
+        <ul>
+          <li>All 15 Orca screen reader scenarios now implemented</li>
+          <li>View mode switches, toast messages, pane focus, and Trash count announced via live region</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.71</url>
+    </release>
+    <release version="5.0.64" date="2026-03-21">
+      <description>
+        <p>Phase 2 — Testing and stability:</p>
+        <ul>
+          <li>20 Rust unit tests covering core filesystem operations and data structures</li>
+          <li>JavaScript test suite (Vitest + jsdom) for view rendering and utilities</li>
+          <li>Settings now persist to ~/.config/frostfinder/settings.json across reinstalls</li>
+          <li>GitHub Actions CI pipeline (lint, test, build on every push)</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.64</url>
+    </release>
+    <release version="5.0.60" date="2026-03-21">
+      <description>
+        <p>Phase 1 — Packaging and localisation:</p>
+        <ul>
+          <li>Added Spanish, French, German, Chinese (Simplified), and Japanese translations</li>
+          <li>Language picker added to Settings → Appearance</li>
+          <li>Flatpak, AUR PKGBUILD, and .desktop packaging files added</li>
+        </ul>
+      </description>
+      <url>https://github.com/frostfinder/frostfinder/releases/tag/v5.0.60</url>
+    </release>
+  </releases>
+</component>
