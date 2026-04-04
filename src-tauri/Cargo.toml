@@ -9,6 +9,10 @@ default-run = "frostfinder"
 edition = "2021"
 rust-version = "1.77"
 
+[profile.release]
+codegen-units = 1
+lto = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
