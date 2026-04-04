@@ -1,0 +1,35 @@
+# Winget manifest for FrostFinder
+# Submit to: https://github.com/microsoft/winget-pkgs
+# Path: manifests/f/FrostFinder/FrostFinder/6.0.1/
+
+PackageIdentifier: FrostFinder.FrostFinder
+PackageVersion: 6.0.26
+PackageName: FrostFinder
+Publisher: FrostFinder Contributors
+PublisherUrl: https://github.com/frostfinder/frostfinder
+PackageUrl: https://github.com/frostfinder/frostfinder
+License: GPL-3.0
+LicenseUrl: https://github.com/frostfinder/frostfinder/blob/main/LICENSE
+ShortDescription: A fast, modern file manager inspired by macOS Finder
+Description: |-
+  FrostFinder is a column-based file manager for Windows, macOS, and Linux
+  inspired by macOS Finder. It combines native performance (Rust + Tauri) with
+  a clean, modern interface featuring column/list/icon/gallery views, Quick Look
+  previews, dual-pane mode, full-text search, tags, network mounts, and more.
+Tags:
+  - file-manager
+  - finder
+  - explorer
+  - files
+  - productivity
+Installers:
+  - Architecture: x64
+    InstallerType: msi
+    InstallerUrl: https://github.com/frostfinder/frostfinder/releases/download/v6.0.1/FrostFinder_6.0.1_x64_en-US.msi
+    InstallerSha256: REPLACE_WITH_ACTUAL_SHA256
+  - Architecture: x64
+    InstallerType: nullsoft
+    InstallerUrl: https://github.com/frostfinder/frostfinder/releases/download/v6.0.1/FrostFinder_6.0.1_x64-setup.exe
+    InstallerSha256: REPLACE_WITH_ACTUAL_SHA256
+ManifestType: singleton
+ManifestVersion: 1.6.0
