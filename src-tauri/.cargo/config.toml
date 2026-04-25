@@ -1,6 +1,7 @@
-# Increase rustc worker-thread stack size to 32 MiB.
-# cairo-rs / gio use deeply recursive proc-macro expansion that overflows
-# the default 8 MiB stack, causing rustc SIGSEGV on some machines.
-# 16 MiB was insufficient on some setups; rustc itself recommends 32 MiB.
+# Increase rustc worker-thread stack size to 64 MiB.
+# cairo-rs / gio / zvariant / pxfm use deeply recursive proc-macro expansion
+# that overflows the default 8 MiB stack on CachyOS/Arch with mold linker,
+# causing rustc SIGSEGV. 32 MiB was insufficient for zvariant 5.10 (edition 2024)
+# and pxfm 0.1.28; rustc's own backtrace recommends 67108864 (64 MiB).
 [env]
 RUST_MIN_STACK = "67108864"

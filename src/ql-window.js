@@ -98,11 +98,12 @@ let _currentEntry = null; // entry currently shown (needed by Save)
 let _vizAnimId = null;
 let _vizAC     = null;
 
+function _getVizMode(){ try{return localStorage.getItem('ff_viz_mode')||'bars';}catch{return 'bars';} }
+
 function startAudioVisualizer(audioEl, canvas) {
   if (!audioEl || !canvas) return;
   if (_vizAnimId) { cancelAnimationFrame(_vizAnimId); _vizAnimId = null; }
 
-  // ── Draw loop ─────────────────────────────────────────────────────────────
   const draw = () => {
     if (!canvas.isConnected || !audioEl.isConnected) { _vizAnimId = null; return; }
     _vizAnimId = requestAnimationFrame(draw);
@@ -110,28 +111,67 @@ function startAudioVisualizer(audioEl, canvas) {
     if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
     const g = canvas.getContext('2d');
     g.clearRect(0, 0, W, H);
+    const mode = _getVizMode();
     if (audioEl.paused || !audioEl._vizAnalyser) {
-      const bars = 60, barW = W / bars;
-      for (let i = 0; i < bars; i++) {
-        g.fillStyle = 'rgba(100,130,160,0.22)';
-        g.beginPath(); g.roundRect(i * barW + 0.5, H - 2, barW - 1.5, 2, 1); g.fill();
+      if (mode === 'ring') {
+        const cx=W/2,cy=H/2,r=Math.min(W,H)*0.3;
+        g.beginPath();g.arc(cx,cy,r,0,Math.PI*2);g.strokeStyle='rgba(100,130,160,0.2)';g.lineWidth=2;g.stroke();
+      } else {
+        const bars = 60, barW = W / bars;
+        for (let i = 0; i < bars; i++) {
+          g.fillStyle = 'rgba(100,130,160,0.22)';
+          g.beginPath(); g.roundRect(i * barW + 0.5, H - 2, barW - 1.5, 2, 1); g.fill();
+        }
       }
       return;
     }
     const analyser = audioEl._vizAnalyser;
-    const bufLen = analyser.frequencyBinCount, dataArr = new Uint8Array(bufLen);
-    analyser.getByteFrequencyData(dataArr);
-    const bars = Math.min(bufLen, 72), barW = W / bars;
-    for (let i = 0; i < bars; i++) {
-      const v = dataArr[i] / 255, h = Math.max(2, v * H);
-      g.fillStyle = `hsla(${195 + v * 120},${60 + v * 30}%,60%,0.9)`;
-      g.beginPath(); g.roundRect(i * barW + 0.5, H - h, barW - 1.5, h, 2); g.fill();
+    const bufLen = analyser.frequencyBinCount;
+    const freqArr = new Uint8Array(bufLen);
+    const timeArr = new Uint8Array(bufLen);
+    analyser.getByteFrequencyData(freqArr);
+    analyser.getByteTimeDomainData(timeArr);
+
+    if (mode === 'bars') {
+      const bars = Math.min(bufLen, 72), barW = W / bars;
+      for (let i = 0; i < bars; i++) {
+        const v = freqArr[i] / 255, h = Math.max(2, v * H);
+        g.fillStyle = `hsla(${195 + v*120},${60+v*30}%,60%,0.9)`;
+        g.beginPath(); g.roundRect(i * barW + 0.5, H - h, barW - 1.5, h, 2); g.fill();
+      }
+    } else if (mode === 'wave') {
+      g.beginPath();
+      const sliceW = W / bufLen; let x = 0;
+      for (let i = 0; i < bufLen; i++) {
+        const v = (timeArr[i] / 128) - 1, y = H/2 + v*(H*0.45);
+        i === 0 ? g.moveTo(x, y) : g.lineTo(x, y); x += sliceW;
+      }
+      const grad = g.createLinearGradient(0,0,W,0);
+      grad.addColorStop(0,'hsla(195,70%,65%,0.9)'); grad.addColorStop(0.5,'hsla(270,70%,75%,0.9)'); grad.addColorStop(1,'hsla(315,70%,65%,0.9)');
+      g.strokeStyle=grad; g.lineWidth=2; g.lineJoin='round'; g.stroke();
+      g.lineWidth=5; g.globalAlpha=0.15; g.stroke(); g.globalAlpha=1;
+    } else if (mode === 'mirror') {
+      const bars = Math.min(bufLen, 72), barW = W / bars;
+      for (let i = 0; i < bars; i++) {
+        const v = freqArr[i]/255, half = Math.max(1, v*H*0.5);
+        g.fillStyle = `hsla(${195+v*120},${60+v*30}%,60%,0.85)`;
+        g.beginPath(); g.roundRect(i*barW+0.5, H/2-half, barW-1.5, half*2, 2); g.fill();
+      }
+      g.fillStyle='rgba(150,170,200,0.25)'; g.fillRect(0,H/2-0.5,W,1);
+    } else if (mode === 'ring') {
+      const cx=W/2,cy=H/2,baseR=Math.min(W,H)*0.28,bars=64,step=bufLen/bars;
+      for (let i = 0; i < bars; i++) {
+        const v=freqArr[Math.floor(i*step)]/255,angle=(i/bars)*Math.PI*2-Math.PI/2;
+        const r2=baseR+v*(Math.min(W,H)*0.22);
+        g.strokeStyle=`hsla(${195+v*120+i*2},${60+v*30}%,65%,${0.5+v*0.5})`;
+        g.lineWidth=Math.max(1,(W/bars)*0.7); g.lineCap='round';
+        g.beginPath(); g.moveTo(cx+Math.cos(angle)*baseR,cy+Math.sin(angle)*baseR);
+        g.lineTo(cx+Math.cos(angle)*r2,cy+Math.sin(angle)*r2); g.stroke();
+      }
+      g.beginPath();g.arc(cx,cy,baseR*0.55,0,Math.PI*2);g.strokeStyle='rgba(150,170,210,0.15)';g.lineWidth=1;g.stroke();
     }
   };
 
-  // ── Wire WebAudio graph immediately (element must be idle, src not set yet) ─
-  // Caller sets src AFTER this call so createMediaElementSource never runs
-  // mid-stream and there is zero audio interruption.
   if (!audioEl._vizSetup) {
     try {
       if (!_vizAC || _vizAC.state === 'closed') {
@@ -151,23 +191,16 @@ function startAudioVisualizer(audioEl, canvas) {
     } catch (err) { console.warn('QL audio viz setup failed:', err); }
   }
 
-  // ── Document-level gesture unlock (belt-and-suspenders for WebKit2GTK) ──────
-  // Capture-phase listener ensures _vizAC.resume() is called on the very first
-  // user gesture (click, keydown, pointerdown) — before `play` fires.
   if(!window._qlACUnlockWired){
     window._qlACUnlockWired=true;
-    const _unlock=()=>{
-      if(_vizAC&&_vizAC.state==='suspended')_vizAC.resume().catch(()=>{});
-    };
+    const _unlock=()=>{ if(_vizAC&&_vizAC.state==='suspended')_vizAC.resume().catch(()=>{}); };
     document.addEventListener('click',_unlock,{capture:true,passive:true});
     document.addEventListener('keydown',_unlock,{capture:true,passive:true});
     document.addEventListener('pointerdown',_unlock,{capture:true,passive:true});
   }
 
-  // ── Event listeners (once per element) ────────────────────────────────────
   if (!audioEl._vizListeners) {
     audioEl._vizListeners = true;
-    // resume() in play handler as primary path; document listener above as fallback
     audioEl.addEventListener('play', () => {
       if (_vizAC && _vizAC.state === 'suspended') _vizAC.resume().catch(() => {});
       if (!_vizAnimId) draw();
@@ -538,6 +571,19 @@ async function renderEntry(entry) {
   qlName.textContent  = entry.name;
   qlMeta.textContent  = fmtSize(entry.size);
   appWindow.setTitle(entry.name);
+  // Show album cover favicon in title bar for audio files
+  const _qlTitleCover = document.getElementById('ql-title-cover');
+  if (_qlTitleCover) {
+    const _ext = (entry.name.split('.').pop()||'').toLowerCase();
+    if (['mp3','flac','ogg','wav','aac','m4a','opus','weba'].includes(_ext)) {
+      invoke('get_audio_cover', {path: entry.path}).then(coverUrl => {
+        if (coverUrl) { _qlTitleCover.src = coverUrl; _qlTitleCover.style.display = 'block'; }
+        else _qlTitleCover.style.display = 'none';
+      }).catch(() => { _qlTitleCover.style.display = 'none'; });
+    } else {
+      _qlTitleCover.style.display = 'none';
+    }
+  }
 
   // Update nav buttons
   const hasPrev = _curIdx > 0;
@@ -724,8 +770,16 @@ async function renderEntry(entry) {
     const wrap = document.createElement('div');
     wrap.className = 'ql-audio-wrap';
     const iconSvg = fileIcon(entry).replace('<svg', '<svg style="width:72px;height:72px"');
-    wrap.innerHTML = `<span style="font-size:64px;color:${fileColor(entry)}">${iconSvg}</span>
-      <div style="font-size:15px;color:#e2e8f0">${escHtml(entry.name)}</div>`;
+    // Icon placeholder — will be replaced with album art if available
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'ql-audio-icon';
+    iconSpan.style.cssText = `font-size:64px;color:${fileColor(entry)}`;
+    iconSpan.innerHTML = iconSvg;
+    const nameDiv = document.createElement('div');
+    nameDiv.style.cssText = 'font-size:15px;color:#e2e8f0;text-align:center;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    nameDiv.textContent = entry.name;
+    wrap.appendChild(iconSpan);
+    wrap.appendChild(nameDiv);
     if (_mediaPort) {
       const aud = document.createElement('audio');
       aud.controls = true;
@@ -741,6 +795,14 @@ async function renderEntry(entry) {
       // Wire graph BEFORE setting src — element is idle, no interruption possible
       startAudioVisualizer(aud, cvs);
       aud.src = getMediaUrl(entry.path); // set src AFTER wiring
+      // Fetch and display album art
+      invoke('get_audio_cover', { path: entry.path }).then(coverUrl => {
+        if (!coverUrl || !iconSpan.isConnected) return;
+        const coverImg = document.createElement('img');
+        coverImg.src = coverUrl;
+        coverImg.style.cssText = 'width:180px;height:180px;object-fit:cover;border-radius:14px;box-shadow:0 8px 40px rgba(0,0,0,0.6);display:block;flex-shrink:0;';
+        iconSpan.replaceWith(coverImg);
+      }).catch(() => {});
       return; // already appended
     }
     qlBody.appendChild(wrap);

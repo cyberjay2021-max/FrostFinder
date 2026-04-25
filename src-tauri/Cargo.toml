@@ -1,6 +1,6 @@
 [package]
 name = "frostfinder"
-version = "1.0.1-rc3"
+version = "1.0.1-rc2-r47"
 description = "FrostFinder - A macOS Finder-inspired file manager"
 authors = ["you"]
 license = "GPL-3.0"
@@ -9,17 +9,13 @@ default-run = "frostfinder"
 edition = "2021"
 rust-version = "1.77"
 
-[profile.release]
-codegen-units = 1
-lto = false
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
-tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
+tauri-plugin-dialog = "=2.7.0"
+tauri-plugin-fs = "=2.5.0"
 tauri-plugin-shell = "2"
 tauri-plugin-notification = "2"
 raw-window-handle = "0.6"
@@ -45,6 +41,12 @@ url = "2"
 lofty = "0.22"
 kamadak-exif = "0.6"
 lopdf = "0.34"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+urlencoding = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# r14: camera permission handler — auto-grant getUserMedia requests in the WebKit2GTK webview
+webkit2gtk = { version = "2", features = [] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 notify = { version = "6", features = ["macos_fsevent"] }

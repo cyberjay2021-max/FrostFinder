@@ -238,7 +238,8 @@ Required entries in `src-tauri/capabilities/main.json`:
 ## Backups
 Create tar backup before major changes:
 ```bash
-tar czf FrostFinder-beta-6-r21_2026-03-22.tar.gz \
-  src/ src-tauri/src/ src-tauri/Cargo.toml src-tauri/tauri.conf.json \
+tar czf BACKUP/FrostFinder-vX.X.X-YYYY-MM-DD.tar.gz \
+  src/ src-tauri/src/ src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock \
+  src-tauri/build.rs src-tauri/capabilities/ src-tauri/gen/ src-tauri/icons/ \
   *.md *.html *.js package.json VERSION
 ```

@@ -1,29 +1,315 @@
-## What's in v1.0.1-RC2-R3 — Native EXIF and PDF metadata (no exiftool)
+### v1.0.1-RC2-R47 — 2026-04-24 (bug fixes)
+- Fix: **`_seekFrac` division by zero when seek track not yet laid out** — `getBoundingClientRect().width` is `0` before the element has been painted (e.g. user clicks seek bar within the same animation frame it was mounted); `(clientX - left) / 0 = Infinity`, which `Math.min(1, Infinity)` clamps to `1`, causing an immediate seek-to-end on first click; now guards with `if (!r.width) return 0`
+- Fix: **Adjacent preload `<video>` elements survived slot teardown** — if the gallery slot was torn down (user navigated away) between the 800ms preload fire and the 3s cleanup timer, the hidden `<video preload=metadata>` elements in `document.body` kept GStreamer pipelines open for up to 2.1 more seconds; preload references are now tracked in `_preloadVids`/`_preloadCleanTimer` and `_cancelPreloads()` is called in `_cleanup()` to discard them immediately on teardown
+- Fix: **`_mountMpvPlayer` failure left gallery slot blank** — on rejection (media server not started, file unreadable, GStreamer codec missing), `gSlot` was left as an empty black void with no feedback; now shows an inline error panel with the rejection message; guarded against overwrite if a subsequent mount already succeeded
+- Fix: **Escape-to-parent in column view skipped history recording** — the breadcrumb Escape shortcut (and breadcrumb pill click in column view when the target column is already loaded) took a fast path that wrote `state.currentPath` directly and called `render()`, bypassing `_recordPathHistory()`, `state.history` push, and `_applySortPrefForPath()`; pressing Back after using this shortcut would go to the wrong location and per-folder sort preferences were not applied; all three are now called in the fast path
+- No Rust recompile required (JS only)
 
-**Files changed:** `src-tauri/Cargo.toml`, `src-tauri/src/main.rs`, `src/views.js`, `src/types/tauri-commands.d.ts`
+### v1.0.1-RC2-R47 — 2026-04-24 (bug audit — 3 fixes)
+- Fix: **`_showBar` rAF callback wrote to detached DOM after slot teardown** — the debounced `mousemove` handler queues a `requestAnimationFrame` to update `bar.style.opacity`; if `_cleanup()` fired while that rAF was pending (e.g. user navigated away mid-hover), the callback wrote `opacity` to a removed element; added `if (wrapper._dead) return` guard inside the rAF to bail immediately when the slot has been torn down
+- Fix: **`d` parameter shadowed dependency accessor in adjacent-preload map** — the adjacent video preload used `.map(d => ...)` where `d` is the offset integer (−1 or 1), silently shadowing the outer `d()` dependency accessor function used two lines above; `d()` had already been destructured so there was no functional bug, but the naming confusion was a latent maintenance hazard; renamed the map parameter to `offset`
+- Fix: **dead `pbSelCount` variable in `renderStatus` pane-B branch** — `pbSelCount` was computed (`_paneB.selIdx >= 0 ? 1 : 0`) but never referenced again in the branch; removed the unused variable
+- No Rust recompile required (JS-only changes)
+
+### v1.0.1-RC2-R46 — 2026-04-23 (gallery video playback — smooth as butter)
+- Fix: **seek bar wrote `width%` to the DOM on every `timeupdate` event** — WebKit2GTK recalculates layout on any `width` change to an absolutely-positioned element; with GStreamer firing `timeupdate` up to 60× per second during playback, this caused a full layout pass 60× per second; switched seek fill and buffer fill from `width` to `transform:scaleX()` — transform changes are compositor-only and never trigger layout
+- Fix: **`timeupdate` → DOM write was unthrottled** — even with scaleX, batching writes through `requestAnimationFrame` limits repaints to one per display frame maximum and skips frames entirely when the window is hidden; a `_rafSeek` guard prevents stacking rAF callbacks if GStreamer fires faster than 60fps
+- Fix: **`mousemove` auto-hide timer churned on every pixel** — the control bar hide timer was being `clearTimeout`+`setTimeout` on every `mousemove` event (60+ per second during normal mouse movement); added an rAF debounce gate (`_showPending`) so at most one timer update fires per display frame; eliminated the constant GC pressure from rapid timer churn during video scrubbing
+- Fix: **video wrapper was not on its own GPU compositing layer** — added `will-change:transform; transform:translateZ(0); contain:layout style` to the video wrapper div; this isolates the seek bar repaints to a single compositor layer and prevents them from triggering a full-page composite on every playback tick
+- Fix: **seek fill and buffer fill not on compositor layers** — `will-change:transform` added to `.vc-seek-fill` and `.vc-seek-buf` in CSS; these are the elements that change every frame and were previously causing unnecessary compositing work
+- Fix: **no `playsInline`** — added `video.playsInline = true`; some WebKit2GTK builds detach the video renderer without this attribute, causing a blank black frame for several hundred milliseconds after play starts
+- Fix: **pending rAF and hide timer not cancelled on slot teardown** — `_cleanup()` now calls `cancelAnimationFrame(_rafSeek)` and `clearTimeout(_hideTimer)` before destroying the wrapper; previously a dangling rAF could fire after the DOM element was removed, writing to a detached element and potentially keeping the GC root alive
+- Feature: **adjacent video preloading** — 800 ms after a video is mounted (enough time for the current video's demuxer to open), silently creates hidden `<video preload="metadata" muted>` elements for the previous and next videos in the gallery strip; this warms up GStreamer's plugin pipeline and demuxer so navigating to the adjacent file is instant rather than triggering a cold pipeline start; the probe elements are discarded after 3 s; skips WEBKIT_SKIP_EXTS (avi/m4v/ogv) and fires only when the media server is available
+- No Rust recompile required (JS + CSS only)
+
+### v1.0.1-RC2-R45 — 2026-04-21 (tab system bug fixes)
+- Fix: **`makeTabState` had duplicate `_tagFilter`, `_tagFilterMode`, and `previewError` fields** — the object literal defined these keys twice due to stale copy-paste from r23/r28; JS silently uses the last value, but duplicate keys are dead code and a potential source of confusion; all three duplicates removed
+- Fix: **Closing the active tab left the UI stale** — `closeTab(activeId)` called `switchTab(nextId, false)`, which updates `activeTabId` and `state` but deliberately skips `renderTabs()` and `render()`; the tab bar and content area were therefore never redrawn after closing the active tab; now calls `renderTabs();render()` immediately after `switchTab(false)` in the active-tab branch
+- Fix: **`reopenLastTab` rendered the wrong view mode** — `newTab()` was called first (which renders immediately with the inherited view mode), then `viewMode`/`showHidden` were patched onto the new tab state object without triggering a re-render; the reopened tab appeared in the wrong view until the next navigation; rewritten to build the tab state with correct settings before the first render
+- Fix: **"Close Tabs to Left/Right" could silently close the active tab** — these context menu actions iterated a snapshot of tabs and called `closeTab()` on each; if the currently active tab fell within the closed range, `closeTab(activeId)` fired but the preceding `switchTab(false)` call left the UI stale (see above bug); now the target tab is switched to first if the active tab is in the range to be closed, before any tabs are removed
+- No Rust recompile required (JS-only changes)
+
+### v1.0.1-RC2-R44 — 2026-04-19 (QoL gap audit — 5 fixes)
+- Fix: **"Show in Folder" missing from search results context menu** — when `searchMode` is active and a file (not folder) is right-clicked, a new "Show in Folder" item now appears; clicking it navigates to the file's parent directory, exits search mode, and selects the file in the resulting view. This is the standard Finder/Dolphin/Nautilus flow for locating a found file in context.
+- Fix: **Status bar showed bare "N results" in search mode** — now shows `N results for "query"`, giving users a persistent reminder of what they searched for without having to look at the breadcrumb.
+- Fix: **Status bar ignored pane B focus** — `renderStatus()` always reflected the main pane state even when pane B was focused and active; now detects `isPaneBFocused()` and shows pane B's item count, selected file info, and current folder label. `isPaneBFocused` and `_paneB` added to `injectDeps`.
+- Fix: **Recent Files overlay (Ctrl+Shift+E) had no "Show in Folder" for file entries** — each file row now has a small "⤢ Show" button that navigates to the file's parent directory and selects it there, without opening the file. The main row click still opens the file directly.
+- Fix: **Cheatsheet category labels were hardcoded English** — all 6 category names (Navigation, Files, View, Edit, App, Network) and the "No shortcuts match" empty state are now routed through `t('kb.category.*')` and `t('cheatsheet.no_match')`. Seven new locale keys added across all 12 locales.
+- Locale count: 381 → 386 keys across all 12 locales, all in sync.
+- No Rust recompile required (JS-only changes).
+
+### v1.0.1-RC2-R43 — 2026-04-18 (i18n gap fix — full locale coverage)
+- Fix: **75 user-visible strings were hardcoded English** — `showToast()`, `_showDangerModal()`, `_showCreateModal()`, and `_sbProgress` labels across `main.js`, `views.js`, and `plugins.js` bypassed the `t()` i18n system; non-English users saw English text for all affected interactions
+- Fix: **All 12 locale files now have 377 keys** (up from 295 at R42); 82 new `toast.*`, `dialog.*`, and `progress.*` keys added with native translations in all 11 non-English languages (de, es, fr, ja, zh, ar, hi, ko, nl, pt, ru)
+- **Toast strings now localized:** no-recently-closed-tabs, clipboard-history-cleared, path/URI/relative-path/filename copied, multi-path copied, no-tags-in-folder, no-active-search, tag-rule-added, debug-info-copied, undo-history-cleared, device-mounted/ejected, visualizer-mode, permanently-deleted, merging/merged-files/merge-failed, music-applied, no-recent-items, tag-glob-required, folder-not-found, move-to/copy-to pane toasts, orphaned-tags-removed, plugin export/import, metadata editor toasts, op-failed/items-failed plurals, copied/moved (all contexts)
+- **Danger modal strings now localized:** Clear Clipboard, Empty Trash (all 3 call sites, with count-aware variant), Move to Trash (Delete key), Permanently Delete (Shift+Delete), Secure Delete, Delete Duplicate, pane-B Move to Trash — including title, message, and confirmLabel for each
+- **Progress bar labels now localized:** copying, moving, trashing, compressing, extracting, emptying trash, secure-delete passes, applying permissions — all `_sbProgress.start/update/finish/updateJob/finishJob` calls covered
+- **Create modal strings now localized:** Save Search, New Folder (title/placeholder/default), New File, Rename, Extract Archive — all `_showCreateModal()` call sites
+- No Rust recompile required (JS-only changes)
+
+### v1.0.1-RC2-R42 — 2026-04-12 (gap audit fixes)
+- Fix: **column-search banner leaked flex layout into column view** — `renderView()` set `host.style.display='flex'` and `flexDirection='column'` for the banner wrapper but never reset them; `_doRenderColumn` now clears both properties at its entry point so the column pane layout is always clean
+- Fix: **icon view had no folder item-count badge** — gallery strip shows a count pill on folder thumbs; icon view was silent; added async `invoke('list_directory_fast')` per folder item in the icon view builder, rendering an `.iv-dir-count` pill badge using the same colour tiers and pill CSS as the gallery badge (shared rule in style.css)
+- Fix: **`gthumb-dir-count` and `iv-dir-count` CSS now shared** — both selectors merged into a single rule block; only the `bottom`/`right` positioning differs per-variant
+- Fix: **`gthumb-doc-badge` CSS class was defined but never populated** — the CSS for a file-extension label badge (e.g. "DOCX", "PDF", "ZIP") existed since r26 but `_makeGthumb` never created the element; now emitted for all `OFFICE_EXTS`, `PDF_EXTS`, and `ARCHIVE_EXTS` files; badge styled as a centred bottom pill with `backdrop-filter:blur(4px)` matching the count-badge family
+- Fix: **folder preview panel showed no item count** — the info panel displayed size (async) but not how many direct children the folder has; now calls `list_directory_fast` and `get_dir_size_fast` concurrently via `Promise.all` and renders `N items · X MB` in the kind line once both resolve
+- Fix: **tab label not updated after renaming the open folder** — both the modal rename path (`_showCreateModal`) and the inline contentEditable path now check `entry.path === state.currentPath` after a successful `rename_file`; if true they update `getActiveTab().label` to the new name and call `renderTabs()` so the tab strip reflects the change immediately
+- Fix: **toast duration was hardcoded at 3200ms** — short toasts vanished before users finished reading longer messages; duration now scales: `min(6000, 2400 + max(0, msg.length − 20) × 40)ms`; error-type toasts receive an additional 1200ms; the effective range is 2400ms (≤20 chars) to 6000ms (≥109 chars) for info/success, and 3600ms–7200ms for errors
+
+### v1.0.1-RC2-R41 — 2026-04-12 (gallery badge polish)
+- Polish: **gallery folder item-count badge redesigned** — replaced the flat dark rectangle (`rgba(0,0,0,.65)`, 9px, radius 4px, clipped partly off-card) with a proper pill badge: 18px tall, 9px border-radius, `backdrop-filter:blur(6px)`, inner-glow border, drop shadow, and a count-tiered fill colour — slate (1–9), sky (10–99), blue (100–499), purple (500+); badges with a count of 0 are now hidden instead of showing "0"; counts above 999 display as "999+"
+
+### v1.0.1-RC2-R40 — 2026-04-12 (QoL audit fixes)
+- Fix: **Ctrl+Alt+T keybinding conflict** — `tag-filter` and `terminal` both used `Ctrl+Alt+T`; terminal always won because it was dispatched last; `tag-filter` default binding moved to `Ctrl+Alt+G`; cheatsheet updated accordingly
+- Fix: **F2 rename not in keybinding table** — `F2` was documented in the cheatsheet and in a help tooltip but absent from `_KB_DEFAULTS`, so it was neither remappable nor listed in Settings → Shortcuts; added as `{ id:'rename', keys:{key:'F2'} }` with dispatch wired to `startRename(getSelectedEntries()[0])`
+- Fix: **Shift+Delete not in keybinding table** — `Shift+Delete` (permanently delete, bypass Trash) was cheatsheet-only; added as `{ id:'delete-permanent', keys:{shift:true,key:'Delete'} }` with a danger-modal confirmation before calling `invoke('delete_items')`
+- Fix: **F7 toggle-preview not in keybinding table** — the `toggle-preview` dispatch case existed but had no `_KB_DEFAULTS` entry, making it unreachable by keyboard and invisible in Settings → Shortcuts; added as `{ id:'toggle-preview', keys:{key:'F7'}, noInputBlock:true }`
+- Fix: **Recent files display cap 10 vs storage cap 20** — `_getRecentFiles()` stores up to 20 entries but `_showRecentLocations` sliced to 10, discarding half; display slice raised to 20 to match storage cap
+- Fix: **Empty Trash modal omitted total size** — confirmation dialog showed item count only; now computes `entries.reduce((a,e)=>a+(e.size||0),0)` and appends `(X MB)` to the message when size is known
+- Fix: **Type-to-select had no visual feedback** — the 600ms prefix buffer was invisible; added a `#ff-tts-hud` floating pill (bottom-center, above status bar) that shows `Jump to: <prefix>` while typing and fades out with a 160ms opacity transition when the buffer resets
+- Fix: **Status bar omitted folder modified date** — single folder selection showed only `· Name (folder)` with no date; now shows `· Name (folder) · <date>` matching the file row format
+- Fix: **Column-view search fallback was silent** — switching to search mode while in column view swapped the layout to a flat list with no user-visible explanation; `renderView` now injects a `#ff-col-search-notice` info banner above the flat list explaining the fallback and suggesting switching to List view
+- Fix: **List-view search lacked a Location column** — after R39 fixed list-view to use `renderListView` during search, it showed no path context; `renderListView` now inserts a `Location` `<col>` + `<th>` + per-row `<td>` (showing the parent directory, truncated with ellipsis) when `state.searchMode` is true; the column is also sortable via `state.listSort.col==='loc'`
+
+### v1.0.1-RC2-R39 — 2026-04-12 (known-issues audit + list-search fix)
+- Fix: **list view search fell back to flat list renderer** — `renderView()` search-mode branch routed both `list` and `column` to `renderFlatList`; list view should (and now does) use `renderListView` during search because `getVisibleEntries()` already returns `state.searchResults` in search mode, so the familiar sort columns, column-resize handles, and virtual-scroll virtualiser are preserved; column view still falls back to `renderFlatList` (correct — it requires a real directory tree)
+- Docs: **removed stale known-issue** — "Undo only tracks paste (Ctrl+V)" was superseded at r67 when all 8 op types (move, copy, rename, delete, create, batchRename, tags, chmod) were wired into `undo.js`; entry removed from Known Issues
+- Docs: **narrowed column-search known-issue** — updated the remaining entry to explicitly state that only column view falls back to a flat list; list/icon/gallery retain their own renderers during search
+
+### v1.0.1-RC2-R38 — 2026-04-11 (a11y + gallery layout fixes)
+- Fix: **a11y tests — gallery strip items missing ARIA attributes** — `_makeGthumb` built `.gthumb` elements with no ARIA attributes; `a11y.test.js` asserts `role="option"`, `aria-selected`, and `aria-label` on every gallery strip item (mirroring the attributes already set on column/list/icon rows); added `el.setAttribute('role','option')`, `el.setAttribute('aria-selected', isSel?'true':'false')`, and `el.setAttribute('aria-label', e.name+(e.is_dir?', folder':''))` to `_makeGthumb`; also updated the incremental fast-path loop to keep `aria-selected` in sync when selection changes without a full rebuild
+- Fix: **`GTHUMB_W` / `THUMB_STRIDE` frozen at module load time** — both were module-level `const`s evaluated once when `views.js` was imported, at which point `d()` was still `null`; `iconSizeGallery` therefore always defaulted to `128` and the thumbnail width never responded to user preference changes made in Settings; converted to a live `_gthumbW()` getter function that reads `d()?.state?.iconSizeGallery` on every call; updated all three call sites (`_thumbLeft`, `_paintStrip` window calculation, `_scrollToSel` centering) to use `_gthumbW()` and removed the now-dead `THUMB_STRIDE` constant
+
+### v1.0.1-RC2-R37 — 2026-04-11 (test fixes)
+- Fix: **Rust tests — `search_advanced` signature mismatch** — 3 test calls still used the old 6-argument form after `size_op` and `date_op` (both `Option<String>`) were added to the function signature; affected tests: `search_regex_invalid_pattern_returns_error` (line 12436), `search_includes_hidden_files_when_flag_set` (line 12472), `search_contents_finds_text_inside_file` (line 12490); all three now pass `None, None` as the final two arguments; the other 8 calls in the test suite already had the correct arity
+- Fix: **JS tests — `localStorage.clear is not a function`** — jsdom v24+ requires a valid origin (URL) for the Web Storage APIs to be instantiated; without it jsdom provides a non-functional stub and `localStorage.clear()` in `setup.js`s `beforeEach` hook throws at runtime, failing all 61 tests in `main.test.js`; fixed by adding `environmentOptions: { jsdom: { url: 'http://localhost' } }` to `vitest.config.js` — the correct Vitest-native solution rather than manually constructing a `JSDOM` instance in setup.js
+
+
+### v1.0.1-RC2-R36 — 2026-04-11 (gallery fix)
+- Fix: **Gallery view was completely broken** — `sortState` was used inside `_buildBarHtml()` (the gallery toolbar builder, added in R26 for the sort button) but was never added to the `renderGalleryView` destructuring of `d()`; at runtime `sortState` was `undefined`, causing a `TypeError: Cannot read properties of undefined (reading 'col')` that crashed the entire `renderGalleryView` call before any HTML was produced — resulting in a permanently blank gallery pane; fixed by adding `sortState` to the destructuring on line 2746 of `views.js`
+
+
+### v1.0.1-RC2-R35 — 2026-04-11 (esbuild fix)
+- Fix: esbuild (Vite's bundler) rejected two expressions in `crossPaneCopy` and `crossPaneMove` where `??` was mixed with `||` without explicit parentheses — `_paneB.path || panes[1].path ?? state.currentPath` is ambiguous under the ECMAScript spec and esbuild enforces the disambiguation; added parentheses: `(_paneB.path || panes[1].path) ?? state.currentPath`; this blocked `npm run tauri dev` and `cargo tauri build` with an esbuild parse error
+
+**Note on version mismatch warning**: The `tauri-plugin-fs (v2.4.5) / @tauri-apps/plugin-fs (v2.5.0)` and `tauri-plugin-dialog` version mismatches are pre-existing in your environment and unrelated to this codebase — run `npm update` in the project root or pin the NPM packages to match your Cargo.toml versions to clear those warnings.
+
+### v1.0.1-RC2-R34 — 2026-04-11 (CRITICAL boot fix)
+- **Fix: app rendered a blank screen on launch** — `state._tagFilter` was missing from the global `state` object (only existed in `makeTabState` for per-tab state). The toolbar fast-path code added in R33 read `state._tagFilter.length` before any tab state was merged into `state`, causing a `TypeError: Cannot read properties of undefined (reading 'length')` that crashed the entire render chain before any DOM content was built. Sidebar, toolbar, and file view all appeared blank with status bar stuck on "Loading..."
+- Fix: Added `_tagFilter:[]`, `_tagFilterMode:'AND'`, `_activeSavedSearch:null`, and `previewError:false` to the global `state` object initializer (all four were in `makeTabState` but not in the module-level `state`)
+- Fix: Guarded the toolbar tag-filter indicator with `Array.isArray(state._tagFilter)` for defensive safety at early render time
+
+### v1.0.1-RC2-R33 — 2026-04-11 (gap-fix)
+- Fix: `state._activeSavedSearch` was not in `syncState` keys or `makeTabState` — switching tabs lost the saved-search auto-refresh registration; both now included
+- Fix: `_runSavedSearch` did not clear `state._activeSavedSearch` on error — a failed search would keep the auto-refresh hook active and re-run the broken search on every subsequent dir-changed event; now cleared in the `.catch()` handler
+- Fix: Omnibar action items (type `>`) displayed the raw action ID (e.g. `go-to-folder`) instead of the human-readable label and key chord; action rows now show the binding's `label` (e.g. "Go to folder") and `keyLabel` (e.g. "Ctrl+G") from `_KB_DEFAULTS`
+- Fix: `toast.search_already_saved` was a hardcoded English string; added to all 12 locale files and switched to `t('toast.search_already_saved')`
+- QoL: Toolbar now shows a purple "Tags: N" pill when a tag filter is active; clicking the pill re-opens the tag filter bar; the indicator updates in the fingerprint fast-path so it doesn't force a full toolbar rebuild on every render
+
+### v1.0.1-RC2-R32 — 2026-04-11 (QoL)
+- QoL: Omnibar (`Ctrl+K`) placeholder now reads "Go to path or recent location…  (› type > for actions)" — making the command-palette mode discoverable without prior knowledge
+- QoL: Saved searches now auto-refresh — `_runSavedSearch` records `state._activeSavedSearch`; the `dir-changed` watcher event checks whether the changed path is under the search root and re-runs the search if so, keeping pinned search tabs live as files change; cleared on navigate away
+
+### v1.0.1-RC2-R31 — 2026-04-11 (bug-fix)
+- Fix: **Omnibar action dispatch was completely broken** — `_dispatchKbAction(item.path)` was called with a bare action-id string as the first argument, but `_dispatchKbAction` expects `(e, kb, noInputOnly, ctx)` (keyboard event, keybinding map, filter flag, state context); at runtime this produced `undefined` for all destructured args and silently did nothing; replaced with a direct action-id → function map covering all commonly-used actions (`_showOmnibar`, `_showGoToFolder`, `_showTagFilterBar`, `_showAdvancedSearch`, `newTab`, `promptCreate`, `showDiskUsage`, `showCloudDialog`, etc.)
+
+### v1.0.1-RC2-R30 — 2026-04-09 (robustness)
+- Fix: `_quickSaveSearch` allowed saving the same search query multiple times; now deduplicates by query string and shows "Search already saved" toast if a match exists
+- Fix: `_saveTagRules` had no size limit; array is now capped at 50 rules (`slice(0,50)`) to prevent unbounded localStorage growth
+- Fix: Smart Folders "Recent" and "Large Files" searched from `state.currentPath` only — meaning they only found files in the current folder tree rather than across the home directory; both now resolve `get_home_dir` and search from there (falling back to current path if unavailable)
+- Fix: `_applyTagRules` had no stale-navigation guard — if the user navigated to a new folder while async tagging was still running, rules would apply tags to entries from the old folder that were no longer visible; added a path snapshot before the loop that returns early if `state.currentPath` changes mid-run
+- Fix: `_showGoToFolder` navigate call had no error handler — if the user typed a non-existent path and pressed Enter, the dialog would close but nothing visible would happen; now shows an "error" toast with the bad path
+
+### v1.0.1-RC2-R29 — 2026-04-09 (gap-fix)
+- Fix: `previewError` was not in `syncState` keys — tab switching reset the error state so a re-render after switching back would show a blank panel instead of the error message; added to syncState, makeTabState, and the keys list
+- Fix: `iconSizeIcon` and `iconSizeGallery` were not in `syncState` — switching tabs reset per-view icon sizes; both added to syncState, saveSession (persisted per-tab), and restoreSession (restored on relaunch)
+- Fix: tag filter bar and `state._tagFilter` were not cleared on folder navigation — pills showed stale tags from previous folder; `applyNavState` now resets `_tagFilter`/`_tagFilterMode` and removes the bar DOM element when navigating to a new path
+
+### v1.0.1-RC2-R28 — 2026-04-09
+- New: Multi-tag filtering (`Ctrl+Alt+T`) — tag filter bar slides in above the view host showing all tags in the current folder as pill buttons; click tags to toggle them into the active filter (highlighted with a halo), press the AND/OR mode button to switch logic; the filter applies inside `getVisibleEntries` so it composes correctly with the name filter and sort; `_tagFilter` and `_tagFilterMode` are synced across tab switches via `syncState`
+- New: Tag Auto-Rules settings UI — Settings → Customisation now has a "Tag Auto-Rules" section with a three-column form (glob pattern, optional path prefix, tag name); rules are shown as deletable rows; all rules persisted to `ff_tag_rules` localStorage and applied by `_applyTagRules()` after every directory load
+- Improvement: Tag filter keybinding `Ctrl+Alt+T` added to `_KB_DEFAULTS` — visible in cheatsheet, remappable in Settings → Shortcuts
+
+### v1.0.1-RC2-R27 — 2026-04-09
+- New: Persistent search — "📌 Save" button appears in the breadcrumb rail whenever search results are active; clicking it opens a lightweight inline dialog pre-filled with the query, letting you name and save the search to the Saved Searches sidebar section with one action; uses existing `_getSavedSearches`/`_setSavedSearches` infrastructure
+- New: Smart Folders sidebar section — four built-in virtual queries above the Tags section: **Recent** (files modified in the last 7 days, sorted newest first), **Large Files** (files >100 MB, sorted largest first), **Downloads** (navigates to `~/Downloads`), **Screenshots** (navigates to `~/Pictures/Screenshots` → `~/Screenshots` → `~/Pictures`); collapsible with the same `_sbCol` mechanism as other sections; no disk storage — queries run live on every click
+- New: Tag Auto-Rules — passive rule engine stored in `ff_tag_rules` localStorage; rules are `{glob, pathPrefix, tag}` objects; `_applyTagRules()` runs after every `loadTagsForEntries()` call and auto-tags matching files via `set_file_tags_v2`; `_matchGlob()` supports `*` and `?` wildcards; rules can be managed via `_getTagRules()`/`_saveTagRules()` (UI hookup in Settings pending)
+
+### v1.0.1-RC2-R26 — 2026-04-09
+- New: `Ctrl+G` Go to Folder — dedicated path dialog with `~` expansion (resolved via `get_home_dir`), live filesystem tab-completion (reads `list_directory` as you type), `Tab` to accept the top completion, `↑`/`↓` to choose, `Enter` to navigate; fills to `~/` on open so the first keystroke starts narrowing immediately
+- New: Command palette extension for `Ctrl+K` omnibar — type `>` prefix to switch into action mode (shows all keybinding actions filtered by label), or get 3 action suggestions inline in any normal search; selecting an action dispatches through `_dispatchKbAction` so the full keybinding system handles it; actions shown with a purple `> cmd` badge
+- New: Gallery sort controls — Sort button added to the gallery toolbar showing the current column name and direction arrow (`↑`/`↓`); clicking opens the existing `showSortMenu` popup so gallery sort works identically to list/column view sort including direction toggle and Folders First
+
+### v1.0.1-RC2-R25 — 2026-04-05
+- Fix: inline rename (`F2`, slow-double-click on label) was broken in all views — `startRename()` referenced an undefined closure variable `selector`, causing `document.querySelector(undefined)` to always return `null` and always fall back to the modal dialog; fixed by deriving the element from `entry.path` via `[data-path]` attribute lookup across `.ico-lbl`, `.cell-name-text`, and `.fname` selectors
+- Fix: icon view label elements had no `class` or `data-path`, preventing the path-based lookup; added `lbl.className='ico-lbl'` and `lbl.dataset.path=e.path` to `makeItem`
+- Fix: list view `cell-name-text` spans had no `data-path`; added `data-path` attribute so startRename can locate them
+- Fix: column view `fname` spans had no `data-path`; added `data-path` attribute
+- QoL: icon size slider (`Ctrl+Shift+=/−`) is now per-view — icon view remembers its own size (`ff_icon_size_icon`), gallery view remembers its own strip thumbnail size (`ff_icon_size_gallery`), column/list share the original global key; switching views no longer resets thumbnail sizes across views
+- QoL: gallery strip thumbnail width responds to the gallery-specific size preference, scaling proportionally
+
+### v1.0.1-RC2-R24 — 2026-04-05
+- Fix: sidebar favourites (and Locations/SFTP/FTP/Cloud/MTP items) did not highlight when navigating to a matching path via keyboard, breadcrumb, restored session, or omnibar; `applyNavState` now sets `state.activeSb` to the deepest matching favourite path on every navigation
+- Fix: clipboard history panel (`Ctrl+Shift+V`) had no keyboard navigation — only mouse clicks worked; added arrow-up/down to move focus, Enter to paste the focused item, with scrollIntoView so the focused row is always visible
+- Fix: sort popup closed immediately when clicking the same column to toggle direction, making it impossible to see the direction change; same-column clicks now update the arrow indicator in-place and keep the popup open — only different-column or Folders First clicks close it
+- Fix: gallery view showed a black void for empty directories; added an "Empty folder" icon+label matching the behaviour of column, list, and icon views
+- Fix: cheatsheet (`Ctrl+/`) was a static 40+ entry table with no way to find a specific shortcut; added a live filter input (autofocused on open) that filters both by label and by key chord across all categories; category badges appear next to each result when a filter is active
+- Fix: dragging files onto sidebar favourite items did not show the blue `drop-over` highlight even though dropping worked; the fav-reorder `dragover` handler was intercepting all drags and overriding the `drop-over` CSS class — now only fires when a sidebar item itself is being reordered (`_dragFavIdx >= 0`)
+
+### v1.0.1-RC2-R23 — 2026-04-05
+- Fix: `Ctrl+Shift+R` batch rename was missing from `_KB_DEFAULTS` — invisible in cheatsheet and not remappable in Settings → Shortcuts; added the entry, wired dispatch case, and imported `showBatchRenameDialog` (the function itself was already fully implemented in views.js)
+- Fix: preview panel showed a silent blank when `get_file_preview` threw an error; added `state.previewError` flag (set in the catch block, cleared on new load) and render a styled "Preview unavailable" panel with icon and description instead of a blank void
+- Fix: view mode was global (`ff_viewMode` single localStorage key); added `ff_view_prefs` per-folder map matching the `ff_sort_prefs` pattern — `_saveViewPrefForPath` called when user manually switches modes, `_applyViewPrefForPath` called in `applyNavState` on every navigation
+- Fix: new tab always opened in global default view mode instead of inheriting the active tab's current view mode; `newTab()` now copies `viewMode` from the active tab's state
+- Fix: `notifyOpComplete()` was only called from paste (Ctrl+V) and trash paths; now also fires after successful copy/move batch operations when the window is not focused
+- Fix: `crossPaneCopy()` and `crossPaneMove()` (F5/F6) always read selection from the main pane's `sel` object even when Pane B was focused; both functions now check `isPaneBFocused()` and read from `_paneB.selIdx`/`_paneB.entries` when appropriate, with correct source/dest swap
+- Fix: split-pane active state was saved to `sessionStorage` (lost on restart); `saveSession()` now writes `paneB: { active, path, viewMode }` into `ff_session`, and `restoreSession()` reopens and navigates Pane B after tabs are restored
+- Fix: typing in the search box then switching tabs before pressing Enter lost the typed text; `syncState()` now flushes the live DOM search input value to `state.search` before saving the tab snapshot (skipped if the input is currently focused to avoid clobbering mid-type)
+
+### v1.0.1-RC2-R22 — 2026-04-05
+- Fix: `toast.select_single_file` locale key was missing from all 11 non-English locale files; all 12 locales are now at 294 keys and the CI locale gate passes cleanly
+- Fix: `_showOpenRecent` (`Ctrl+Shift+E`) now shows two sections — **Files** (last 10 opened files from `ff_recent_files`, with coloured extension badge and parent-folder path) and **Folders** (last 10 navigated locations); previously it only showed path history
+- Fix: `makeTabState` now initialises `_restoreColScrolls: {}` and `_restoreListScroll: 0` directly, so a fresh tab that becomes a background tab before any session-restore never falls back to undefined and silently loses its scroll position on restart
+- Fix: `toggle-preview` action (toolbar button and `Ctrl+P` in views.js) now sets `pointer-events: none` on `#preview-resize-handle` when the panel is hidden, so the invisible drag handle no longer intercepts mouse events on the content area
+- Feature: Cloud sidebar entries now show a live reachability dot — green (●) when `check_cloud_remote_reachable` returns true, red (●) when offline; the probe fires asynchronously after `renderSidebar()` so it never blocks the sidebar render
+- Polish: Drive type badges (NVMe/SSD/HDD/USB/NET/OPT) are now pill-shaped with per-type colour fill, inset glow border, monospace font, and a type-glyph prefix (⚡ NVMe, ◆ SSD, ○ HDD, ⧄ USB, ◎ NET); active-item override keeps them legible on blue backgrounds
+
+### v1.0.1-RC2-R20 — 2026-04-04
+- Fix: `saveSession` was reading column and list-view scroll positions from the active tab's DOM for *all* tabs; background tabs now use their cached `_restoreColScrolls`/`_restoreListScroll` values, so restart scroll restoration is correct for every tab
+- Fix: `reopenLastTab` (Ctrl+Shift+T) now restores the closed tab's `viewMode` and `showHidden`; previously only the path was saved/restored
+- Fix: `renderTabs` now calls `scrollIntoView({ inline:'nearest' })` on the active tab element after rebuilding the bar, so Ctrl+Tab or Ctrl+1–9 always keeps the active tab visible when the bar overflows
+- Fix: `duplicate-tab` (both Ctrl+Shift+D keybinding and context menu) now copies `listSort` into the new tab state; previously sort column/direction was always reset to default
+- Fix: `toggle-preview` action now sets `--preview-hidden` CSS variable and calls `render()`, bringing it in sync with the views.js Ctrl+P handler; prevents layout drift when toggling via toolbar vs keyboard
+- Fix: `saveSession` now serialises `listSort` per tab; `restoreSession` reads it back so list-view sort order survives an app restart
+- QoL: Tab context menu now includes "Close Tabs to Left" alongside "Close Tabs to Right"
+
+### v1.0.1-RC2-R19 — 2026-04-04
+- Fix: `ff_iconSize` / `ff_icon_size` localStorage key split — state init and keyboard shortcuts used different keys so icon size never survived a reload; unified to `ff_icon_size` (default `80`)
+- Fix: three duplicate keybindings in `_KB_DEFAULTS`: `Ctrl+Shift+D` (Compare files remapped → `Ctrl+Shift+M`), `Ctrl+Shift+E` (Error log remapped → `Ctrl+Shift+L`), `Ctrl+Shift+V` (Encrypted vaults remapped → `Ctrl+Shift+K`)
+- Fix: cheat sheet had duplicate F3 and F5 entries and was missing `Ctrl+K`, `Ctrl+Shift+A`, `Ctrl+Shift+V` (clipboard), `F2` rename, `Ctrl+I`; rebuilt as single clean table reflecting the actual keybinding table
+- Feature: recently-opened files tracker — `_recordRecentFile()` is called on every `open_file` invoke; stores last 20 files under `ff_recent_files` in localStorage
+- Feature: per-folder filter bar persistence — Ctrl+F now restores the last filter used in each folder; cleared when you explicitly dismiss with Esc or ✕
+- Fix: Empty Trash modal now shows the actual item count ("Permanently delete 14 items…" instead of "all items")
+
+### v1.0.1-RC2-R18 — 2026-04-04
+- Fix: app freeze after pressing Stop — `<a download>.click()` triggers WebKit2GTK's download interception handler which blocks the main thread; replaced with Tauri-native `dialog.save()` + `fs.writeFile()` so the recording is saved via a proper native save dialog without freezing
+- UI now resets immediately on stop (before the async save), and the record button is briefly disabled while saving to prevent double-press
+- Added `fs:allow-write-file`, `fs:allow-app-write`, `dialog:allow-save` to `src-tauri/capabilities/main.json`
+
+### v1.0.1-RC2-R17 — 2026-04-04
+- Fix: camera recording now works — WebKit2GTK denied `getUserMedia` by default; added a `connect_permission_request` handler in `main.rs` setup that auto-grants all media permission requests (camera + mic) so the recording overlay opens the webcam without a browser-style prompt
+- `src-tauri/Cargo.toml`: added `webkit2gtk = { version = "2" }` under `[target.'cfg(target_os = "linux")'.dependencies]` so the permission handler traits (`WebViewExt`, `PermissionRequestExt`) resolve at compile time
+- `src-tauri/tauri.conf.json`: added `mediastream:` to the `media-src` CSP directive so `getUserMedia` stream URLs are not blocked by the content-security policy
+- **Rust recompile required** (Cargo.toml and main.rs changed)
+
+### v1.0.1-RC2-R16 — 2026-04-04
+- Fix: camera `getUserMedia` was blocked by WebKit2GTK — added `settings.set_enable_media_stream(true)` and `settings.set_enable_media_capabilities(true)` in the `with_webview` block; webkit2gtk 2.0.2 has no `prelude` module so traits are now imported directly (`use webkit2gtk::{WebViewExt, SettingsExt, PermissionRequestExt}`) and `settings()` called as `WebViewExt::settings(&wv)` to resolve ambiguity with `WidgetExt::settings`
+
+### v1.0.1-RC2-R15 — 2026-04-04
+- Fix: added `rust-toolchain.toml` at project root pinning toolchain to `1.88.0` — the exact minimum required by `darling 0.23`, `image 0.25`, `serde_with 3.18`, `time 0.3`, and `zbus 5.14`; stays below the 1.93.x ICE regressions (`const_of_item`, `body_codegen_fn_attrs`, `hir_node`) that crash builds of `brotli` and `serde_derive_internals`
+
+### v1.0.1-RC2-R14 — 2026-04-04
+- Feature: Camera devices (e.g. Rapoo webcam) in the sidebar DEVICES section now open a live video recording overlay when clicked, instead of attempting filesystem navigation
+- The overlay shows a live preview feed, a record/stop button, a running timer with pulsing REC badge, and auto-saves recordings as `.webm` files to the browser's Downloads on stop
+- Added `src/camera.js` — self-contained camera module; no native Rust changes needed (uses browser MediaRecorder + getUserMedia APIs available in the Tauri webview)
+- `src/main.js`: MTP device sidebar items now carry `data-cam="1"` when the device name matches `camera|cam|webcam`; sidebar nav handler intercepts those clicks and delegates to `_openCameraView()`
+- Fix: bumped `RUST_MIN_STACK` from 16 MiB → 32 MiB in `src-tauri/.cargo/config.toml` — rustc SIGSEGV on `gio` persisted on some machines at 16 MiB; rustc recommends 33554432
+
+### v1.0.1-RC2-R13 — 2026-04-03
+- Fix: right-clicking empty space in column view now shows background context menu (New Folder, Paste, etc.) — previously did nothing
+- Fix: clicking/mousedown on empty column background now clears selection
+- Fix: clicking empty space between icons in icon view now clears selection
+
+### v1.0.1-RC2-R12 — 2026-04-03
+- Fix: Escape now clears file selection when no modal/search/QL is active (previously did nothing)
+- Fix: D&D auto-scroll — scrollable containers (col-list, list-body, icon-grid) now edge-scroll during drag when cursor is within 48px of top/bottom edge
+- Fix: removed stopPropagation from row dragover handler so the floating drag badge tracks cursor position correctly throughout a drag
+
+### v1.0.1-RC2-R11 — 2026-04-03
+- Fix: tab X button now closes correctly with 2+ tabs; WebKit2GTK draggable parent was swallowing the close button's click event — switched to mousedown and guarded the tab div's click handler against .tab-close targets
+
+### v1.0.1-RC2-R10 — 2026-04-03
+- Fix: sort header ("Name ↑" / sort label) now shows on every column in column view, not just the rightmost column
+
+## v1.0.1-RC2-R9 — Rust build fixes
+
+**Files changed:** `src-tauri/src/main.rs`, `src-tauri/.cargo/config.toml` (new)
 **Rust recompile required:** Yes
+**Date:** 2026-04-03
+
+### Fixes
+- **`rustc` SIGSEGV on `cairo-rs` / `gio`** — Added `src-tauri/.cargo/config.toml` that permanently sets `RUST_MIN_STACK=16777216`. The GTK-rs macro expansion depth overflows rustc's default 8 MiB worker stack; 16 MiB resolves it without any manual `export` step.
+- **Unused import warning** — Removed `Accessor` from `use lofty::prelude::{Accessor, TaggedFileExt}` at `main.rs:8408`; only `TaggedFileExt` is used at that call site.
+
+---
+
+## v1.0.1-RC2-R8 — Tab & QoL gap fixes
+
+**Files changed:** `src/main.js`
+**Rust recompile required:** No
+**Date:** 2026-04-03
+
+### Tab gaps closed
+- **`Ctrl+Tab` / `Ctrl+Shift+Tab`** — Next/Previous tab now actually work (were in cheatsheet but never dispatched)
+- **`Ctrl+1`–`9`** — Jump directly to tab N
+- **`Ctrl+Shift+D`** — Duplicate tab (clones path + view mode)
+- **`Duplicate Tab`** also wired into the new tab right-click context menu
+- **Tab right-click context menu** — Right-click any tab for: New Tab Here, Duplicate Tab, Close Tab, Close Other Tabs, Close Tabs to the Right
+- **Tab tooltip** — Full path on hover now actually shows (was reading `tab.path` which was never set; fixed to `tab.state.currentPath`)
+- **`+` button** — Now opens current folder, consistent with `Ctrl+T` (was opening home)
+- **Cheatsheet** — Tab section completed (`Ctrl+Shift+T` reopen, `Ctrl+Shift+Tab` prev, `Ctrl+Shift+D` duplicate, `Ctrl+1–9` jump)
+
+### Pane B gaps closed
+- **Cheatsheet** — New "Split Pane" section added: `F3`, `Tab`, `Ctrl+\`, `Ctrl+Shift+Tab`, `F5`, `F6` all documented
+
+### QoL fixes
+- **Dead `search-focus` dispatch case** removed (duplicate that was never reached)
+- **`showContextMenu`** now supports `_onAction` callbacks, enabling in-place action wiring without routing through `ctxAction`
+
+---
+
+## What's in v1.0.1-RC2-R3 — Native EXIF/PDF metadata + Audio features
+
+**Files changed:** Multiple source files
+**Rust recompile required:** Yes
+**Date:** 2026-03-29
 
 | Build | Status | Version | Revision | Date |
 |-------|--------|---------|----------|------|
-| FrostFinder-v1_0_1-RC2-R3-2026-03-28 | rc2 | 1.0.1-RC2 | R3 | 2026-03-28 |
+| FrostFinder-v1_0_1-RC2-R3-2026-03-29 | rc2 | 1.0.1-RC2 | R3 | 2026-03-29 |
 
 ### Fix — Native EXIF metadata (no exiftool dependency)
 
-**Problem:** EXIF image metadata and PDF metadata editors required `exiftool` as an external system dependency. Users without exiftool installed saw error messages and could not edit metadata.
+**Problem:** EXIF image metadata and PDF metadata editors required `exiftool` as an external system dependency.
 
-**Fix:** Added native Rust implementations using pure-Rust crates:
+**Fix:** Added native Rust implementations:
 - `kamadak-exif` for EXIF reading (JPEG/PNG)
 - `lopdf` for PDF metadata read/write
-- New Tauri commands: `get_exif_tags`, `write_exif_tags`, `get_pdf_meta`, `write_pdf_meta`
+- `reqwest` + `urlencoding` for HTTP requests
+- `base64` for cover art encoding
+- New commands: `get_exif_tags`, `write_exif_tags`, `get_pdf_meta`, `write_pdf_meta`, `search_music_metadata`, `fetch_album_art`, `get_audio_cover`
 
-**Fields supported:**
-- EXIF: DateTimeOriginal, Make, Model, Orientation, GPS (lat/lon/alt)
-- PDF: Title, Author, Subject, Keywords
+### Feature — Collapsible/Resizable Preview Panel
 
-**Changes:**
-- Updated JS (`views.js`) to call new native commands instead of `get_file_meta_exif`/`write_file_meta_exif`
-- Error messages updated — no longer mention exiftool
-- Removed Orientation dropdown from EXIF editor (not supported by kamadak-exif for writing)
+- **Ctrl+P** toggles preview panel
+- Drag resize handle on left edge (180px-800px)
+- Width and state saved to localStorage
+
+### Feature — Audio Metadata Search
+
+- Search MusicBrainz database from audio tag editor
+- Shows album cover thumbnails
+- Auto-fills: title, artist, album, year
+
+### Feature — Album Cover Embedding
+
+- Downloads cover from Cover Art Archive
+- Embeds into audio file (MP3/FLAC/etc.)
+- Displays cover in Gallery View instead of music icon
+
+### Feature — Ctrl+i Shortcut
+
+- Opens metadata editor for selected file (images, audio, PDF)
 
 ---
 
@@ -9754,13 +10040,12 @@ Core feature set is complete and stable:
 - Search listeners use event delegation on `#toolbar` (attached once in `init()`, never re-attached on re-render)
 - `getVisibleEntries()` returns `state.searchResults` in search mode — icon/gallery pick them up automatically
 - Drive sort order: NVMe → SSD → HDD → USB → Optical → Network
-- Undo stack: `state._undoStack[]` / `state._redoStack[]`, capped at 50 entries
+- Undo stack: `state._undoStack[]` / `state._redoStack[]`, capped at 200 entries (raised 50→200 at r30), persisted across sessions via `save_undo_history` / `load_undo_history`
 
 ---
 
 ## Known Issues / Limitations
-- Undo only tracks paste (Ctrl+V) operations in this revision. Drag-and-drop moves are not yet tracked.
-- Column view search falls back to flat list (column view requires a real directory tree).
+- **Column view** search falls back to a flat list (column view requires a real directory tree; list/icon/gallery views retain their own renderers during search).
 - USB detection requires either `/run/media/` mount path OR `is_usb_device()` sysfs check passing. If your distro mounts USB elsewhere, check `classify_drive()` in `main.rs`.
 
 ---
@@ -9780,4 +10065,92 @@ frostfinder/
 ├── RELEASE.md           — this file
 └── index.html
 ```
+
+## v1.0.1-RC2-R4 — 2026-04-02
+
+### Bug fixes
+- **JS syntax: `#adv-save` async handler** — `click` listener in the advanced-search save
+  flow was missing `async`, causing a runtime "await outside async function" error that
+  crashed the Vite dev build entirely.
+- **JS syntax: `#btn-restore-trash` listener** — a bad edit left the restore-selected
+  listener wired as `});?.addEventListener(...)` (the `document.getElementById(...)` call
+  was dropped), producing an invalid-token parse error.
+- **JS syntax: missing `});` in `renderTrashBanner`** — the empty-trash `click` handler
+  inside the `.then()` block was never closed before the restore listener began, and the
+  `.catch()` block was missing its own closing `});`, leaving two unclosed call-expression
+  arguments.
+- **JS syntax: missing `}` closing `showContextMenu`** — the `showContextMenu` function
+  body was never closed before `closeContextMenu` was declared, making every subsequent
+  function declaration nested one level deep and causing an "Unexpected end of input" error
+  at the module EOF. All four errors were pre-existing and prevented the Vite frontend from
+  loading.
+
+## v1.0.1-RC2-R5 — 2026-04-02
+
+### Bug fixes
+- **Media server OOM crash (system-level)** — the media HTTP server spawned one
+  unbounded OS thread per TCP connection with no cap and no socket timeout.
+  Audio playback drives a burst of range requests (initial probe, buffer chunks,
+  seek probes, Web Audio API intercepts); rapid seeking could create hundreds of
+  threads within seconds, exhausting virtual memory and crashing the system via
+  the OOM killer.  Fixed with three changes in `start_media_server()`:
+  - **Thread cap**: `MEDIA_ACTIVE` atomic counter + `MEDIA_MAX_THREADS = 32`;
+    connections are dropped (browser retries) when the cap is reached.
+  - **Socket timeouts**: 30 s read + write timeout on every connection so hung
+    clients (disconnected mid-seek) release their thread promptly.
+  - **512 KB stack**: `thread::Builder::stack_size(512 * 1024)` replaces the
+    8 MB Linux default, reducing per-thread virtual memory by 16x.
+
+  **Requires Rust recompile.**
+## v1.0.1-RC2-R6 — 2026-04-02
+
+### Improvements
+- **Office file previews wired** — DOCX, XLSX, PPTX, ODT, ODS, ODP files now
+  attempt a LibreOffice → PDF conversion via `get_office_preview`. If LibreOffice
+  is installed the preview panel (and gallery) upgrades from raw extracted text to
+  a full-fidelity PDF iframe. Without LibreOffice the text-extraction fallback is
+  still shown, now with a labelled banner ("Word Document — text preview") and an
+  "Install LibreOffice for full preview" hint.
+- **Image dimensions no longer depend on `exiftool`** — `loadPreview` now calls
+  `get_exif_tags` (native `kamadak-exif`) instead of `get_file_meta_exif`
+  (exiftool subprocess) to read `ImageWidth`/`ImageHeight` for the preview panel.
+  `ExifData` extended with `image_width` / `image_height` from EXIF tags
+  `PixelXDimension` / `PixelYDimension` (with `ImageWidth` / `ImageLength` fallback).
+- **Suppressed `unused import: Accessor` build warning** in `get_audio_tags`; renamed
+  to `Accessor as _` to keep the trait in scope without the lint.
+
+### Requires Rust recompile
+`src-tauri/src/main.rs` — `ExifData` struct and `get_exif_tags` extended.
+## v1.0.1-RC2-R7 — 2026-04-02
+
+### Bug fixes
+- **Drag-and-drop column update lag** — both source and destination columns now
+  update immediately on drop, without waiting for the full file operation to
+  finish. Previously both columns stayed stale until the entire move/copy
+  completed (could be seconds for large files).
+
+  Two-part fix in `setupDropTarget`'s drop handler (`src/main.js`):
+
+  - **Optimistic source remove (move only)**: the dragged entries are
+    immediately spliced out of `state.columns` (and pane B if it is showing
+    the same directory) and `render()` is called before `invoke()` fires.
+    If the op is cancelled or errors, `refreshColumns()` at the end restores
+    the correct state.
+  - **Optimistic destination refresh**: a `list_directory_fast` IPC call for
+    the destination path is fired concurrently with the Rust file op (not
+    awaited), updating the dest column (and pane B) as soon as the OS flush
+    is visible — typically within one round-trip (~5–20 ms), well before
+    `ddDone` resolves. `refreshColumns()` after completion reconciles any
+    ordering or metadata differences.
+
+  No-op if the destination column is not currently open. Covers both
+  main-pane columns and split-pane (pane B). No Rust changes required.### v1.0.1-RC2-R22 — 2026-04-05
+- Fix: `toast.select_single_file` key was missing from all 11 non-English locale files (would have caused `check-locales.js` CI gate to exit 1); added native translations for de/es/fr/hi/ja/ko/nl/pt/ru/zh/ar — all 12 locales now have exactly 294 keys
+- Fix: `_showOpenRecent` (Ctrl+Shift+E) only surfaced recently *navigated folders* (path history); now merges both recent *files* (`ff_recent_files`, tracked since R19) and recent *folders* into a single polished overlay with per-section labels, file-type ext badges, colour-coded icons, and folder icons
+- Fix: `toggle-preview` action and Ctrl+P handler in views.js now set `pointer-events:none` on the resize handle when the panel is hidden, preventing phantom resize drags through a collapsed panel
+- Fix: `makeTabState()` now initialises `_restoreColScrolls:{}` and `_restoreListScroll:0` so fresh tabs that become background tabs before any session-restore never fall through to `(undefined||{})` — scroll is 0 rather than potentially undefined
+- QoL: Cloud sidebar section (WebDAV/rclone) now shows per-mount reachability badges — an animated grey pulse while checking, a green dot when the remote is reachable, a red dot when offline; powered by `check_cloud_remote_reachable` (already existed in Rust, now wired)
+- QoL: Drive-type badges (NVMe/SSD/HDD/USB/NET/OPT) are now beautiful — glassmorphic background, coloured glow text-shadow, inset highlight, hover scale animation; cloud items have their own styled indicator instead of a plain ✕ button
+- QoL: Recent overlay redesigned — card layout with section headers, icon-with-rounded-bg, file extension pill badges, muted path line, keyboard shortcut hint
+
 

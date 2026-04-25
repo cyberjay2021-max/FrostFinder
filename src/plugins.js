@@ -261,7 +261,7 @@ async function _showPluginManager() {
       if (!path) return;
       const { writeTextFile } = await import('@tauri-apps/plugin-fs');
       await writeTextFile(path, json);
-      showToast(`Exported ${plugins.length} plugin${plugins.length !== 1 ? 's' : ''}`, 'success');
+      showToast(t(plugins.length !== 1 ? 'toast.plugins_exported_plural' : 'toast.plugins_exported', {n: plugins.length}), 'success');
     } catch(e) { showToast('Export failed: ' + e, 'error'); }
   });
 
@@ -274,7 +274,7 @@ async function _showPluginManager() {
       const { readTextFile } = await import('@tauri-apps/plugin-fs');
       const raw = await readTextFile(path);
       const imported = JSON.parse(raw);
-      if (!Array.isArray(imported)) { showToast('Invalid plugin file — expected a JSON array', 'error'); return; }
+      if (!Array.isArray(imported)) { showToast(t('toast.plugin_file_invalid'), 'error'); return; }
       let added = 0;
       for (const p of imported) {
         if (!p.id || !p.name || !p.command) continue; // basic validation
@@ -288,9 +288,9 @@ async function _showPluginManager() {
         await invoke('save_plugins', { plugins });
         _plugins = plugins.slice();
         render();
-        showToast(`Imported ${added} plugin${added !== 1 ? 's' : ''}`, 'success');
+        showToast(t(added !== 1 ? 'toast.plugins_imported_plural' : 'toast.plugins_imported', {n: added}), 'success');
       } else {
-        showToast('No new plugins found (all already installed)', 'info');
+        showToast(t('toast.plugins_no_new'), 'info');
       }
     } catch(e) { showToast('Import failed: ' + e, 'error'); }
   });

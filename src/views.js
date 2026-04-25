@@ -22,6 +22,23 @@ function _fuzzyMatch(name, query) {
   return qi === q.length;
 }
 
+// Audio cover cache
+const _audioCoverCache = {};
+
+async function _getAudioCover(path) {
+  if (_audioCoverCache[path] === 'loading') return null;
+  if (_audioCoverCache[path]) return _audioCoverCache[path];
+  _audioCoverCache[path] = 'loading';
+  try {
+    const cover = await invoke('get_audio_cover', { path });
+    _audioCoverCache[path] = cover || null;
+    return cover || null;
+  } catch {
+    _audioCoverCache[path] = null;
+    return null;
+  }
+}
+
 // Injected by main.js
 let _deps = {};
 export function injectDeps(deps){ 
@@ -100,6 +117,9 @@ if (typeof document !== 'undefined') {
         const isVisible = panel.style.display !== 'none';
         panel.style.display = isVisible ? 'none' : '';
         document.documentElement.style.setProperty('--preview-hidden', isVisible ? '1' : '0');
+        // r22c: keep resize handle non-interactive when panel is hidden
+        const _rh = document.getElementById('preview-resize-handle');
+        if (_rh) _rh.style.pointerEvents = isVisible ? 'none' : 'auto';
         try { localStorage.setItem('ff_preview_hidden', isVisible ? '1' : '0'); } catch {}
         d().render?.();
       }
@@ -120,7 +140,7 @@ if (typeof document !== 'undefined') {
       }
       const entry = selectedEntries[0];
       if (entry.is_dir) {
-        d().showToast('Cannot edit metadata for folders', 'info');
+        d().showToast(d().t('toast.no_metadata_for_folders'), 'info');
         return;
       }
       const ext = (entry.extension || '').toLowerCase();
@@ -134,7 +154,7 @@ if (typeof document !== 'undefined') {
       } else if (AUDIO_EXTS.includes(ext)) {
         _showAudioTagEditor(entry, null);
       } else {
-        d().showToast('No metadata editor for .' + ext + ' files', 'info');
+        d().showToast(d().t('toast.no_metadata_editor', {ext}), 'info');
       }
       return;
     }
@@ -310,6 +330,7 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
   video.preload = 'none'; // 'metadata' caused GStreamer to open range requests immediately on highlight — no IO until user plays
   video.autoplay = autoplay;
   video.disablePictureInPicture = true;
+  video.playsInline = true;  // prevent WebKit detaching the renderer on some builds
   video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;display:block;cursor:pointer;';
 
   // ── Fullscreen launcher (hands off to mpv on Wayland) ───────────────────
@@ -351,7 +372,9 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
   // ── Wrapper + custom controls bar ─────────────────────────────────────────
   const wrapper = document.createElement('div');
   // tabIndex lets the wrapper receive keyboard events on focus
-  wrapper.style.cssText = 'position:relative;width:100%;height:100%;background:#000;overflow:hidden;outline:none;';
+  // will-change:transform isolates this subtree on its own GPU layer — prevents
+  // seek-bar repaints from triggering a full-page composite on WebKit2GTK.
+  wrapper.style.cssText = 'position:relative;width:100%;height:100%;background:#000;overflow:hidden;outline:none;will-change:transform;transform:translateZ(0);contain:layout style;';
   wrapper.tabIndex = -1;
 
   let _userStarted = autoplay;  // true once user clicks play (or autoplay=true)
@@ -430,6 +453,7 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
 
   const _seekFrac = (e) => {
     const r = elTrack.getBoundingClientRect();
+    if (!r.width) return 0;  // not yet laid out — avoid Infinity/NaN
     return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
   };
   elTrack.style.cursor = 'pointer';
@@ -439,13 +463,13 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
     _seeking = true;
     elTrack.setPointerCapture(e.pointerId);
     const p = _seekFrac(e);
-    elFill.style.width = (p * 100).toFixed(2) + '%';
+    elFill.style.transform = `scaleX(${p.toFixed(4)})`;
     elTime.textContent = `${fmt(video.duration * p)} / ${fmt(video.duration)}`;
   });
   elTrack.addEventListener('pointermove', e => {
     if (!_seeking) return;
     const p = _seekFrac(e);
-    elFill.style.width = (p * 100).toFixed(2) + '%';
+    elFill.style.transform = `scaleX(${p.toFixed(4)})`;
     if (isFinite(video.duration)) elTime.textContent = `${fmt(video.duration * p)} / ${fmt(video.duration)}`;
   });
   elTrack.addEventListener('pointerup', e => {
@@ -462,10 +486,17 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
       return;
     }
     const p = video.duration ? video.currentTime / video.duration : 0;
-    elFill.style.width = (p * 100).toFixed(2) + '%';
+    elFill.style.transform = `scaleX(${p.toFixed(4)})`;
     elTime.textContent = `${fmt(video.currentTime)} / ${fmt(video.duration)}`;
   };
-  video.addEventListener('timeupdate', _updSeek);
+  // Throttle timeupdate via rAF — fires up to 60fps on some GStreamer builds,
+  // but we only need to repaint at ~4fps max. rAF batches DOM writes and skips
+  // frames when the window is hidden, preventing needless layout recalculations.
+  let _rafSeek = null;
+  video.addEventListener('timeupdate', () => {
+    if (_rafSeek) return;
+    _rafSeek = requestAnimationFrame(() => { _rafSeek = null; _updSeek(); });
+  });
   video.addEventListener('loadedmetadata', () => {
     const live = !isFinite(video.duration);
     _setLiveMode(live);
@@ -478,7 +509,7 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
   });
   video.addEventListener('progress', () => {
     if (!video.duration || !isFinite(video.duration) || !video.buffered.length) return;
-    elBuf.style.width = (video.buffered.end(video.buffered.length - 1) / video.duration * 100).toFixed(2) + '%';
+    elBuf.style.transform = `scaleX(${(video.buffered.end(video.buffered.length - 1) / video.duration).toFixed(4)})`;
   });
 
   // Volume
@@ -504,11 +535,19 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
   bar.addEventListener('mousedown', ()=>wrapper.focus());
 
   // Auto-hide controls (always visible while paused)
-  let _hideTimer=null;
+  // Debounce via rAF: mousemove fires 60+ times/sec during panning;
+  // the old code cleared+set a 2s timer on every event = constant GC pressure.
+  let _hideTimer=null, _showPending=false;
   const _showBar = () => {
-    bar.style.opacity='1'; bar.style.pointerEvents='auto';
-    clearTimeout(_hideTimer);
-    if (!video.paused) _hideTimer=setTimeout(()=>{ bar.style.opacity='0'; bar.style.pointerEvents='none'; }, 2500);
+    if (_showPending) return;
+    _showPending = true;
+    requestAnimationFrame(() => {
+      _showPending = false;
+      if (wrapper._dead) return;  // slot was torn down while rAF was pending
+      bar.style.opacity='1'; bar.style.pointerEvents='auto';
+      clearTimeout(_hideTimer);
+      if (!video.paused) _hideTimer=setTimeout(()=>{ bar.style.opacity='0'; bar.style.pointerEvents='none'; }, 2500);
+    });
   };
   const _stayVis = () => { clearTimeout(_hideTimer); bar.style.opacity='1'; bar.style.pointerEvents='auto'; };
   wrapper.addEventListener('mousemove', _showBar);
@@ -635,6 +674,43 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
   // Mark the SLOT (not the video element) so _mpvStop can find it with
   // querySelector('[data-mpv-active]') and call slot._mpvCleanup correctly.
   slot.dataset.mpvActive = '1';
+
+  // ── Adjacent video preload — prime the GStreamer pipeline for the next file ──
+  // After mount, silently probe the prev/next video in the gallery strip so
+  // GStreamer has its decoder ready before the user presses ← or →.
+  // Uses preload='metadata' (just container headers, no significant IO) and is
+  // discarded after 3 s — well before the user is likely to navigate away.
+  let _preloadVids = [];
+  let _preloadCleanTimer = null;
+  const _cancelPreloads = () => {
+    clearTimeout(_preloadCleanTimer);
+    _preloadVids.forEach(p => { p.src = ''; p.remove(); });
+    _preloadVids = [];
+  };
+  setTimeout(() => {
+    if (!_isActive() || !_mediaPort) return;
+    try {
+      const {getVisibleEntries, state: _st} = d();
+      const _entries = getVisibleEntries?.() ?? [];
+      const _curIdx = _st?.gallerySelIdx ?? -1;
+      const _neighbors = [-1, 1].map(offset => _entries[_curIdx + offset]).filter(
+        e => e && !e.is_dir && VIDEO_EXTS.includes((e.extension||'').toLowerCase())
+          && !WEBKIT_SKIP_EXTS.has((e.extension||'').toLowerCase())
+      );
+      _preloadVids = _neighbors.map(e => {
+        const _pv = document.createElement('video');
+        _pv.preload = 'metadata';
+        _pv.muted = true;
+        _pv.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
+        _pv.src = `http://127.0.0.1:${_mediaPort}${e.path.split('/').map(encodeURIComponent).join('/')}`;
+        document.body.appendChild(_pv);
+        return _pv;
+      });
+      // Discard after 3 s — we only needed to open the GStreamer demuxer
+      _preloadCleanTimer = setTimeout(_cancelPreloads, 3000);
+    } catch(_) {}
+  }, 800); // delay until after our own video.load() has started
+
   // For the autoplay=true path (Quick Look), arm stall detection immediately and
   // trigger play explicitly — with preload='none' the autoplay HTML attribute may
   // not fire on WebKit2GTK without an explicit play() call.
@@ -644,6 +720,9 @@ async function _mountMpvPlayer(slot, path, { autoplay = false } = {}) {
   }
   const _cleanup = () => {
     clearTimeout(_stallTimer);
+    clearTimeout(_hideTimer);
+    if (_rafSeek) { cancelAnimationFrame(_rafSeek); _rafSeek = null; }
+    _cancelPreloads();  // eagerly remove preload video elements from document.body
     wrapper._dead = true;  // signals _isActive() → stall/error callbacks bail
     document.removeEventListener('keydown', _fsKey);
     document.removeEventListener('fullscreenchange', _onFsChange);
@@ -681,12 +760,30 @@ function tagColor(tag){
 export function renderView(){
   const host=document.getElementById('view-host'); if(!host)return;
   const {state}=d();
-  // Search results render in the CURRENT view mode (not always flat list)
-  // Column view falls back to list since it needs a real directory structure
+  // Search results render in the CURRENT view mode where possible.
+  // List view uses renderListView (getVisibleEntries() already returns searchResults).
+  // Column view falls back to renderFlatList — it requires a real directory tree.
   if(state.searchMode){
     if(state.viewMode==='icon') renderIconView(host);
     else if(state.viewMode==='gallery') renderGalleryView(host);
-    else renderFlatList(host,state.searchResults); // list + column → flat list
+    else if(state.viewMode==='list') renderListView(host);
+    else {
+      // Column view can't search in-place — insert a one-line notice then render flat.
+      const _bn=document.createElement('div');
+      _bn.id='ff-col-search-notice';
+      _bn.style.cssText='padding:5px 14px;font-size:11px;color:#98989f;background:rgba(255,255,255,.04);'+
+        'border-bottom:1px solid rgba(255,255,255,.07);display:flex;align-items:center;gap:6px;flex-shrink:0;';
+      _bn.innerHTML='<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:12px;height:12px;opacity:.6"><circle cx="6.5" cy="6.5" r="4"/><line x1="10" y1="10" x2="13" y2="13"/></svg>'+
+        'Search results shown as flat list \u2014 column view requires a directory tree. Switch to List view to keep sort columns.';
+      host.innerHTML='';
+      host.style.display='flex';
+      host.style.flexDirection='column';
+      host.appendChild(_bn);
+      const _wrap=document.createElement('div');
+      _wrap.style.cssText='flex:1;overflow:auto;min-height:0;';
+      host.appendChild(_wrap);
+      renderFlatList(_wrap,state.searchResults);
+    }
     return;
   }
   if(state.viewMode==='column') renderColumnView(host);
@@ -728,6 +825,10 @@ function _doRenderColumn(host, _mySeq) {
   const {state,sel,sortEntries,setupDragDrop,setupDropTarget,
          showContextMenu,buildFileCtxMenu,buildBgCtxMenu,
          loadPreview,navigate,render}=d();
+
+  // Reset any flex layout injected by the column-search banner path
+  host.style.display='';
+  host.style.flexDirection='';
 
   if(!host.querySelector('.cols-wrap'))
     host.innerHTML='<div class="cols-wrap"><div class="cols-container" id="cols"></div></div>';
@@ -869,9 +970,26 @@ function _doRenderColumn(host, _mySeq) {
       row.className = `frow${isSel ? ' sel' : ''}${isTrail ? ' trail' : ''}${e.is_hidden ? ' hid' : ''}${isCut ? ' cut-item' : ''}`;
       row.dataset.col = ci; row.dataset.idx = ei; row.dataset.path = e.path; row.dataset.dir = e.is_dir;
       row.setAttribute('role','option'); row.setAttribute('aria-selected',isSel?'true':'false'); row.setAttribute('aria-label',e.name+(e.is_dir?', folder':''));
+      row.title = e.name; // tooltip for truncated names
       row.style.cssText = `position:absolute;left:0;right:0;top:${ei * CROW_H}px;`;
       if (!isSel && !isTrail && _rowTag) row.style.background = `${tagColor(_rowTag)}33`;
-      row.innerHTML = `<span class="fico" style="color:${fileColor(e)}">${fileIcon(e)}</span><span class="fname">${escHtml(e.name)}${e.is_symlink ? '<span class="sym-arrow">\u2192</span>' : ''}</span>${e.is_dir ? `<span class="fchev">${I.chev}</span>` : `<span class="fsize">${e.size != null ? fmtSize(e.size) : ''}</span>`}${_rowTags.map(t => `<span class="frow-tag" style="background:${tagColor(t)}"></span>`).join('')}${d().gitBadgeHtml?.(e.path)??''}` ;
+      row.innerHTML = `<span class="fico" style="color:${fileColor(e)}">${fileIcon(e)}</span><span class="fname" data-path="${e.path.replace(/"/g,'&quot;')}">${escHtml(e.name)}${e.is_symlink ? '<span class="sym-arrow">\u2192</span>' : ''}</span>${e.is_dir ? `<span class="fchev">${I.chev}</span>` : `<span class="fsize">${e.size != null ? fmtSize(e.size) : ''}</span>`}${_rowTags.map(t => `<span class="frow-tag" style="background:${tagColor(t)}"></span>`).join('')}${d().gitBadgeHtml?.(e.path)??''}` ;
+      // Async: replace audio file icon with album cover thumbnail
+      if (AUDIO_EXTS.includes((e.extension||'').toLowerCase())) {
+        const _applyColCover = (coverUrl) => {
+          const ico = row.querySelector('.fico');
+          if (!ico || !row.isConnected) return;
+          const img = document.createElement('img');
+          img.src = coverUrl;
+          img.style.cssText = 'width:16px;height:16px;object-fit:cover;border-radius:3px;flex-shrink:0;display:block;';
+          ico.replaceWith(img);
+        };
+        if (_audioCoverCache[e.path] && _audioCoverCache[e.path] !== 'loading') {
+          _applyColCover(_audioCoverCache[e.path]);
+        } else {
+          _getAudioCover(e.path).then(cover => { if (cover) _applyColCover(cover); });
+        }
+      }
       return row;
     };
 
@@ -981,7 +1099,15 @@ function _doRenderColumn(host, _mySeq) {
     });
     colList.addEventListener('contextmenu', ev => {
       if (!colList.isConnected) return;
-      const row = ev.target.closest('.frow'); if (!row) return;
+      const row = ev.target.closest('.frow');
+      if (!row) {
+        // Right-click on empty column space → background context menu
+        ev.preventDefault();
+        const {sel,render,showContextMenu,buildBgCtxMenu} = d();
+        sel.clear(); render();
+        showContextMenu(ev.clientX, ev.clientY, buildBgCtxMenu());
+        return;
+      }
       ev.preventDefault();
       const ei = +row.dataset.idx; const entry = entries[ei]; if (!entry) return;
       const _sc = {}; document.querySelectorAll('.col-list').forEach((c, i) => _sc[i] = c.scrollTop);
@@ -1014,13 +1140,13 @@ function _doRenderColumn(host, _mySeq) {
     // that are clipped invisible by contain:paint on the zero-height parent column.
 
     // ── Sort indicator header ─────────────────────────────────────────────────
-    // Only shown on the last (active) column so it doesn't clutter intermediate columns
+    // Shown on every column so the sort label is always visible.
     colEl.appendChild(colList);
     // ── Sort indicator header — inserted AFTER colEl.appendChild(colList) ──────
     // colEl.insertBefore(sortHdr, colList) requires colList to already be a child
     // of colEl. Calling it before appendChild throws a DOMException, crashing
     // renderColumnView and leaving the column blank with status "Loading...".
-    if(ci === state.columns.length - 1){
+    if(true){
       const {sortState} = d();
       const sortLabel = sortState
         ? `${sortState.col==='name'?'Name':sortState.col==='date'?'Date':sortState.col==='size'?'Size':'Kind'} ${sortState.dir>0?'↑':'↓'}`
@@ -1262,6 +1388,16 @@ function _doRenderColumn(host, _mySeq) {
     resizeHandle.innerHTML='<div class="col-resize-pill"><div class="col-resize-dots"></div></div>';
     resizeHandle.addEventListener('mousedown',e=>startColResize(e,state));
     colEl.appendChild(resizeHandle);
+    // Animate new columns: slide-in-right for forward nav, slide-in-left for back
+    const _existingCount = container.children.length;
+    const _isNewCol = !container.querySelector(`[data-col-path="${CSS.escape(col.path)}"]`);
+    if (_isNewCol && _existingCount > 0) {
+      const _goingBack = (ci < _existingCount); // fewer cols than current DOM = back-nav
+      colEl.classList.add(_goingBack ? 'col-slide-in-left' : 'col-slide-in');
+      colEl.addEventListener('animationend', () => {
+        colEl.classList.remove('col-slide-in', 'col-slide-in-left');
+      }, {once: true});
+    }
     container.appendChild(colEl);
     setupDropTarget(colList,col.path);
 
@@ -1470,7 +1606,15 @@ function attachDragSelect(colList, getEntries, sel, col, state, render) {
   const onDown = (ev) => {
     if (ev.button !== 0) return;
     const row = ev.target.closest('.frow');
-    if (!row || ev.target.closest('button,a,input')) return;
+    if (!row) {
+      // Clicked column background — clear selection
+      if (!ev.ctrlKey && !ev.metaKey && !ev.shiftKey) {
+        const {sel,state,render} = d();
+        if (sel.size > 0) { sel.clear(); state.selIdx = -1; render(); }
+      }
+      return;
+    }
+    if (ev.target.closest('button,a,input')) return;
     armed         = true;
     active        = false;
     wantSelection = false;
@@ -1635,7 +1779,7 @@ export function renderIconView(host) {
     host.addEventListener('contextmenu', ev=>{ev.preventDefault();showContextMenu(ev.clientX,ev.clientY,buildBgCtxMenu());},{once:true});
     return;
   }
-  const iconSz  = state.iconSize || 80;
+  const iconSz  = state.iconSizeIcon || state.iconSize || 80; // r25: per-view size
   const ITEM_W  = iconSz * 2 + 16;
   const ITEM_H  = iconSz + 78;
   const GAP     = 10;
@@ -1743,6 +1887,7 @@ export function renderIconView(host) {
     div.dataset.idx = idx;
     div.dataset.path = e.path;
     div.setAttribute('role','option'); div.setAttribute('aria-selected', isSel ? 'true' : 'false'); div.setAttribute('aria-label', e.name + (e.is_dir ? ', folder' : ''));
+    div.title = e.name;
     const _iconTag = !isSel ? (state._fileTags?.[e.path]||[])[0] : null;
     div.style.cssText = `
       position:absolute;
@@ -1823,6 +1968,26 @@ export function renderIconView(host) {
       box.appendChild(tagRow);
     }
 
+    // Folder item-count badge (mirrors gallery strip badge)
+    if (e.is_dir) {
+      const ivBadge = document.createElement('span');
+      ivBadge.className = 'iv-dir-count';
+      ivBadge.style.display = 'none';
+      box.appendChild(ivBadge);
+      invoke('list_directory_fast', {path: e.path}).then(res => {
+        if (!div.isConnected) return;
+        const count = res?.entries?.length ?? 0;
+        if (count === 0) return;
+        ivBadge.textContent = count > 999 ? '999+' : count;
+        const tint = count >= 500 ? 'rgba(139,92,246,.55)'
+                   : count >= 100 ? 'rgba(59,130,246,.55)'
+                   : count >=  10 ? 'rgba(56,189,248,.45)'
+                   :                'rgba(148,163,184,.35)';
+        ivBadge.style.background = tint;
+        ivBadge.style.display = 'flex';
+      }).catch(() => {});
+    }
+
     // Label
     const lbl = document.createElement('span');
     lbl.style.cssText = `
@@ -1834,6 +1999,8 @@ export function renderIconView(host) {
       display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3;
       text-shadow: 0 1px 3px rgba(0,0,0,0.7);
     `;
+    lbl.className = 'ico-lbl';
+    lbl.dataset.path = e.path; // r25: needed by startRename for element lookup
     lbl.textContent = e.name;
 
     div.appendChild(box);
@@ -1916,12 +2083,39 @@ export function renderIconView(host) {
 
         const ext = (e.extension || '').toLowerCase();
         if ((IMAGE_EXTS.includes(ext) || VIDEO_EXTS.includes(ext)) && !_thumbCache.has(e.path)) needThumb.push(e.path);
+        // Load audio cover and swap it into the icon box
+        if (AUDIO_EXTS.includes(ext)) {
+          const _applyAudioCoverToItem = (coverUrl) => {
+            const box = item.querySelector('div'); // icon box is first child div
+            if (!box || !box.isConnected) return;
+            const iconWrap = box.querySelector('div'); // inner icon wrap
+            if (!iconWrap) return;
+            const coverImg = document.createElement('img');
+            coverImg.src = coverUrl;
+            coverImg.style.cssText = 'width:100%;height:100%;object-fit:cover;border-radius:7px;display:block;';
+            iconWrap.replaceWith(coverImg);
+          };
+          if (_audioCoverCache[e.path] && _audioCoverCache[e.path] !== 'loading') {
+            _applyAudioCoverToItem(_audioCoverCache[e.path]);
+          } else {
+            _getAudioCover(e.path).then(cover => { if (cover) _applyAudioCoverToItem(cover); });
+          }
+        }
       }
     }
 
     if (needThumb.length) _queueThumb(needThumb);
   };
 
+  wrap.addEventListener('mousedown', ev => {
+    if (ev.button !== 0) return;
+    if (!ev.target.closest('.icon-item')) {
+      if (!ev.ctrlKey && !ev.metaKey && !ev.shiftKey) {
+        const {sel,state,render} = d();
+        if (sel.size > 0) { sel.clear(); state.selIdx = -1; render(); }
+      }
+    }
+  });
   wrap.addEventListener('contextmenu', ev => {
     if (!ev.target.closest('.icon-item')) {
       ev.preventDefault(); sel.clear(); d().render();
@@ -2021,6 +2215,11 @@ export function renderListView(host){
       const ka=a.is_dir?'Folder':(a.extension||''); const kb=b.is_dir?'Folder':(b.extension||'');
       return sd*ka.localeCompare(kb) || a.name.localeCompare(b.name);
     }
+    if(col==='loc'){
+      const la=a.path.slice(0,a.path.lastIndexOf('/')||1);
+      const lb=b.path.slice(0,b.path.lastIndexOf('/')||1);
+      return sd*la.localeCompare(lb) || a.name.localeCompare(b.name);
+    }
     return sd*a.name.localeCompare(b.name,undefined,{sensitivity:'base'});
   });
   // FIX (RC2-R1 Bug 1+3): point sel._e at the list-sorted array immediately so
@@ -2043,23 +2242,26 @@ export function renderListView(host){
     host.addEventListener('contextmenu', ev=>{ev.preventDefault();showContextMenu(ev.clientX,ev.clientY,buildBgCtxMenu());},{once:true});
     return;
   }
+  const _inSearch = state.searchMode;
   host.innerHTML=`<div class="list-wrap" id="lv-wrap">
     <table class="list-table">
       <colgroup>
         <col id="col-name" style="width:${state.colWidths['l-name']||300}px">
+        ${_inSearch?`<col id="col-loc" style="width:${state.colWidths['l-loc']||200}px">`:''}
         <col id="col-date" style="width:${state.colWidths['l-date']||180}px">
         <col id="col-size" style="width:${state.colWidths['l-size']||90}px">
         <col id="col-kind" style="width:${state.colWidths['l-kind']||100}px">
       </colgroup>
       <thead class="list-head"><tr>
         <th data-col="name" class="${col==='name'?'sorted':''}">Name ${arrow('name')}<div class="th-resize" data-col="l-name"></div></th>
+        ${_inSearch?`<th data-col="loc" class="${col==='loc'?'sorted':''}">Location ${arrow('loc')}<div class="th-resize" data-col="l-loc"></div></th>`:''}
         <th data-col="date" class="${col==='date'?'sorted':''}">Date Modified ${arrow('date')}<div class="th-resize" data-col="l-date"></div></th>
         <th data-col="size" class="${col==='size'?'sorted':''}">Size ${arrow('size')}<div class="th-resize" data-col="l-size"></div></th>
         <th data-col="kind" class="${col==='kind'?'sorted':''}">Kind ${arrow('kind')}</th>
       </tr></thead>
       <tbody id="lv-body">
-        <tr class="lv-spacer" id="lv-top"><td colspan="4" style="padding:0;border:0;height:0"></td></tr>
-        <tr class="lv-spacer" id="lv-bot"><td colspan="4" style="padding:0;border:0;height:0"></td></tr>
+        <tr class="lv-spacer" id="lv-top"><td colspan="${_inSearch?5:4}" style="padding:0;border:0;height:0"></td></tr>
+        <tr class="lv-spacer" id="lv-bot"><td colspan="${_inSearch?5:4}" style="padding:0;border:0;height:0"></td></tr>
       </tbody>
     </table>
   </div>`;
@@ -2102,15 +2304,33 @@ export function renderListView(host){
     tr.className = `list-row${isSel?' sel':''}${e.is_hidden?' hid':''}${isCut?' cut-item':''}`;
     tr.dataset.idx = i; tr.dataset.path = e.path; tr.dataset.dir = e.is_dir;
     tr.setAttribute('role','row'); tr.setAttribute('aria-selected',isSel?'true':'false'); tr.setAttribute('aria-label',e.name+(e.is_dir?', folder':''));
+    tr.title = e.name;
     tr.innerHTML = `
       <td class="cell-name"${tdBg}>
         <span class="fico" style="color:${fileColor(e)};width:16px;height:16px;display:inline-flex;align-items:center;flex-shrink:0">${fileIcon(e)}</span>
-        <span class="cell-name-text">${escHtml(e.name)}${e.is_symlink?'<span class="sym-arrow">\u2192</span>':''}</span>
+        <span class="cell-name-text" data-path="${e.path.replace(/"/g,'&quot;')}">${escHtml(e.name)}${e.is_symlink?'<span class="sym-arrow">\u2192</span>':''}</span>
         ${(state._fileTags?.[e.path]||[]).map(t=>`<span class="row-tag" style="background:${tagColor(t)}22;color:${tagColor(t)};border:1px solid ${tagColor(t)}44">${t}</span>`).join('')}${d().gitBadgeHtml?.(e.path)??''}
       </td>
+      ${_inSearch?`<td class="cell-meta" title="${escHtml(e.path.slice(0,e.path.lastIndexOf('/')||1))}"${tdBg} style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;opacity:.75">${escHtml(e.path.slice(0,e.path.lastIndexOf('/')||1)||'/')}</td>`:''}
       <td class="cell-meta"${tdBg}>${fmtDate(e.modified)}</td>
       <td class="cell-meta"${tdBg}>${e.is_dir?'--':fmtSize(e.size)}</td>
       <td class="cell-meta"${tdBg}>${e.is_dir?'Folder':(e.extension?e.extension.toUpperCase()+' file':'File')}</td>`;
+    // Async: replace audio file icon with album cover thumbnail
+    if (AUDIO_EXTS.includes((e.extension||'').toLowerCase())) {
+      const _applyLvCover = (coverUrl) => {
+        const ico = tr.querySelector('.fico');
+        if (!ico || !tr.isConnected) return;
+        const img = document.createElement('img');
+        img.src = coverUrl;
+        img.style.cssText = 'width:16px;height:16px;object-fit:cover;border-radius:3px;flex-shrink:0;display:block;';
+        ico.replaceWith(img);
+      };
+      if (_audioCoverCache[e.path] && _audioCoverCache[e.path] !== 'loading') {
+        _applyLvCover(_audioCoverCache[e.path]);
+      } else {
+        _getAudioCover(e.path).then(cover => { if (cover) _applyLvCover(cover); });
+      }
+    }
     return tr;
   };
 
@@ -2535,18 +2755,23 @@ function _wireFontInstall(fontPath, panel) {
 
 // ── Gallery view ──────────────────────────────────────────────────────────────
 // Virtual-scroller constants — must match style.css .gallery-strip / .gthumb
-const GTHUMB_W      = 86;   // .gthumb { width: 86px }
+// GTHUMB_W is a function so it reads the live iconSizeGallery preference on
+// every call rather than being frozen to whatever d() returned at module load
+// time (which was null, so it always defaulted to 128).
+function _gthumbW() {
+  return Math.round(Math.max(64, (d()?.state?.iconSizeGallery ?? 128) * 0.67));
+}
 const STRIP_GAP     = 6;    // .gallery-strip { gap: 6px }
 const STRIP_PAD     = 16;   // .gallery-strip { padding: 8px 16px } — left/right only
 const STRIP_TOP     = 9;    // vertical offset inside strip-wrap (8px pad-top + 1px optical)
-const THUMB_STRIDE  = GTHUMB_W + STRIP_GAP;  // 92px per slot
 const STRIP_OVERSCAN = 6;   // extra items rendered beyond visible edge on each side
 
 // Absolute left offset of item i inside the virtual strip
-function _thumbLeft(i) { return STRIP_PAD + i * THUMB_STRIDE; }
+function _thumbLeft(i) { const W = _gthumbW(); return STRIP_PAD + i * (W + STRIP_GAP); }
 // Total scroll-content width for n items
 function _stripTotalW(n) {
-  return n === 0 ? STRIP_PAD * 2 : STRIP_PAD + n * THUMB_STRIDE - STRIP_GAP + STRIP_PAD;
+  const W = _gthumbW(); const stride = W + STRIP_GAP;
+  return n === 0 ? STRIP_PAD * 2 : STRIP_PAD + n * stride - STRIP_GAP + STRIP_PAD;
 }
 
 // Build a single gthumb DOM element (no innerHTML string concat)
@@ -2554,6 +2779,7 @@ function _makeGthumb(e, i, selIdx, state) {
   const isSel  = i === selIdx;
   const ext    = (e.extension || '').toLowerCase();
   const isMedia = IMAGE_EXTS.includes(ext) || VIDEO_EXTS.includes(ext);
+  const isAudio = AUDIO_EXTS.includes(ext);
   const color  = fileColor(e);
   const iconSvg = fileIcon(e).replace('<svg', '<svg style="width:28px;height:28px"');
   const _tag   = !isSel ? (state._fileTags?.[e.path] || [])[0] : null;
@@ -2562,10 +2788,50 @@ function _makeGthumb(e, i, selIdx, state) {
   el.dataset.idx  = i;
   el.dataset.path = e.path;
   el.dataset.dir  = String(e.is_dir);
-  if (isMedia) el.dataset.thumbPath = e.path;
+  if (isMedia || isAudio) el.dataset.thumbPath = e.path;
   el.style.cssText = `position:absolute;left:${_thumbLeft(i)}px;top:${STRIP_TOP}px;`;
+  el.setAttribute('role', 'option');
+  el.setAttribute('aria-selected', isSel ? 'true' : 'false');
+  el.setAttribute('aria-label', e.name + (e.is_dir ? ', folder' : ''));
   if (_tag) el.style.setProperty('--tag-tint', tagColor(_tag) + '33');
-  el.innerHTML = `<span class="gthumb-icon" style="color:${color}">${iconSvg}</span><span class="gthumb-lbl">${escHtml(e.name)}</span>`;
+  
+  // For audio files with covers, show cover thumbnail
+  if (isAudio && _audioCoverCache[e.path]) {
+    el.innerHTML = `<img src="${_audioCoverCache[e.path]}" class="gthumb-audio-cover" style="width:60px;height:60px;object-fit:cover;border-radius:6px;flex-shrink:0;display:block;"><span class="gthumb-lbl">${escHtml(e.name)}</span>`;
+    el.dataset.thumbLoaded = '1'; // prevent _loadGthumb from inserting a second cover
+  } else if (isAudio) {
+    // Show music icon initially - _loadGthumb will replace with cover if available
+    el.innerHTML = `<span class="gthumb-icon gthumb-shimmer" style="color:${color}">${iconSvg}</span><span class="gthumb-lbl">${escHtml(e.name)}</span>`;
+  } else if (e.is_dir) {
+    el.innerHTML = `<span class="gthumb-icon" style="color:${color};position:relative;">${iconSvg}<span class="gthumb-dir-count" style="display:none;"></span></span><span class="gthumb-lbl">${escHtml(e.name)}</span>`;
+    // Async: count direct children and show as a styled pill badge
+    invoke('list_directory_fast', {path: e.path}).then(res => {
+      if (!el.isConnected) return;
+      const count = res?.entries?.length ?? 0;
+      const badge = el.querySelector('.gthumb-dir-count');
+      if (!badge) return;
+      if (count === 0) { badge.style.display = 'none'; return; }
+      badge.textContent = count > 999 ? '999+' : count;
+      // Tint: cool blue for small, vivid blue for medium, purple for large
+      const tint = count >= 500 ? 'rgba(139,92,246,.55)'   // purple
+                 : count >= 100 ? 'rgba(59,130,246,.55)'    // blue
+                 : count >=  10 ? 'rgba(56,189,248,.45)'    // sky
+                 :                'rgba(148,163,184,.35)';   // slate (small)
+      badge.style.background = tint;
+      badge.style.border = '1px solid rgba(255,255,255,.22)';
+      badge.style.display = 'flex';
+    }).catch(() => {});
+  } else {
+    const needsShimmer = isMedia;
+    el.innerHTML = `<span class="gthumb-icon${needsShimmer?' gthumb-shimmer':''}" style="color:${color}">${iconSvg}</span><span class="gthumb-lbl">${escHtml(e.name)}</span>`;
+    // Extension badge for office/document files (e.g. DOCX, XLSX, PDF)
+    if (ext && (OFFICE_EXTS.includes(ext) || PDF_EXTS.includes(ext) || ARCHIVE_EXTS.includes(ext))) {
+      const docBadge = document.createElement('span');
+      docBadge.className = 'gthumb-doc-badge';
+      docBadge.textContent = ext.toUpperCase();
+      el.querySelector('.gthumb-icon').appendChild(docBadge);
+    }
+  }
   return el;
 }
 
@@ -2575,9 +2841,9 @@ function _paintStrip(stripWrap, strip, entries, selIdx, state) {
   const scrollLeft   = stripWrap.scrollLeft;
   const viewW        = stripWrap.clientWidth || 900;
   const firstVisible = Math.max(0,
-    Math.floor((scrollLeft - STRIP_PAD) / THUMB_STRIDE) - STRIP_OVERSCAN);
+    Math.floor((scrollLeft - STRIP_PAD) / (_gthumbW() + STRIP_GAP)) - STRIP_OVERSCAN);
   const lastVisible  = Math.min(entries.length - 1,
-    Math.ceil((scrollLeft + viewW - STRIP_PAD) / THUMB_STRIDE) + STRIP_OVERSCAN);
+    Math.ceil((scrollLeft + viewW - STRIP_PAD) / (_gthumbW() + STRIP_GAP)) + STRIP_OVERSCAN);
 
   // Evict out-of-range items
   for (const ch of [...strip.children]) {
@@ -2601,7 +2867,7 @@ function _paintStrip(stripWrap, strip, entries, selIdx, state) {
 // Scroll the strip-wrap to center selIdx, then repaint the visible window.
 function _scrollToSel(stripWrap, strip, entries, selIdx, state, behavior = 'smooth') {
   if (selIdx < 0 || selIdx >= entries.length) return;
-  const itemCenter = _thumbLeft(selIdx) + GTHUMB_W / 2;
+  const itemCenter = _thumbLeft(selIdx) + _gthumbW() / 2;
   const targetLeft = Math.max(0, itemCenter - (stripWrap.clientWidth || 900) / 2);
   stripWrap.scrollTo({ left: targetLeft, behavior });
   _paintStrip(stripWrap, strip, entries, selIdx, state);
@@ -2612,7 +2878,7 @@ function _scrollToSel(stripWrap, strip, entries, selIdx, state, behavior = 'smoo
 let thumbObserver = null;
 
 export async function renderGalleryView(host){
-  const {state,sel,getVisibleEntries,loadPreview,navigate,getMediaUrl,getHeicJpegUrl}=d();
+  const {state,sel,getVisibleEntries,loadPreview,navigate,getMediaUrl,getHeicJpegUrl,sortState}=d();
   const entries=getVisibleEntries();
   const selIdx=state.gallerySelIdx>=0?state.gallerySelIdx:0;
   const sel_e=entries[selIdx]||null;
@@ -2654,20 +2920,43 @@ export async function renderGalleryView(host){
   const isFit=!!state._galleryFit;
   if(state._galSlideshow===undefined) state._galSlideshow=false;
   const _isSS=!!state._galSlideshow;
+  const _isAudioSel = sel_e && AUDIO_EXTS.includes(sel_e.extension||'');
+  const _selCount = sel ? [...(sel._paths||[])].length : 0;
+  const _totalCount = entries.length;
+  const _curVizMode = getVizMode();
+  const _vizModes = [{k:'bars',label:'▊▊',title:'Bars'},{k:'wave',label:'〜',title:'Wave'},{k:'mirror',label:'╪',title:'Mirror'},{k:'ring',label:'◎',title:'Ring'}];
+
   let _buildBarHtml=()=>`
     <div class="gallery-ss-bar-wrap" style="display:${_isSS?'block':'none'}"><div id="gallery-ss-bar" class="gallery-ss-bar"></div></div>
     <div style="display:flex;align-items:center;gap:6px;">
+      ${state.currentPath&&state.currentPath!=='/'?`<button class="gallery-open-btn" id="gallery-go-up" title="Go to parent folder (⌫)" style="font-size:14px;padding:0 8px;min-width:0;">↑</button>`:''}
       ${sel_e&&!sel_e.is_dir?`<button class="gallery-open-btn" id="gallery-open">${I.openExt} Open</button>`:'<span></span>'}
+      ${sel_e&&!sel_e.is_dir?`<button class="gallery-open-btn" id="gallery-copy-to" title="Copy to folder…" style="font-size:11px;padding:0 9px;">${I.copy} Copy to…</button>`:''}
+      ${sel_e&&!sel_e.is_dir?`<button class="gallery-open-btn" id="gallery-move-to" title="Move to folder…" style="font-size:11px;padding:0 9px;">${I.scissors} Move to…</button>`:''}
       <button class="gallery-open-btn${_isSS?' gallery-ss-active':''}" id="gallery-slideshow" title="Slideshow (S)" style="font-size:11px;padding:0 10px;${_isSS?'background:var(--accent-blue);color:#fff;border-color:var(--accent-blue);':''}">
         ${_isSS?'⏹ Stop':'▶ Slideshow'}
       </button>
+      ${_isSS?`<div class="gallery-ss-interval-wrap" title="Slide interval">
+        <span style="font-size:10px;color:var(--text-tertiary);">⏱</span>
+        <input type="range" id="gallery-ss-interval" class="gallery-ss-slider" min="1" max="10" step="0.5" value="${state._galSSInterval||3}" style="width:60px;">
+        <span id="gallery-ss-interval-lbl" style="font-size:10px;color:var(--text-tertiary);min-width:22px;">${(state._galSSInterval||3)}s</span>
+      </div>`:''}
+      <button class="gallery-open-btn" id="gallery-sort-btn" title="Sort" style="font-size:11px;padding:0 9px;min-width:0;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="9" y2="18"/></svg>${sortState.col[0].toUpperCase()+sortState.col.slice(1)} ${sortState.dir>0?'↑':'↓'}</button>
+      <button class="gallery-open-btn gallery-sel-btn" id="gallery-select-all" title="Select all / deselect all" style="font-size:11px;padding:0 9px;min-width:0;">
+        ${_selCount>1?`✓ ${_selCount} selected`:'☐ Select all'}
+      </button>
     </div>
+    ${_isAudioSel?`<div class="gallery-viz-mode-bar" id="gallery-viz-mode-bar" title="Press V to cycle visualizer modes">
+      ${_vizModes.map(m=>`<button class="gvm-btn${_curVizMode===m.k?' gvm-active':''}" data-mode="${m.k}" title="${m.title} (V to cycle)">${m.label}</button>`).join('')}
+      <span style="font-size:9px;color:var(--text-tertiary);padding:0 4px;opacity:.6;pointer-events:none;">V</span>
+    </div>`:''}
     ${canZoom&&!VIDEO_EXTS.includes(sel_e?.extension||'')?`<div class="gallery-zoom-bar">
       <button class="gallery-zoom-btn${isFit?' active':''}" id="gz-fit" title="Fit to window (F)" style="font-size:10px;padding:0 8px;${isFit?'background:var(--accent-blue);color:#fff;':''}">Fit</button>
       <button class="gallery-zoom-btn" id="gz-out" title="Zoom Out (-)" ${isFit?'disabled style="opacity:.35;pointer-events:none"':''}>&#x2212;</button>
       <span class="gallery-zoom-pct" id="gz-pct">${isFit?'fit':zoomPct+'%'}</span>
       <button class="gallery-zoom-btn" id="gz-in" title="Zoom In (+)" ${isFit?'disabled style="opacity:.35;pointer-events:none"':''}>+</button>
       <button class="gallery-zoom-btn" id="gz-reset" title="Reset Zoom (0)" style="font-size:10px;padding:0 6px">&#x27F3;</button>
+      <button class="gallery-zoom-btn" id="gz-scroll-sel" title="Scroll strip to selected (⊙)" style="font-size:13px;padding:0 5px;line-height:1;">⊙</button>
     </div>`:''}
 `;
 
@@ -2694,10 +2983,13 @@ export async function renderGalleryView(host){
         // video keeps playing audio in the background.
         _stopSlot(gSlot);
         gSlot.innerHTML='';
-        _mountMpvPlayer(gSlot, sel_e.path).catch(()=>{});
+        _mountMpvPlayer(gSlot, sel_e.path).catch(err=>{
+          if(gSlot.dataset.mpvActive) return; // another mount already took over
+          gSlot.innerHTML=`<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;color:#f87171;font-size:13px;opacity:.8;"><svg width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>Could not play video</span><span style="font-size:11px;opacity:.6;">${escHtml(String(err).slice(0,80))}</span></div>`;
+        });
       }else if(AUDIO_EXTS.includes(ext)){
         const _fc=fileColor(sel_e);const _fi=fileIcon(sel_e).replace('<svg','<svg style="width:90px;height:90px"');
-        gSlot.innerHTML='<div class="gallery-audio-inner"><span style="color:'+_fc+';filter:drop-shadow(0 0 24px '+_fc+'50)">'+_fi+'</span><div class="gallery-audio-name">'+escHtml(sel_e.name)+'</div><audio class="gallery-main-audio" id="gallery-audio-el" data-file-path="'+sel_e.path+'" crossorigin="anonymous" controls preload="none"></audio></div>';
+        gSlot.innerHTML='<div class="gallery-audio-inner"><span class="gallery-audio-icon-wrap" style="color:'+_fc+';filter:drop-shadow(0 0 24px '+_fc+'50)">'+_fi+'</span><div class="gallery-audio-name">'+escHtml(sel_e.name)+'</div><audio class="gallery-main-audio" id="gallery-audio-el" data-file-path="'+sel_e.path+'" crossorigin="anonymous" controls preload="none"></audio></div>';
         // Wire WebAudio graph BEFORE setting src — element is idle, zero interruption risk
         const audioEl=document.getElementById('gallery-audio-el');
         const canvas=document.getElementById('gallery-viz-canvas');
@@ -2705,15 +2997,40 @@ export async function renderGalleryView(host){
           startAudioVisualizer(audioEl,canvas);
           audioEl.src=gUrl; // set src AFTER wiring
         }
+        // Replace icon with album cover if available
+        const _replaceGalleryIcon = (coverUrl) => {
+          const iconWrap = gSlot.querySelector('.gallery-audio-icon-wrap');
+          if (!iconWrap || !iconWrap.isConnected) return;
+          const coverImg = document.createElement('img');
+          coverImg.src = coverUrl;
+          coverImg.style.cssText = 'width:160px;height:160px;object-fit:cover;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.5);display:block;flex-shrink:0;';
+          iconWrap.replaceWith(coverImg);
+        };
+        if (_audioCoverCache[sel_e.path] && _audioCoverCache[sel_e.path] !== 'loading') {
+          _replaceGalleryIcon(_audioCoverCache[sel_e.path]);
+        } else {
+          _getAudioCover(sel_e.path).then(cover => { if (cover) _replaceGalleryIcon(cover); });
+        }
       }
     }
     if(DOC_EXTS.includes(ext)||OFFICE_EXTS.includes(ext)||BOOK_EXTS.includes(ext)){
       const ds=document.getElementById('gallery-doc-slot');
-      if(ds)invoke('get_file_preview',{path:sel_e.path}).then(pd=>{
-        const s=document.getElementById('gallery-doc-slot');if(!s)return;
-        if(pd?.content!=null){s.innerHTML='<pre class="gallery-text-preview">'+escHtml(pd.content.slice(0,8000))+'</pre>';}
-        else{const _fi2=fileIcon(sel_e).replace('<svg','<svg style="width:60px;height:60px"');s.innerHTML='<div class="gallery-dir-preview"><span style="color:'+fileColor(sel_e)+'">'+_fi2+'</span><div class="gallery-preview-name">'+escHtml(sel_e.name)+'</div></div>';}
-      }).catch(()=>{});
+      if(ds){
+        invoke('get_file_preview',{path:sel_e.path}).then(pd=>{
+          const s=document.getElementById('gallery-doc-slot');if(!s)return;
+          if(pd?.content!=null){s.innerHTML='<pre class="gallery-text-preview">'+escHtml(pd.content.slice(0,8000))+'</pre>';}
+          else{const _fi2=fileIcon(sel_e).replace('<svg','<svg style="width:60px;height:60px"');s.innerHTML='<div class="gallery-dir-preview"><span style="color:'+fileColor(sel_e)+'">'+_fi2+'</span><div class="gallery-preview-name">'+escHtml(sel_e.name)+'</div></div>';}
+        }).catch(()=>{});
+        // If office file, upgrade to PDF preview when LibreOffice is available
+        if(OFFICE_EXTS.includes(ext)){
+          invoke('get_office_preview',{path:sel_e.path}).then(res=>{
+            const s=document.getElementById('gallery-doc-slot');if(!s)return;
+            if(res?.mode==='pdf'&&res?.pdf_path){
+              s.innerHTML='<iframe class="gallery-office-pdf" src="'+getMediaUrl(res.pdf_path)+'" title="Document Preview" style="width:100%;height:100%;border:none;border-radius:8px;"></iframe>';
+            }
+          }).catch(()=>{});
+        }
+      }
     }
   };
 
@@ -2740,9 +3057,66 @@ export async function renderGalleryView(host){
     if(barEl){barEl.innerHTML=_buildBarHtml();_bindZoom();}
   };
   const _bindZoom=()=>{
+    document.getElementById('gallery-go-up')?.addEventListener('click',()=>{
+      const cur=d().state?.currentPath||'';
+      const parent=cur.includes('/')?cur.slice(0,cur.lastIndexOf('/'))||'/':'/';
+      d().navigate?.(parent,0);
+    });
+    document.getElementById('gallery-open')?.addEventListener('click',()=>{
+      if(sel_e) invoke('open_file',{path:sel_e.path}).catch(()=>{});
+    });
+    document.getElementById('gallery-copy-to')?.addEventListener('click',()=>{
+      const entries=d().getVisibleEntries?.()??[];
+      const idx=entries.indexOf(sel_e);
+      if(idx>=0){d().sel?.set(idx);d().state&&(d().state.selIdx=idx);}
+      d().ctxAction?.('copy-to');
+    });
+    document.getElementById('gallery-move-to')?.addEventListener('click',()=>{
+      const entries=d().getVisibleEntries?.()??[];
+      const idx=entries.indexOf(sel_e);
+      if(idx>=0){d().sel?.set(idx);d().state&&(d().state.selIdx=idx);}
+      d().ctxAction?.('move-to');
+    });
+    document.getElementById('gallery-sort-btn')?.addEventListener('click', e => {
+    const {showSortMenu} = d();
+    if (showSortMenu) showSortMenu(e.currentTarget);
+  });
+  host.querySelector('#gallery-select-all')?.addEventListener('click',()=>{
+      const ents=d().getVisibleEntries?.()??[];
+      if(sel && [...(sel._paths||[])].length > 1){
+        sel.clear(); state.selIdx = state.gallerySelIdx;
+      } else {
+        sel.clear();
+        ents.forEach((e,i) => { sel._paths.add(e.path); sel.last=i; });
+      }
+      _rebuildBar(); d().render?.();
+    });
+    // Viz mode buttons
+    host.querySelectorAll('.gvm-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        setVizMode(btn.dataset.mode);
+        _rebuildBar();
+        // Restart visualizer so it picks up the new mode immediately
+        const audioEl = document.getElementById('gallery-audio-el');
+        const canvas = document.getElementById('gallery-viz-canvas');
+        if (audioEl && canvas) startAudioVisualizer(audioEl, canvas);
+      });
+    });
     document.getElementById('gallery-slideshow')?.addEventListener('click',()=>{
       state._galSlideshow=!state._galSlideshow;
       _rebuildBar();
+      // Wire interval slider if it just appeared
+      const slider=document.getElementById('gallery-ss-interval');
+      if(slider){
+        slider.addEventListener('input',()=>{
+          state._galSSInterval=parseFloat(slider.value);
+          const lbl=document.getElementById('gallery-ss-interval-lbl');
+          if(lbl) lbl.textContent=state._galSSInterval+'s';
+          // Reset the progress bar animation to match new interval
+          const ssBar=document.getElementById('gallery-ss-bar');
+          if(ssBar){ssBar.style.transition='none';ssBar.style.width='0%';requestAnimationFrame(()=>{ssBar.style.transition=`width ${state._galSSInterval*1000}ms linear`;ssBar.style.width='100%';});}
+        });
+      }
       if(state._galSlideshow){
         // Start slideshow — advance every 3s
         clearInterval(state._galSSTimer);
@@ -2775,6 +3149,11 @@ export async function renderGalleryView(host){
     document.getElementById('gz-in')?.addEventListener('click',()=>{if(state._galleryFit)return;state._galleryZoom=Math.min((state._galleryZoom||1)+0.25,5);_applyZoom();});
     document.getElementById('gz-out')?.addEventListener('click',()=>{if(state._galleryFit)return;state._galleryZoom=Math.max((state._galleryZoom||1)-0.25,0.25);_applyZoom();});
     document.getElementById('gz-reset')?.addEventListener('click',()=>{state._galleryFit=false;state._galleryZoom=1;_rebuildBar();_applyZoom();});
+    document.getElementById('gz-scroll-sel')?.addEventListener('click',()=>{
+      const sw=host.querySelector('.gallery-strip-wrap');
+      const s=host.querySelector('#gallery-strip');
+      if(sw&&s) _scrollToSel(sw,s,d().getVisibleEntries?.()??[],state.gallerySelIdx>=0?state.gallerySelIdx:0,state,'smooth');
+    });
     if(!host._gzKeyBound){
       host._gzKeyBound=true;
       // Store the listener so the full-rebuild path can remove it before re-adding,
@@ -2813,6 +3192,7 @@ export async function renderGalleryView(host){
       const _tag=!isSel?(state._fileTags?.[entries[i]?.path]||[])[0]:null;
       if(isSel!==wasSelCls){
         el.classList.toggle('sel',isSel);
+        el.setAttribute('aria-selected', isSel ? 'true' : 'false');
         if(_tag) el.style.setProperty('--tag-tint',tagColor(_tag)+'33');
         else el.style.removeProperty('--tag-tint');
       }
@@ -2836,11 +3216,40 @@ export async function renderGalleryView(host){
   host.innerHTML=`<div class="gallery-wrap">
     <div class="gallery-main" id="gallery-main">${_buildMainHtml()}</div>
     <div class="gallery-bar">${_buildBarHtml()}</div>
-    <div class="gallery-strip-wrap"><div class="gallery-strip" id="gallery-strip"></div></div>
+    <div class="gallery-strip-wrap"><div class="gallery-strip-resize-handle" id="gallery-strip-rh"></div><div class="gallery-strip" id="gallery-strip"></div></div>
   </div>`;
+  // Wire strip resize handle
+  const _rh = host.querySelector('#gallery-strip-rh');
+  const _sw = host.querySelector('.gallery-strip-wrap');
+  if(_rh && _sw && !_sw._resizeWired){
+    _sw._resizeWired = true;
+    const _savedH = parseInt(localStorage.getItem('ff_strip_h')||'136');
+    if(_savedH !== 136) document.documentElement.style.setProperty('--gallery-strip-h', _savedH+'px');
+    _rh.addEventListener('mousedown', ev => {
+      ev.preventDefault();
+      const startY = ev.clientY, startH = _sw.offsetHeight;
+      const onMove = mv => {
+        const newH = Math.min(280, Math.max(72, startH - (mv.clientY - startY)));
+        document.documentElement.style.setProperty('--gallery-strip-h', newH+'px');
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        try{localStorage.setItem('ff_strip_h', _sw.offsetHeight);}catch{}
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  }
   // Capture previous path BEFORE stamping new meta so the slideshow check below
   // can compare old vs new. Stamping first made meta.path === currentPath always
   // true, so the slideshow never stopped on directory navigation.
+  // r24: empty folder state — matches column/list/icon behaviour
+  if(!entries.length){
+    host._galleryMeta = null;
+    host.innerHTML='<div class="empty-folder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" style="width:56px;height:56px;color:#3a3d47"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg><div class="empty-folder-label">Empty folder</div></div>';
+    return;
+  }
   const _prevGalleryPath = host._galleryMeta?.path;
   // Stamp meta so incremental path can identify this render
   host._galleryMeta={path:state.currentPath,count:entries.length};
@@ -2895,6 +3304,19 @@ export async function renderGalleryView(host){
     if(el.dataset.dir==='true')await navigate(el.dataset.path,0);
     else invoke('open_file',{path:el.dataset.path}).catch(()=>{});
   });
+  strip.addEventListener('contextmenu', e => {
+    const el = e.target.closest('.gthumb'); if (!el) return;
+    e.preventDefault();
+    const {showContextMenu, buildFileCtxMenu, sel, state: st} = d();
+    const i = +el.dataset.idx;
+    const entry = entries[i]; if (!entry) return;
+    // Ensure the item is selected so context menu actions target it
+    if (!sel.hasp(entry.path)) { sel._e = entries; sel.set(i); st.selIdx = i; st.gallerySelIdx = i; }
+    const items = el.dataset.dir === 'true'
+      ? [{label:'Open',action:'open',icon:I.openExt},{label:'Open in New Tab',action:'open-new-tab',icon:I.folder},'-',{label:'Copy Path',action:'copy-path',icon:I.copy},{label:'Add to Sidebar',action:'add-sidebar',icon:'+'}]
+      : buildFileCtxMenu(entry);
+    showContextMenu(e.clientX, e.clientY, items);
+  });
 
   // ── Rubber-band drag selection on gallery strip ───────────────────────────
   const _stripWrapEl = host.querySelector('.gallery-strip-wrap');
@@ -2933,6 +3355,20 @@ export async function renderGalleryView(host){
   _loadContent();
   _bindZoom();
   _applyZoom();
+
+  // Ctrl+wheel zoom on gallery main area
+  const galleryMain = host.querySelector('#gallery-main');
+  if (galleryMain && !galleryMain._wheelZoomWired) {
+    galleryMain._wheelZoomWired = true;
+    galleryMain.addEventListener('wheel', e => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      if (state._galleryFit) return;
+      const delta = e.deltaY < 0 ? 0.15 : -0.15;
+      state._galleryZoom = Math.min(5, Math.max(0.25, (state._galleryZoom || 1) + delta));
+      _applyZoom();
+    }, { passive: false });
+  }
 }
 function _setupThumbObserver(host,stripWrap){
   if(thumbObserver)thumbObserver.disconnect();
@@ -2957,15 +3393,32 @@ function _loadGthumb(el){
   if(!path||el.dataset.thumbLoaded)return;
   el.dataset.thumbLoaded='1';
   const {getMediaUrl}=d();
+  const ext = (path.split('.').pop() || '').toLowerCase();
+  const isAudio = AUDIO_EXTS.includes(ext);
+  
+  // Handle audio covers
+  if (isAudio) {
+    if (_audioCoverCache[path]) {
+      _showAudioCover(el, _audioCoverCache[path]);
+      return;
+    }
+    _getAudioCover(path).then(cover => {
+      if (cover) _showAudioCover(el, cover);
+    });
+    return;
+  }
+  
   const showThumb=(url)=>{
     if(!el.isConnected)return;
     const existing=el.querySelector('.gthumb-icon,.gthumb-media-icon');
     const img=document.createElement('img');
     img.decoding='async';img.loading='lazy';img.className='gthumb-img';
     img.style.cssText='width:100%;height:60px;object-fit:cover;border-radius:4px 4px 0 0;display:block;flex-shrink:0;opacity:0;transition:opacity .15s ease-out;';
-    const isVid = VIDEO_EXTS.includes((el.dataset.thumbPath||'').split('.').pop().toLowerCase());
+    const isVid = VIDEO_EXTS.includes(ext);
     img.onload=()=>{
       img.style.opacity='1';
+      // Remove shimmer once image is loaded
+      el.querySelector('.gthumb-shimmer')?.classList.remove('gthumb-shimmer');
       // Play indicator for video thumbnails in the gallery strip
       if (isVid && !el.querySelector('.gthumb-play')) {
         const play = document.createElement('div');
@@ -2985,6 +3438,21 @@ function _loadGthumb(el){
     showThumb(url);
   }).catch(()=>{});
 }
+
+function _showAudioCover(el, coverUrl) {
+  if (!el.isConnected) return;
+  // Replace only the icon, keep the label
+  const iconEl = el.querySelector('.gthumb-icon');
+  const img = document.createElement('img');
+  img.decoding = 'async';
+  img.className = 'gthumb-audio-cover';
+  img.style.cssText = 'width:60px;height:60px;object-fit:cover;border-radius:6px;display:block;';
+  img.src = coverUrl;
+  img.onload = () => el.querySelector('.gthumb-shimmer')?.classList.remove('gthumb-shimmer');
+  if (iconEl) iconEl.replaceWith(img);
+  else el.prepend(img);
+}
+
 function openLightboxUrl(entry,url){
   document.getElementById('lightbox')?.remove();
   const lb=document.createElement('div');lb.id='lightbox';lb.tabIndex=0;
@@ -3040,12 +3508,12 @@ export function renderPreview(){
   if(e.is_dir){
     // toLocaleString (not toLocaleDateString) correctly formats date+time together
     const fmtLong = ts => !ts ? '--' : new Date(ts*1000).toLocaleString('en-GB',{day:'numeric',month:'long',year:'numeric',hour:'numeric',minute:'2-digit'});
-    const renderFolderPanel = (sizeStr) => {
+    const renderFolderPanel = (sizeStr, countStr) => {
       panel.innerHTML=`
       <div class="preview-header pv-folder-header">
         <span class="preview-icon pv-folder-icon" style="color:${fileColor(e)}">${fileIcon(e).replace('<svg','<svg style="width:80px;height:80px"')}</span>
         <div class="preview-name">${escHtml(e.name)}</div>
-        <div class="preview-kind">Folder${sizeStr?' · '+sizeStr:''}</div>
+        <div class="preview-kind">Folder${countStr?' · '+countStr:''}${sizeStr?' · '+sizeStr:''}</div>
       </div>
       <div class="pv-folder-scroll">
         <div class="preview-meta pv-info-section">
@@ -3059,15 +3527,34 @@ export function renderPreview(){
       </div>`;
       attachTagHandlers(panel,e,state);
     };
-    renderFolderPanel(null);
-    // Fetch real folder size async — show nothing (not '--') for empty/inaccessible folders
-    invoke('get_dir_size_fast',{path:e.path}).then(bytes=>{
-      if(state.previewEntry===e) renderFolderPanel(bytes>0?fmtSize(bytes):null);
-    }).catch(()=>{});
+    renderFolderPanel(null, null);
+    // Fetch item count and size concurrently
+    Promise.all([
+      invoke('list_directory_fast',{path:e.path}).then(r=>(r?.entries?.length??0)).catch(()=>null),
+      invoke('get_dir_size_fast',{path:e.path}).then(b=>b>0?fmtSize(b):null).catch(()=>null),
+    ]).then(([count, sizeStr]) => {
+      if(state.previewEntry!==e) return;
+      const countStr = count!=null ? `${count} item${count!==1?'s':''}` : null;
+      renderFolderPanel(sizeStr, countStr);
+    });
     return;
   }
   if(state.previewLoading){
     panel.innerHTML='<div class="preview-header"><span class="preview-icon" style="color:' + (fileColor(e)) + '">' + (fileIcon(e).replace('<svg','<svg style="width:48px;height:48px"')) + '</span><div class="preview-name">' + escHtml(e.name) + '</div></div><div class="preview-loading"><div class="spinner"></div></div>';return;
+  }
+  // r23: show styled error state when preview fetch failed (previewData===null after load)
+  if(state.previewError && !state.previewLoading){
+    panel.innerHTML=`
+      <div class="preview-header">
+        <span class="preview-icon" style="color:${fileColor(e)}">${fileIcon(e).replace('<svg','<svg style="width:48px;height:48px"')}</span>
+        <div class="preview-name">${escHtml(e.name)}</div>
+      </div>
+      <div class="pv-error-state">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><circle cx="12" cy="16" r="0.8" fill="#f87171" stroke="none"/></svg>
+        <div class="pv-error-msg">Preview unavailable</div>
+        <div class="pv-error-sub">This file type cannot be previewed</div>
+      </div>`;
+    return;
   }
   const d2=state.previewData,ext2=e.extension||'';
   let content='';
@@ -3084,8 +3571,14 @@ export function renderPreview(){
     const imgUrl = isHeic ? getHeicJpegUrl(e.path) : getMediaUrl(e.path);
     const thumbUrl=d2?.thumb_path?getMediaUrl(d2.thumb_path):null;
     const src=thumbUrl||imgUrl;
-    content=`<div class="preview-image-wrap"><img src="${src}" decoding="async" loading="lazy" class="preview-img" id="preview-img"
-      ${thumbUrl?'data-full="' + (imgUrl) + '"':''}/><div class="preview-img-hint">Click for fullscreen</div></div>`;
+  content=`<div class="preview-image-wrap">
+    <img src="${src}" decoding="async" loading="lazy" class="preview-img" id="preview-img"
+      ${thumbUrl?'data-full="' + (imgUrl) + '"':''}/>
+    <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
+      <div class="preview-img-hint">Click for fullscreen</div>
+      <button id="pv-copy-img" title="Copy image to clipboard" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:6px;color:var(--text-tertiary);font-size:10px;cursor:pointer;padding:2px 8px;font-family:var(--font);transition:background .1s;">⎘ Copy</button>
+    </div>
+  </div>`;
   }else if(ARCHIVE_EXTS.includes(ext2)||['zip','tar','gz','bz2','xz','zst','7z','rar','tgz','tbz2','txz'].includes(ext2)){
     // ── Archive content preview ──────────────────────────────────────────────
     content=`<div class="preview-archive-wrap" id="archive-preview-wrap">
@@ -3180,6 +3673,14 @@ export function renderPreview(){
   }else if(ext2==='xcf'){
     // ── XCF (GIMP) — browser cannot render natively; show open-in-app nudge ─
     content=`<div class="preview-binary preview-xcf"><span style="color:${fileColor(e)}">${fileIcon(e).replace('<svg','<svg style="width:64px;height:64px"')}</span><span class="xcf-label">GIMP Image</span><span class="xcf-hint">XCF files cannot be rendered inline.<br>Open in GIMP to view or edit.</span></div>`;
+  }else if(OFFICE_EXTS.includes(ext2)&&d2?._office_pdf){
+    // ── Office file: LibreOffice converted to PDF — show as iframe ───────────
+    const pdfUrl=getMediaUrl(d2._office_pdf);
+    content=`<div class="preview-pdf-wrap"><iframe class="preview-pdf" src="${pdfUrl}" title="Document Preview"></iframe></div>`;
+  }else if(OFFICE_EXTS.includes(ext2)&&d2?.content!=null){
+    // ── Office file: text extraction fallback (no LibreOffice) ──────────────
+    const docLabel={'docx':'Word Document','doc':'Word Document','xlsx':'Spreadsheet','xls':'Spreadsheet','pptx':'Presentation','ppt':'Presentation','odt':'Document','ods':'Spreadsheet','odp':'Presentation','odg':'Drawing'}[ext2]||ext2.toUpperCase();
+    content=`<div class="preview-office-text"><div class="preview-office-banner"><span style="color:${fileColor(e)}">${fileIcon(e).replace('<svg','<svg style="width:18px;height:18px"')}</span><span class="preview-office-label">${escHtml(docLabel)} — text preview</span><span class="preview-office-hint">Install LibreOffice for full preview</span></div><pre class="preview-code preview-office-pre">${escHtml(d2.content.slice(0,32768))}</pre></div>`;
   }else if(d2?.is_text&&d2?.content!=null){
     content=`<pre class="preview-code">${escHtml(d2.content)}</pre>`;
   }else if(d2){
@@ -3192,9 +3693,27 @@ export function renderPreview(){
   const _isPdf   = ext2 === 'pdf';
   const _hasMetaEditor = _isImg || _isAudio || _isPdf;
 
-  panel.innerHTML='\n    <div class="preview-header">\n      <span class="preview-icon" style="color:' + (fileColor(e)) + '">' + (fileIcon(e).replace('<svg','<svg style="width:48px;height:48px"')) + '</span>\n      <div class="preview-name">' + escHtml(e.name) + '</div>\n      <div class="preview-kind">' + (extLabel?extLabel+' · ':'') + (d2?mimeLabel(d2.mime_type):'') + '</div>\n    </div>\n    ' + (content) + '\n    ' + (renderTagsUI(e,state)) + '\n    <div class="preview-meta">\n      <div class="preview-row"><span>Size</span><span>' + (fmtSize(e.size)) + '</span></div>\n      <div class="preview-row"><span>Modified</span><span>' + (fmtDate(e.modified)) + '</span></div>\n      <div class="preview-row"><span>Permissions</span><span class="mono">' + (e.permissions||'--') + '</span></div>\n      ' + (d2?.line_count!=null?'<div class="preview-row"><span>Lines</span><span>' + (d2.line_count.toLocaleString()) + '</span></div>':'') + '\n      <div class="preview-row" id="pv-checksum-row">\n        <span>Checksum</span>\n        <button class="pv-checksum-reveal" id="pv-checksum-btn" style="background:none;border:none;color:var(--accent-blue);font-size:10px;cursor:pointer;padding:0;">Reveal</button>\n      </div>\n    </div>\n    ' + (_hasMetaEditor ? '<button class="preview-open-btn pv-edit-meta-btn" id="pv-edit-meta-btn" style="margin-top:0">✏ Edit Metadata</button>' : '') + '\n    <button class="preview-open-btn" id="preview-open">' + (I.openExt) + ' Open with default app</button>';
+  panel.innerHTML='\n    <div class="preview-header">\n      <span class="preview-icon" style="color:' + (fileColor(e)) + '">' + (fileIcon(e).replace('<svg','<svg style="width:48px;height:48px"')) + '</span>\n      <div class="preview-name">' + escHtml(e.name) + '</div>\n      <div class="preview-kind">' + (extLabel?extLabel+' · ':'') + (d2?mimeLabel(d2.mime_type):'') + '</div>\n    </div>\n    <div class="pv-scroll-body">\n    ' + (content) + '\n    ' + (renderTagsUI(e,state)) + '\n    <div class="preview-meta">\n      <div class="preview-row"><span>Size</span><span>' + (fmtSize(e.size)) + '</span></div>\n      <div class="preview-row"><span>Modified</span><span>' + (fmtDate(e.modified)) + '</span></div>\n      <div class="preview-row"><span>Permissions</span><span class="mono">' + (e.permissions||'--') + '</span></div>\n      ' + (d2?.line_count!=null?'<div class="preview-row"><span>Lines</span><span>' + (d2.line_count.toLocaleString()) + '</span></div>':'') + '\n      <div class="preview-row" id="pv-checksum-row">\n        <span>Checksum</span>\n        <button class="pv-checksum-reveal" id="pv-checksum-btn" style="background:none;border:none;color:var(--accent-blue);font-size:10px;cursor:pointer;padding:0;">Reveal</button>\n      </div>\n    </div>\n    </div>\n    ' + (_hasMetaEditor ? '<button class="preview-open-btn pv-edit-meta-btn" id="pv-edit-meta-btn" style="margin-top:0">✏ Edit Metadata</button>' : '') + '\n    <button class="preview-open-btn" id="preview-open">' + (I.openExt) + ' Open with default app</button>';
 
   document.getElementById('preview-open')?.addEventListener('click',()=>invoke('open_file',{path:e.path}).catch(()=>{}));
+  // Copy image to clipboard
+  document.getElementById('pv-copy-img')?.addEventListener('click', async () => {
+    const btn = document.getElementById('pv-copy-img');
+    const imgEl = document.getElementById('preview-img');
+    const src = imgEl?.dataset.full || imgEl?.src || getMediaUrl(e.path);
+    try {
+      if (!src) throw new Error('no src');
+      const res = await fetch(src);
+      const blob = await res.blob();
+      const item = new ClipboardItem({[blob.type]: blob});
+      await navigator.clipboard.write([item]);
+      if (btn) { btn.textContent = '✓ Copied'; setTimeout(() => { if(btn.isConnected) btn.textContent = '⎘ Copy'; }, 1800); }
+    } catch {
+      // Fallback: copy URL
+      navigator.clipboard.writeText(src).catch(()=>{});
+      if (btn) { btn.textContent = '✓ URL copied'; setTimeout(() => { if(btn.isConnected) btn.textContent = '⎘ Copy'; }, 1800); }
+    }
+  });
   // Track file currently shown in preview (used for same-file guard on next render)
   panel.dataset.previewExt = ext2;
   panel.dataset.previewPath = e.path;
@@ -3245,6 +3764,20 @@ export function renderPreview(){
         if(canvas) startAudioVisualizer(aud,canvas);
         // Set src after graph is wired — preload=none means no data fetch starts yet
         aud.src=mediaUrl;
+        // Replace icon with album cover if available
+        const _replacePvIcon = (coverUrl) => {
+          const icon = slot.querySelector('.preview-audio-icon');
+          if (!icon || !icon.isConnected) return;
+          const coverImg = document.createElement('img');
+          coverImg.src = coverUrl;
+          coverImg.style.cssText = 'width:80px;height:80px;object-fit:cover;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.4);display:block;flex-shrink:0;';
+          icon.replaceWith(coverImg);
+        };
+        if (_audioCoverCache[e.path] && _audioCoverCache[e.path] !== 'loading') {
+          _replacePvIcon(_audioCoverCache[e.path]);
+        } else {
+          _getAudioCover(e.path).then(cover => { if (cover) _replacePvIcon(cover); });
+        }
       } else {
         // Same file reselected — just reattach visualizer to existing canvas
         const audioEl=existing;
@@ -3520,6 +4053,9 @@ const TAG_PALETTE=[
 
 function renderTagsUI(e,state){
   const tags=state._fileTags?.[e.path]||[];
+  const allTags=state._allTags||[];
+  // Don't render the section at all when there are no tags anywhere
+  if(tags.length===0 && allTags.length===0) return '';
   const swatches=TAG_PALETTE.map(p=>{
     const active=tags.includes(p.name);
     return `<button class="tag-swatch${active?' tag-swatch-active':''}" data-tag="${p.name}" data-color="${p.color}"
@@ -3606,6 +4142,10 @@ function getAC(){
 }
 
 let _vizAnimId=null;
+// Persisted visualizer mode — shared across all instances
+let _vizMode = (() => { try { return localStorage.getItem('ff_viz_mode')||'bars'; } catch { return 'bars'; } })();
+export function setVizMode(m){ _vizMode=m; try{localStorage.setItem('ff_viz_mode',m);}catch{} }
+export function getVizMode(){ return _vizMode; }
 
 export function startAudioVisualizer(audioEl,canvas){
   if(!audioEl||!canvas)return;
@@ -3620,30 +4160,95 @@ export function startAudioVisualizer(audioEl,canvas){
     if(canvas.width!==W||canvas.height!==H){canvas.width=W;canvas.height=H;}
     const g=canvas.getContext('2d');
     g.clearRect(0,0,W,H);
+    const mode = _vizMode;
+
     if(audioEl.paused||!audioEl._vizAnalyser){
-      const bars=60,barW=W/bars;
-      for(let i=0;i<bars;i++){
-        g.fillStyle='rgba(100,130,160,0.25)';
-        g.beginPath();g.roundRect(i*barW+0.5,H-2,barW-1.5,2,1);g.fill();
+      // Idle state — draw subtle flat bars for all modes
+      g.fillStyle='rgba(100,130,160,0.2)';
+      if(mode==='ring'){
+        const cx=W/2,cy=H/2,r=Math.min(W,H)*0.3;
+        g.beginPath();g.arc(cx,cy,r,0,Math.PI*2);g.strokeStyle='rgba(100,130,160,0.2)';g.lineWidth=2;g.stroke();
+      } else {
+        const bars=60,barW=W/bars;
+        for(let i=0;i<bars;i++){
+          g.beginPath();g.roundRect(i*barW+0.5,H-2,barW-1.5,2,1);g.fill();
+        }
       }
       return;
     }
     const analyser=audioEl._vizAnalyser;
-    const bufLen=analyser.frequencyBinCount,dataArr=new Uint8Array(bufLen);
-    analyser.getByteFrequencyData(dataArr);
-    const bars=Math.min(bufLen,72),barW=W/bars;
-    for(let i=0;i<bars;i++){
-      const v=dataArr[i]/255,h=Math.max(2,v*H);
-      g.fillStyle=`hsla(${195+v*120},${60+v*30}%,60%,0.9)`;
-      g.beginPath();g.roundRect(i*barW+0.5,H-h,barW-1.5,h,2);g.fill();
+    const bufLen=analyser.frequencyBinCount;
+    const freqArr=new Uint8Array(bufLen);
+    const timeArr=new Uint8Array(bufLen);
+    analyser.getByteFrequencyData(freqArr);
+    analyser.getByteTimeDomainData(timeArr);
+
+    if(mode==='bars'){
+      // Classic upward frequency bars with gradient colour
+      const bars=Math.min(bufLen,72),barW=W/bars;
+      for(let i=0;i<bars;i++){
+        const v=freqArr[i]/255,h=Math.max(2,v*H);
+        g.fillStyle=`hsla(${195+v*120},${60+v*30}%,60%,0.9)`;
+        g.beginPath();g.roundRect(i*barW+0.5,H-h,barW-1.5,h,2);g.fill();
+      }
+    } else if(mode==='wave'){
+      // Smooth waveform line
+      g.beginPath();
+      const sliceW=W/bufLen;
+      let x=0;
+      for(let i=0;i<bufLen;i++){
+        const v=(timeArr[i]/128)-1;
+        const y=H/2+v*(H*0.45);
+        i===0?g.moveTo(x,y):g.lineTo(x,y);
+        x+=sliceW;
+      }
+      const grad=g.createLinearGradient(0,0,W,0);
+      grad.addColorStop(0,'hsla(195,70%,65%,0.9)');
+      grad.addColorStop(0.5,'hsla(270,70%,75%,0.9)');
+      grad.addColorStop(1,'hsla(315,70%,65%,0.9)');
+      g.strokeStyle=grad;g.lineWidth=2;g.lineJoin='round';g.stroke();
+      // Glow
+      g.strokeStyle=grad;g.lineWidth=5;g.globalAlpha=0.15;g.stroke();
+      g.globalAlpha=1;
+    } else if(mode==='mirror'){
+      // Mirrored bars — grow from centre vertically
+      const bars=Math.min(bufLen,72),barW=W/bars;
+      for(let i=0;i<bars;i++){
+        const v=freqArr[i]/255,half=Math.max(1,v*H*0.5);
+        const hue=195+v*120;
+        g.fillStyle=`hsla(${hue},${60+v*30}%,60%,0.85)`;
+        g.beginPath();g.roundRect(i*barW+0.5,H/2-half,barW-1.5,half*2,2);g.fill();
+      }
+      // Centre line
+      g.fillStyle='rgba(150,170,200,0.25)';
+      g.fillRect(0,H/2-0.5,W,1);
+    } else if(mode==='ring'){
+      // Circular frequency ring
+      const cx=W/2,cy=H/2;
+      const baseR=Math.min(W,H)*0.28;
+      const bars=64;
+      const step=bufLen/bars;
+      for(let i=0;i<bars;i++){
+        const v=freqArr[Math.floor(i*step)]/255;
+        const angle=(i/bars)*Math.PI*2-Math.PI/2;
+        const r1=baseR;
+        const r2=baseR+v*(Math.min(W,H)*0.22);
+        const hue=195+v*120+i*2;
+        g.strokeStyle=`hsla(${hue},${60+v*30}%,65%,${0.5+v*0.5})`;
+        g.lineWidth=Math.max(1,(W/bars)*0.7);
+        g.lineCap='round';
+        g.beginPath();
+        g.moveTo(cx+Math.cos(angle)*r1,cy+Math.sin(angle)*r1);
+        g.lineTo(cx+Math.cos(angle)*r2,cy+Math.sin(angle)*r2);
+        g.stroke();
+      }
+      // Inner circle
+      g.beginPath();g.arc(cx,cy,baseR*0.55,0,Math.PI*2);
+      g.strokeStyle='rgba(150,170,210,0.15)';g.lineWidth=1;g.stroke();
     }
   };
 
   // ── Wire WebAudio graph immediately (element must be idle, no src yet) ────
-  // createMediaElementSource called on an idle element (no src, readyState=0)
-  // never causes an audio interruption. The caller is responsible for setting
-  // src AFTER calling this function. This completely eliminates the cut/restart
-  // glitch that occurs when wiring mid-stream or mid-preload.
   if(!audioEl._vizSetup){
     try{
       const ctx=getAC();
@@ -3662,11 +4267,6 @@ export function startAudioVisualizer(audioEl,canvas){
   }
 
   // ── Document-level gesture unlock (belt-and-suspenders for WebKit2GTK) ──────
-  // WebKit2GTK renders <audio controls> in shadow DOM; the play-button click may
-  // not propagate a qualifying user-gesture context to the `play` event handler.
-  // A capture-phase listener on document fires *before* any other handler on
-  // every real user gesture (click, keydown), guaranteeing the AC is resumed
-  // the instant the user interacts — even if `play` fires a tick later.
   if(!window._vizACUnlockWired){
     window._vizACUnlockWired=true;
     const _unlock=()=>{
@@ -3680,7 +4280,6 @@ export function startAudioVisualizer(audioEl,canvas){
   // ── Event listeners (once per element) ────────────────────────────────────
   if(!audioEl._vizListeners){
     audioEl._vizListeners=true;
-    // resume() in play handler as primary path; document listener above as fallback
     audioEl.addEventListener('play',()=>{
       const c=audioEl._vizCtx;
       if(c&&c.state==='suspended')c.resume().catch(()=>{});
@@ -3855,7 +4454,22 @@ export function closeQuickLook() {
 }
 
 export function renderStatus(){
-  const {state,sel,getCurrentEntries,sortEntries}=d();
+  const {state,sel,getCurrentEntries,sortEntries,isPaneBFocused,_paneB}=d();
+
+  // Gap fix: when pane B is focused, show pane B stats instead of main pane
+  if(isPaneBFocused?.() && _paneB?.active){
+    const pbEntries = _paneB.entries || [];
+    const pbCount = pbEntries.length;
+    const pbSelEntry = _paneB.selIdx >= 0 ? pbEntries[_paneB.selIdx] : null;
+    const pbFolder = (_paneB.path||'').split('/').filter(Boolean).pop() || _paneB.path || '';
+    let txt = pbSelEntry
+      ? `${pbCount} item${pbCount!==1?'s':''} · ${pbSelEntry.name}${pbSelEntry.is_dir?` (folder) · ${fmtDate(pbSelEntry.modified)}`:` · ${fmtSize(pbSelEntry.size)} · ${fmtDate(pbSelEntry.modified)}`}`
+      : `${pbCount} item${pbCount!==1?'s':''}`;
+    txt += `  ·  Pane B: ${pbFolder}`;
+    document.getElementById('status').textContent=txt;
+    return;
+  }
+
   const entries=getCurrentEntries();
   let count=entries.length,selEntry=null;
   if(state.viewMode==='column'&&!state.searchMode){
@@ -3876,9 +4490,10 @@ export function renderStatus(){
   // Total size of multi-selection (only files that have size populated)
   const selEntries = multiSel ? sel.arr.map(i=>entries[i]).filter(Boolean) : [];
   const selTotalSize = multiSel ? selEntries.reduce((a,e)=>a+(e.size||0),0) : 0;
-  let txt=state.searchMode?(count) + ' result' + (count!==1?'s':'')
+  let txt=state.searchMode
+    ? (count) + ' result' + (count!==1?'s':'') + (state.searchQuery ? ` for "${state.searchQuery}"` : '')
     :multiSel?`${sel.size} selected of ${count} · ${fmtSize(selTotalSize)}`:`${count} item${count!==1?'s':''}`;
-  if(!multiSel&&selEntry)txt+=selEntry.is_dir?' · ' + (selEntry.name) + ' (folder)':` · ${selEntry.name} · ${fmtSize(selEntry.size)}`;
+  if(!multiSel&&selEntry)txt+=selEntry.is_dir?` · ${selEntry.name} (folder) · ${fmtDate(selEntry.modified)}`:` · ${selEntry.name} · ${fmtSize(selEntry.size)} · ${fmtDate(selEntry.modified)}`;
   if(state.clipboard.entries.length)txt+=` · ${state.clipboard.entries.length} in clipboard (${state.clipboard.op})`;
   if(!state.searchMode)txt+=`  ·  ${hints[state.viewMode]||''} View`;
   document.getElementById('status').textContent=txt;
@@ -4434,6 +5049,8 @@ async function _showExifEditor(entry, panel) {
 
 // ── r128/r25: Audio tag editor — uses native lofty backend (no exiftool) ────
 async function _showAudioTagEditor(entry, panel) {
+  let selectedCoverUrl = null;
+  
   const ov = _metaEditorOverlay('Edit Tags — ' + entry.name,
     '<div style="padding:24px;text-align:center;color:var(--text-tertiary)">Loading tags…</div>',
     async (ov, close) => {
@@ -4456,12 +5073,17 @@ async function _showAudioTagEditor(entry, panel) {
         const val = get(sel);
         if (val !== orig(sel)) { tags[key] = val; changed = true; }
       }
+      // Include cover URL if one was selected from search
+      if (selectedCoverUrl) {
+        tags.cover_url = selectedCoverUrl;
+        changed = true;
+      }
       if (!changed) { close(); return; }
-      if (statusDiv) statusDiv.textContent = 'Saving…';
+      if (statusDiv) statusDiv.textContent = selectedCoverUrl ? 'Saving with cover...' : 'Saving...';
       ov.querySelector('#meta-ed-apply').disabled = true;
       try {
         await invoke('write_audio_tags', { path: entry.path, tags });
-        if (statusDiv) { statusDiv.style.color = '#34d399'; statusDiv.textContent = 'Saved!'; }
+        if (statusDiv) { statusDiv.style.color = '#34d399'; statusDiv.textContent = selectedCoverUrl ? 'Saved with cover!' : 'Saved!'; }
         setTimeout(close, 900);
       } catch(err) {
         if (statusDiv) { statusDiv.style.color = '#f87171'; statusDiv.textContent = String(err); }
@@ -4481,7 +5103,16 @@ async function _showAudioTagEditor(entry, panel) {
         <input class="meta-ed-input" id="${id}" value="${v}" data-orig="${v}" placeholder="${escHtml(placeholder)}">
       </div>`;
     };
-    body.innerHTML =
+    
+    // Build search query from existing metadata
+    const searchQuery = [meta.title, meta.artist, meta.album].filter(Boolean).join(' ') || entry.name.replace(/\.[^.]+$/, '');
+    
+    body.innerHTML = 
+      `<div class="aud-search-row" style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
+        <input class="meta-ed-input" id="aud-search" value="${escHtml(searchQuery)}" placeholder="Search online..." style="flex:1;">
+        <button class="stg-btn" id="aud-search-btn" style="padding:6px 12px;font-size:11px;">Search</button>
+      </div>
+      <div id="aud-search-results" style="max-height:180px;overflow-y:auto;display:none;border:1px solid var(--border);border-radius:8px;margin-bottom:12px;"></div>` +
       row('aud-title',   'Title',   meta.title,   'Song title') +
       row('aud-artist',  'Artist',  meta.artist,  'Artist name') +
       row('aud-album',   'Album',   meta.album,   'Album name') +
@@ -4489,6 +5120,64 @@ async function _showAudioTagEditor(entry, panel) {
       row('aud-track',   'Track #', meta.track,   '1') +
       row('aud-genre',   'Genre',   meta.genre,   'e.g. Pop') +
       row('aud-comment', 'Comment', meta.comment, '');
+    
+    // Wire search button
+    const searchInput = body.querySelector('#aud-search');
+    const searchBtn = body.querySelector('#aud-search-btn');
+    const resultsDiv = body.querySelector('#aud-search-results');
+    
+    const doSearch = async () => {
+      const query = searchInput.value.trim();
+      if (!query) return;
+      searchBtn.disabled = true;
+      searchBtn.textContent = 'Searching...';
+      resultsDiv.style.display = 'block';
+      resultsDiv.innerHTML = '<div style="padding:12px;color:var(--text-tertiary)">Searching...</div>';
+      
+      try {
+        const results = await invoke('search_music_metadata', { query });
+        if (!results || results.length === 0) {
+          resultsDiv.innerHTML = '<div style="padding:12px;color:var(--text-tertiary)">No results found</div>';
+          return;
+        }
+        resultsDiv.innerHTML = results.map((r, i) => `
+          <div class="aud-result-item" data-idx="${i}" style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;">
+            <div style="width:40px;height:40px;background:var(--bg-hover);border-radius:4px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+              ${r.cover_url ? `<img src="${escHtml(r.cover_url)}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;" onerror="this.parentElement.innerHTML='🎵'">` : '🎵'}
+            </div>
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(r.title)}</div>
+              <div style="font-size:10px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escHtml(r.artist)}${r.album ? ' — ' + escHtml(r.album) : ''}</div>
+            </div>
+          </div>
+        `).join('');
+        
+        // Wire click to apply
+        resultsDiv.querySelectorAll('.aud-result-item').forEach(item => {
+          item.addEventListener('click', () => {
+            const idx = parseInt(item.dataset.idx);
+            const r = results[idx];
+            if (r.title) { body.querySelector('#aud-title').value = r.title; }
+            if (r.artist) { body.querySelector('#aud-artist').value = r.artist; }
+            if (r.album) { body.querySelector('#aud-album').value = r.album; }
+            if (r.year) { body.querySelector('#aud-year').value = r.year; }
+            // Store cover URL for embedding when saving
+            selectedCoverUrl = r.cover_url || null;
+            resultsDiv.style.display = 'none';
+            d().showToast(selectedCoverUrl ? d().t('toast.music_applied_cover', {title: r.title}) : d().t('toast.music_applied', {title: r.title}), 'success');
+          });
+        });
+      } catch(err) {
+        resultsDiv.innerHTML = `<div style="padding:12px;color:#f87171;font-size:11px;">Search failed: ${escHtml(String(err))}</div>`;
+      } finally {
+        searchBtn.disabled = false;
+        searchBtn.textContent = 'Search';
+      }
+    };
+    
+    searchBtn.addEventListener('click', doSearch);
+    searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+    
   } catch(err) {
     const body = ov.querySelector('#meta-ed-body');
     if (body) body.innerHTML = `<div style="padding:16px;color:#f87171;font-size:12px">Could not load tags: ${escHtml(String(err))}</div>`;

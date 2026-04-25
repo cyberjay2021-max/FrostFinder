@@ -1,4 +1,8 @@
-# Pinned to 1.90.0 — fix ICE
+# Pinned to 1.88.0 — the minimum version required by the dependency tree
+# (darling 0.23, image 0.25, serde_with 3.18, time 0.3, zbus 5.14).
+# Must stay below 1.93.x which contains ICE regressions in const_of_item /
+# body_codegen_fn_attrs / hir_node that cause build failures in brotli and
+# serde_derive_internals. If deps require a bump, test against 1.92.x first.
 [toolchain]
-channel = "1.90.0"
+channel = "1.88.0"
 components = ["rustfmt", "clippy"]
