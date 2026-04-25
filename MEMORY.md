@@ -105,7 +105,7 @@ npm run test:watch
 - WebDAV mounts persisted across restarts
 - SMB and WebDAV mounts shown in sidebar with disconnect button
 
-## Code Stats (v1.0.1-RC2-R39 / 2026-04-12)
+## Code Stats (v1.0.1-RC2-R47 / 2026-04-24)
 - main.rs: 12792 lines
 - tags.rs: 567 lines
 - trash.rs: 227 lines
